@@ -1,0 +1,92 @@
+
+esp32:
+  base_url: "http://192.168.101.123"
+
+processing:
+  interval_sec: 10
+  retry_backoff_sec: 5
+  image_path: "/tmp/water_raw.jpg"
+  image_timeout: 8.0
+  save_debug_overlays: true
+  debug_dir: "~/watermeter/debug"
+  debug_keep_latest_only: true
+
+overlay:
+  font_scale: 1.0           # ~relative to a 480-px tall frame; try 1.0–1.6
+  font_thickness: 2         # main text thickness
+  outline_thickness: 6      # black outline behind text (>= font_thickness)
+  line_thickness: 1         # rectangle thickness around ROIs
+  publish_mqtt: true
+  camera_topic: "home/watermeter/debug/overlay"   # image topic
+  camera_name: "Water Meter Overlay"
+  camera_unique_id: "water_overlay_macocr"
+  jpeg_quality: 85                                 # optional re-encode before publish
+  
+digits:
+  count: 5
+  per_digit_inset: 0.10         # shrink each digit box inside the window
+  rolling_threshold_up: 0.92
+  rolling_threshold_down: 0.08
+
+postproc:
+  monotonic_epsilon: 0.0
+  big_jump_guard: 2.0
+
+mqtt:
+  host: "192.168.1.23"
+  port: 1883
+  username: null
+  password: null
+  topic: "home/watermeter"
+  client_id: "water-ocr-mac"
+  ha_discovery_prefix: "homeassistant"
+
+paths:
+  ocr_bin: "~/watermeter/bin/ocr"
+  state_path: "~/watermeter/state.json"
+  log_path:   "~/watermeter/watermeter.log"
+
+alignment:
+  enabled: true
+  reference_path: "~/watermeter/reference.jpg"
+  use_mask: true
+  anchor_rois:
+    - [0.18, 0.00, 0.64, 0.28]
+    - [0.05, 0.28, 0.30, 0.22]
+    - [0.70, 0.24, 0.25, 0.25]
+  nfeatures: 1200
+  ratio_test: 0.75
+  min_matches: 40
+  ransac_thresh_px: 3.0
+  max_scale_change: 0.08
+  max_rotation_deg: 15.0
+  warp_mode: "similarity"
+  write_debug_aligned: true
+
+rois:
+  digits: [0.307, 0.270, 0.330, 0.110]
+
+  dials:
+    - name: dial_0_1        # ×0.1 m³ (rightmost)
+      roi: [0.6370, 0.5892, 0.131, 0.174]
+      factor: 0.1
+      rotation: "cw"
+      zero_angle_deg: -90
+
+    - name: dial_0_01       # ×0.01 m³
+      roi: [0.5444, 0.7273, 0.132, 0.174]
+      factor: 0.01
+      rotation: "cw"
+      zero_angle_deg: -90
+
+    - name: dial_0_001      # ×0.001 m³
+      roi: [0.4137, 0.7763, 0.130, 0.173]
+      factor: 0.001
+      rotation: "cw"
+      zero_angle_deg: -90
+
+    - name: dial_0_0001     # ×0.0001 m³ (leftmost)
+      roi: [0.2439, 0.6675, 0.134, 0.173]
+      factor: 0.0001
+      rotation: "cw"
+      zero_angle_deg: -90
