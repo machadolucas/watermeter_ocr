@@ -8,6 +8,7 @@ See README for details.
 import os, sys, time, json, math, subprocess, logging, argparse
 from dataclasses import dataclass, field
 from typing import List, Tuple, Optional
+from datetime import datetime
 import requests
 import yaml
 import cv2
@@ -73,6 +74,10 @@ class Config:
     overlay_camera_name: str = "Water Meter Overlay"
     overlay_camera_unique_id: str = "water_overlay_macocr"
     overlay_jpeg_quality: int = 85
+    quiet_hours_enabled: bool = True
+    quiet_start: str = "00:00"
+    quiet_end: str = "07:00"
+    quiet_interval_sec: int = 60
 
 def load_config(path)->Config:
     raw=load_yaml(path)
@@ -90,6 +95,7 @@ def load_config(path)->Config:
     )
     ov = raw.get("overlay", {})
     topic_default = raw.get("mqtt", {}).get("topic", "home/watermeter")
+    qh = raw.get("processing", {}).get("quiet_hours", {})
     return Config(
         esp32_base_url=raw.get("esp32",{}).get("base_url","http://192.168.101.190"),
         interval_sec=raw.get("processing",{}).get("interval_sec",10),
@@ -126,7 +132,11 @@ def load_config(path)->Config:
         overlay_camera_topic = ov.get("camera_topic", f"{topic_default}/debug/overlay"),
         overlay_camera_name = ov.get("camera_name", "Water Meter Overlay"),
         overlay_camera_unique_id = ov.get("camera_unique_id", "water_overlay_macocr"),
-        overlay_jpeg_quality = ov.get("jpeg_quality", 85)
+        overlay_jpeg_quality = ov.get("jpeg_quality", 85),
+        quiet_hours_enabled = qh.get("enabled", False),
+        quiet_start         = qh.get("start",  "00:00"),
+        quiet_end           = qh.get("end",    "07:00"),
+        quiet_interval_sec  = qh.get("interval_sec", 60),
     )
 
 class VisionOCR:
@@ -386,6 +396,16 @@ def build_digit_rois(cfg,W,H):
         rois.append([sx+sw*inset, sy+sh*inset, sw*(1-2*inset), sh*(1-2*inset)])
     return rois
 
+def _hhmm_to_min(s: str) -> int:
+    h, m = map(int, s.split(":"))
+    return h*60 + m
+
+def _in_window_local(now: datetime, start_hhmm: str, end_hhmm: str) -> bool:
+    cur = now.hour*60 + now.minute
+    start = _hhmm_to_min(start_hhmm)
+    end   = _hhmm_to_min(end_hhmm)
+    return (start <= cur < end) if start < end else (cur >= start or cur < end)
+
 def main():
     parser=argparse.ArgumentParser(); parser.add_argument("--config",required=True); parser.add_argument("--log")
     a=parser.parse_args(); cfg=load_config(a.config)
@@ -397,6 +417,7 @@ def main():
     ocr=VisionOCR(cfg.ocr_bin); mqttc=MqttClient(cfg,log); mqttc.connect(); mqttc.discovery()
     aligner=AlignConfig() and Aligner(cfg.align,log) if cfg.align.enabled else None
     session=requests.Session()
+    mode_prev = None
 
     while True:
         t0=time.time()
@@ -491,6 +512,19 @@ def main():
         prev_total=publish_total; prev_ts=now
         save_json(cfg.state_path, {"total": prev_total, "ts": prev_ts})
 
-        time.sleep(max(0.0, cfg.interval_sec - (time.time()-t0)))
+        # choose target interval based on local time
+        if cfg.quiet_hours_enabled and _in_window_local(datetime.now(), cfg.quiet_start, cfg.quiet_end):
+            target_interval = cfg.quiet_interval_sec
+            mode = "quiet"
+        else:
+            target_interval = cfg.interval_sec
+            mode = "normal"
+
+        if mode != mode_prev:
+            log.info(f"Sampling mode -> {mode} (interval={target_interval}s)")
+            mode_prev = mode
+
+        elapsed = time.time() - t0
+        time.sleep(max(0.0, target_interval - elapsed))
 
 if __name__=="__main__": main()

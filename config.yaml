@@ -10,6 +10,11 @@ processing:
   save_debug_overlays: true
   debug_dir: "~/watermeter/debug"
   debug_keep_latest_only: true
+  quiet_hours:
+    enabled: true
+    start: "00:00"      # inclusive
+    end:   "07:00"      # exclusive
+    interval_sec: 60
 
 overlay:
   font_scale: 1.0           # ~relative to a 480-px tall frame; try 1.0–1.6
