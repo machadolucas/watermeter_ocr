@@ -1,8 +1,9 @@
 # Water Meter OCR (Mac + ESP32 PoE)
 
-Read a **mechanical water meter** (odometer digits + 4 red-pointer dials) using an **ESP32-S3 AI-on-the-Edge Cam** for image capture and a **Mac** for fast, robust processing.
+Reads a **mechanical water meter** (odometer digits + 4 red-pointer dials) using an **ESP32-S3 AI-on-the-Edge Cam** for image capture and a **Mac** for fast, robust processing.
 - Uses Apple **Vision** for per-digit OCR (full/top/bottom) to resolve rolling digits.
 - Uses OpenCV for the 4 analog dials.
+
 Publishes **total (m³)**, **flow rate (m³/min)**, **liters/min**, and an **overlay camera feed** to Home Assistant via **MQTT**.
 
 <p align="center">
@@ -11,17 +12,11 @@ Publishes **total (m³)**, **flow rate (m³/min)**, **liters/min**, and an **ove
 
 ---
 
-## Repo
-
-**GitHub:** [https://github.com/machadolucas/watermeter_ocr](https://github.com/machadolucas/watermeter_ocr)
-
----
-
 ## Why this project?
 
 * The ESP32’s built-in models are great but each processing round takes one or more minutes to read a single image capture.
 * This shifts OCR and logic to your Apple silicon Mac (CPU/GPU/NPU), while the ESP32 reliably delivers lit images via PoE (I am using [this device](https://hackaday.io/project/203879-ai-on-the-edge-cam) since I wanted PoE for stable power and signal).
-* By leveraging the power of a Mac's NPU and CPU, I am able to process images at 10-second intervals without barely any additional load in the machine. This allows for almost instant reading of water consumption and flow.
+* **By leveraging the power of a Mac's NPU and CPU, I am able to process images at 10-second intervals without barely any additional load in the machine. This allows for almost instant reading of water consumption and flow.**
 * It reproduces key AI-on-the-Edge ideas:
 
   * **Rolling digit** disambiguation (handles “in-between” digits)
