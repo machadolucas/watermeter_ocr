@@ -218,16 +218,75 @@ def detect_dial_markings(roi_img, cx, cy, radius):
     return (0.0, 0.0)
 
 
+def detect_needle_center(roi_img):
+    """
+    Detect center by analyzing the red needle's thick end (drop shape).
+    The needle is thickest at the center pivot point.
+    Returns (cx, cy, confidence) or None if detection fails.
+    """
+    hsv = cv2.cvtColor(roi_img, cv2.COLOR_BGR2HSV)
+    # Detect red needle
+    m = cv2.inRange(hsv, (0, 70, 50), (10, 255, 255)) | cv2.inRange(hsv, (170, 70, 50), (180, 255, 255))
+    m = cv2.medianBlur(m, 5)
+    
+    # Use morphological operations to find the thickest part
+    k = np.ones((3, 3), np.uint8)
+    m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, k, iterations=2)
+    
+    # Find contours
+    cs, _ = cv2.findContours(m, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+    if not cs:
+        return None
+    
+    cnt = max(cs, key=cv2.contourArea)
+    if cv2.contourArea(cnt) < 10:
+        return None
+    
+    # Find the point on the contour with maximum local thickness
+    # Use distance transform to find thickest region
+    dist_transform = cv2.distanceTransform(m, cv2.DIST_L2, 5)
+    
+    # Find the maximum value (thickest point)
+    min_val, max_val, min_loc, max_loc = cv2.minMaxLoc(dist_transform)
+    
+    if max_val < 2.0:  # Needle too thin
+        return None
+    
+    cx, cy = max_loc[0], max_loc[1]
+    
+    # Confidence based on thickness and contour size
+    area = cv2.contourArea(cnt)
+    roi_area = roi_img.shape[0] * roi_img.shape[1]
+    area_ratio = area / roi_area
+    
+    # Good needle should be 1-5% of ROI area
+    if 0.01 < area_ratio < 0.10:
+        confidence = 0.9
+    else:
+        confidence = 0.6
+    
+    return (cx, cy, confidence)
+
+
 def detect_dial_center(roi_img):
     """
-    Detect the actual center of the dial face using Hough circles.
-    Optionally refined using dial markings (0 at top, 5 at bottom).
+    Detect the actual center of the dial face using multiple methods.
+    Priority: needle center > Hough circles > dial markings > geometric center
     Returns (cx, cy, radius, confidence) or None if detection fails.
     """
+    hh, ww = roi_img.shape[:2]
+    default_radius = min(ww, hh) / 2.0
+    
+    # Method 1: Detect center from needle's thick end (most reliable for drop-shaped needles)
+    needle_result = detect_needle_center(roi_img)
+    if needle_result is not None:
+        cx, cy, conf = needle_result
+        return (cx, cy, default_radius * 0.8, conf)
+    
+    # Method 2: Try Hough circles (dial face detection)
     gray = cv2.cvtColor(roi_img, cv2.COLOR_BGR2GRAY)
     blurred = cv2.GaussianBlur(gray, (9, 9), 2)
     
-    # Try to detect circular dial face
     circles = cv2.HoughCircles(
         blurred,
         cv2.HOUGH_GRADIENT,
@@ -247,13 +306,12 @@ def detect_dial_center(roi_img):
         # Try to validate/refine using dial markings
         rotation_offset, marking_conf = detect_dial_markings(roi_img, cx, cy, radius)
         
-        # Boost confidence if markings were detected
-        confidence = 0.7 + 0.3 * marking_conf  # 0.7-1.0 range
+        # Confidence for circle detection
+        confidence = 0.6 + 0.2 * marking_conf  # 0.6-0.8 range (lower than needle method)
         return (cx, cy, radius, confidence)
     
     # Fallback: use geometric center with low confidence
-    hh, ww = roi_img.shape[:2]
-    return (ww / 2.0, hh / 2.0, min(ww, hh) / 2.0, 0.3)
+    return (ww / 2.0, hh / 2.0, default_radius, 0.3)
 
 
 def detect_needle_by_color(roi_img, cx, cy):
@@ -323,7 +381,10 @@ def detect_needle_by_lines(roi_img, cx, cy):
         
         # Point-to-line distance
         point_vec = np.array([cx - x1, cy - y1])
-        cross = abs(np.cross(line_vec, point_vec))
+        # Use 3D vectors for cross product to avoid NumPy 2.0 deprecation warning
+        line_vec_3d = np.array([line_vec[0], line_vec[1], 0])
+        point_vec_3d = np.array([point_vec[0], point_vec[1], 0])
+        cross = abs(np.cross(line_vec_3d, point_vec_3d)[2])
         dist = cross / line_len
         
         if dist < best_score:
@@ -505,29 +566,56 @@ def decide_digit(bottom, top, full, progress, thr_up, thr_dn, prev_digit=None):
     """
     Prefer previous digit when we're not near a rollover (thr_dn < progress < thr_up).
     Use top/bottom rules only at the edges or when both agree strongly.
+    
+    Progress represents the fractional progress from lower-order positions.
+    When progress is high (>thr_up), we expect the digit to have rolled to the next value.
+    When progress is low (<thr_dn) after being high, it indicates a rollover just occurred.
     """
     toint = lambda s: int(s) if (isinstance(s, str) and s.isdigit()) else None
     b, t, f = toint(bottom), toint(top), toint(full)
 
     in_middle = (thr_dn < progress < thr_up)
 
-    # 1) If we have a previous digit and we are in the "middle" zone, stick to it.
-    if prev_digit is not None and in_middle:
-        return prev_digit
-
-    # 2) Classic rolling window logic (top is next of bottom)
+    # 1) Rolling window logic (top is next of bottom) - handle transitions
     if b is not None and t is not None and t == ((b + 1) % 10):
+        # Near the top threshold - digit is rolling to next value
         if progress >= thr_up:
             return t
+        # Near the bottom threshold - digit just rolled or is stable at bottom
         if progress <= thr_dn:
             return b
+        # In transition zone - use previous if available
         return prev_digit if prev_digit is not None else b
 
-    # 3) If top and bottom agree, trust them
+    # 2) If top and bottom agree, trust them
     if b is not None and t is not None and b == t:
         return b
 
-    # 4) Otherwise try full, then bottom, then top, then prev
+    # 3) Check if we just rolled over (low progress after high, OCR may fail during transition)
+    # This handles the case where digit is cropped/transitioning but dials show rollover happened
+    if prev_digit is not None and progress <= thr_dn:
+        # Low progress means dials show values near 0, indicating a rollover just occurred
+        # Trust the dial reading and increment the digit, even if OCR doesn't see it yet
+        next_digit = (prev_digit + 1) % 10
+        
+        # If OCR managed to see the new digit, great! Use it
+        if f == next_digit or t == next_digit or b == next_digit:
+            return next_digit
+        
+        # If OCR still shows old digit, that's expected during transition
+        if f == prev_digit or t == prev_digit or b == prev_digit:
+            # But dials say rollover happened, so trust dials over OCR
+            return next_digit
+        
+        # OCR shows something else entirely - might be misread, still trust dials
+        # This is the critical case: OCR fails, but dial reading at ~0.001 proves rollover
+        return next_digit
+
+    # 4) If we have previous digit and we're in stable zone, use it
+    if prev_digit is not None and in_middle:
+        return prev_digit
+
+    # 5) Otherwise try full, then bottom, then top, then prev
     for v in (f, b, t, prev_digit):
         if v is not None:
             return v
