@@ -68,6 +68,13 @@ alignment:
   warp_mode: "similarity"
   write_debug_aligned: true
 
+# Auto-centering: automatically detects and centers dials for improved accuracy
+auto_centering:
+  enabled: true                    # Enable automatic dial center detection and ROI adjustment
+  smoothing_alpha: 0.3             # ROI adjustment speed (0.1=stable/slow, 0.5=fast/responsive)
+  min_confidence_threshold: 0.4    # Log warning if dial detection confidence drops below this
+  max_dial_change_per_sec: 0.5     # Maximum expected dial change per second (for temporal validation)
+
 rois:
   digits: [0.307, 0.270, 0.330, 0.110]
 
