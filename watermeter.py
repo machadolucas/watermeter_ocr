@@ -842,6 +842,10 @@ def draw_overlays(img, digits_rois_abs, per_digit_vals, dials_abs, dial_vals, di
 
     color_digits = (0, 255, 0) if aligned_ok else (0, 0, 255)  # green or red
 
+    # Timestamp overlay for correlation with capture time
+    timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    _draw_label(ov, timestamp, (10, int(20 * fs)), fs * 0.6, (255, 255, 255), th, o_th)
+
     # Digit boxes + labels
     for i, (x, y, w, h) in enumerate(digits_rois_abs):
         cv2.rectangle(ov, (x, y), (x + w, y + h), color_digits, box_th)
