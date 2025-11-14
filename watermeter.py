@@ -660,6 +660,9 @@ class MqttClient:
             callback_api_version=mqtt.CallbackAPIVersion.VERSION2,)
         if cfg.mqtt_username: self.client.username_pw_set(cfg.mqtt_username,cfg.mqtt_password)
         self.connected=False
+        self._loop_started=False
+        self._last_attempt=0.0
+        self._reconnect_delay=5.0
         def _on_connect(client, userdata, flags, reason_code, properties=None):
             self.connected = True
             self.log.info(f"MQTT connected rc={reason_code}")
@@ -670,11 +673,39 @@ class MqttClient:
 
         self.client.on_connect = _on_connect
         self.client.on_disconnect = _on_disconnect
+    def _ensure_loop(self):
+        if not self._loop_started:
+            try:
+                self.client.loop_start()
+                self._loop_started = True
+            except Exception as e:
+                self.log.error(f"MQTT loop_start failed: {e}")
     def connect(self):
-        try: self.client.connect(self.cfg.mqtt_host,self.cfg.mqtt_port,keepalive=30); self.client.loop_start()
-        except Exception as e: self.log.error(f"MQTT connect failed: {e}")
+        self._last_attempt = time.time()
+        try:
+            self.client.connect(self.cfg.mqtt_host, self.cfg.mqtt_port, keepalive=30)
+        except Exception as e:
+            self.log.error(f"MQTT connect failed: {e}")
+        self._ensure_loop()
     def publish(self,t,p,retain=False):
         if self.connected: self.client.publish(t,p,retain=retain)
+    def ensure_connection(self):
+        if self.connected:
+            return
+        now = time.time()
+        if now - self._last_attempt < self._reconnect_delay:
+            return
+        self._last_attempt = now
+        try:
+            self.client.reconnect()
+            self.log.info("Attempting MQTT reconnect")
+        except Exception as e:
+            self.log.warning(f"MQTT reconnect failed ({e}); retrying full connect")
+            try:
+                self.client.connect(self.cfg.mqtt_host, self.cfg.mqtt_port, keepalive=30)
+            except Exception as e2:
+                self.log.error(f"MQTT connect retry failed: {e2}")
+        self._ensure_loop()
     def discovery(self):
         base = self.cfg.mqtt_main_topic
         pre  = self.cfg.ha_discovery_prefix
@@ -851,7 +882,8 @@ def draw_overlays(img, digits_rois_abs, per_digit_vals, dials_abs, dial_vals, di
             _draw_label(ov, label_text,
                         (x, max(12, y - 4)), fs * 0.7, color_dials, th, o_th)
 
-    cv2.imwrite(out_path, ov)
+    if out_path:
+        cv2.imwrite(out_path, ov)
     return ov
 
 
@@ -910,6 +942,8 @@ def main():
             log.info(f"Sampling mode -> {mode} (interval={target_interval}s)")
             mode_prev = mode
         
+        mqttc.ensure_connection()
+
         try:
             url=cfg.esp32_base_url.rstrip("/")+"/capture_with_flashlight"
             r=session.get(url,timeout=cfg.image_timeout); r.raise_for_status()
@@ -1039,18 +1073,34 @@ def main():
         rate_lpm = rate * 1000.0
         mqttc.publish(f"{base}/main/rate_lpm", f"{rate_lpm:.3f}", retain=False)
 
-        if cfg.save_debug_overlays:
-            ensure_dir(cfg.debug_dir)
-            out = os.path.join(cfg.debug_dir, "overlay_latest.jpg") \
-                if getattr(cfg, "debug_keep_latest_only", True) \
-                else os.path.join(cfg.debug_dir, f"overlay_{int(now)}.jpg")
-            digits_abs=[norm_to_abs(r,W,H) for r in digit_rois]
-            ov_img = draw_overlays(img, digits_abs, per_digits, dials_abs, dial_vals, 
-                                   dial_confidences, out, aligned_ok, cfg, center_offsets)
-            # Publish overlay to the MQTT camera (raw JPEG bytes)
-            topic  = getattr(cfg, "overlay_camera_topic", f"{cfg.mqtt_main_topic}/debug/overlay")
-            jpeg_q = int(getattr(cfg, "overlay_jpeg_quality", 85))
-            if getattr(cfg, "overlay_publish_mqtt", True):
+        should_save_overlay = cfg.save_debug_overlays
+        should_publish_overlay = getattr(cfg, "overlay_publish_mqtt", True)
+        if should_save_overlay or should_publish_overlay:
+            out = None
+            if should_save_overlay:
+                ensure_dir(cfg.debug_dir)
+                out = os.path.join(cfg.debug_dir, "overlay_latest.jpg") \
+                    if getattr(cfg, "debug_keep_latest_only", True) \
+                    else os.path.join(cfg.debug_dir, f"overlay_{int(now)}.jpg")
+
+            digits_abs = [norm_to_abs(r, W, H) for r in digit_rois]
+            ov_img = draw_overlays(
+                img,
+                digits_abs,
+                per_digits,
+                dials_abs,
+                dial_vals,
+                dial_confidences,
+                out,
+                aligned_ok,
+                cfg,
+                center_offsets,
+            )
+
+            if should_publish_overlay:
+                # Publish overlay to the MQTT camera (raw JPEG bytes)
+                topic = getattr(cfg, "overlay_camera_topic", f"{cfg.mqtt_main_topic}/debug/overlay")
+                jpeg_q = int(getattr(cfg, "overlay_jpeg_quality", 85))
                 ok, buf = cv2.imencode(".jpg", ov_img, [int(cv2.IMWRITE_JPEG_QUALITY), jpeg_q])
                 if ok:
                     mqttc.publish(topic, buf.tobytes(), retain=True)
