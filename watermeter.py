@@ -891,6 +891,31 @@ def draw_overlays(img, digits_rois_abs, per_digit_vals, dials_abs, dial_vals, di
     return ov
 
 
+def estimate_total_from_dials(prev_total, frac_pub, cfg):
+    """Use dial fractions plus previous reading to infer a sane total.
+
+    Assumes consumption between captures is <1 m³, so at most one rollover.
+    """
+    if prev_total is None:
+        return None
+
+    prev_int = math.floor(prev_total)
+    prev_frac = prev_total - prev_int
+
+    # Use configurable thresholds to detect rollover around zero.
+    low = min(0.25, max(0.05, cfg.rolling_threshold_down * 2.0))
+    high = 1.0 - low
+
+    expected_int = prev_int
+
+    if prev_frac > high and frac_pub < low:
+        expected_int += 1  # rollover happened but OCR missed it
+    elif prev_frac < low and frac_pub > high:
+        expected_int = max(0, expected_int - 1)  # handle rare counter rollbacks
+
+    return expected_int + frac_pub
+
+
 def build_digit_rois(cfg,W,H):
     x,y,w,h=cfg.digits_window; dw=w/cfg.digits_count; rois=[]; inset=cfg.per_digit_inset
     for i in range(cfg.digits_count):
@@ -1054,6 +1079,17 @@ def main():
         except:
             integer = int(prev_int_str) if prev_int_str else 0
         total = float(integer) + float(frac_pub)
+
+        if prev_total is not None:
+            diff_candidate = total - prev_total
+            if abs(diff_candidate) > cfg.big_jump_guard:
+                fallback_total = estimate_total_from_dials(prev_total, frac_pub, cfg)
+                if fallback_total is not None and abs(fallback_total - prev_total) <= cfg.big_jump_guard:
+                    log.warning(
+                        "OCR integer jump (Δ=%.3f) exceeds guard; trusting dial fractions",
+                        diff_candidate,
+                    )
+                    total = fallback_total
 
         publish_total=total; now=time.time()
         if prev_total is not None:
