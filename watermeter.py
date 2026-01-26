@@ -595,21 +595,21 @@ def decide_digit(bottom, top, full, progress, thr_up, thr_dn, prev_digit=None):
     # This handles the case where digit is cropped/transitioning but dials show rollover happened
     if prev_digit is not None and progress <= thr_dn:
         # Low progress means dials show values near 0, indicating a rollover just occurred
-        # Trust the dial reading and increment the digit, even if OCR doesn't see it yet
         next_digit = (prev_digit + 1) % 10
         
         # If OCR managed to see the new digit, great! Use it
         if f == next_digit or t == next_digit or b == next_digit:
             return next_digit
         
-        # If OCR still shows old digit, that's expected during transition
+        # If OCR clearly shows the previous digit is still there, trust OCR
+        # (rollover hasn't happened yet, or low progress is normal for this digit)
         if f == prev_digit or t == prev_digit or b == prev_digit:
-            # But dials say rollover happened, so trust dials over OCR
-            return next_digit
+            return prev_digit
         
-        # OCR shows something else entirely - might be misread, still trust dials
-        # This is the critical case: OCR fails, but dial reading at ~0.001 proves rollover
-        return next_digit
+        # OCR shows something else entirely - trust OCR reading over dial inference
+        # Only use dial-based inference when OCR completely fails (all None)
+        if f is None and t is None and b is None:
+            return next_digit
 
     # 4) If we have previous digit and we're in stable zone, use it
     if prev_digit is not None and in_middle:
@@ -830,7 +830,7 @@ def adjust_dial_roi(original_roi, center_offset, W, H, smoothing_alpha=0.3):
     return [new_x, new_y, w, h]
 
 def draw_overlays(img, digits_rois_abs, per_digit_vals, dials_abs, dial_vals, dial_confidences, 
-                  out_path, aligned_ok, cfg, center_offsets=None):
+                  out_path, aligned_ok, cfg, center_offsets=None, resolved_digits=None):
     ov = img.copy()
     H, W = ov.shape[:2]
 
@@ -849,9 +849,15 @@ def draw_overlays(img, digits_rois_abs, per_digit_vals, dials_abs, dial_vals, di
     # Digit boxes + labels
     for i, (x, y, w, h) in enumerate(digits_rois_abs):
         cv2.rectangle(ov, (x, y), (x + w, y + h), color_digits, box_th)
-        if i < len(per_digit_vals) and per_digit_vals[i] is not None:
-            _draw_label(ov, f"{per_digit_vals[i]}",
-                        (x, max(12, y - 4)), fs, color_digits, th, o_th)
+        if i < len(per_digit_vals):
+            # Show raw OCR value, or fall back to resolved digit if OCR failed
+            val = per_digit_vals[i]
+            if val in (None, ""):
+                # Fall back to resolved digit if available
+                val = resolved_digits[i] if resolved_digits and i < len(resolved_digits) else None
+            if val is not None:
+                _draw_label(ov, f"{val}",
+                            (x, max(12, y - 4)), fs, color_digits, th, o_th)
 
     # Dial boxes + labels with confidence-based coloring
     for i, (x, y, w, h) in enumerate(dials_abs):
@@ -883,8 +889,27 @@ def draw_overlays(img, digits_rois_abs, per_digit_vals, dials_abs, dial_vals, di
             label_text = f"{dial_vals[i]:.2f}"
             if i < len(dial_confidences):
                 label_text += f" ({dial_confidences[i]:.0%})"
-            _draw_label(ov, label_text,
-                        (x, max(12, y - 4)), fs * 0.7, color_dials, th, o_th)
+            
+            # Position labels to avoid overlap:
+            # - Middle-left dial (index 1): bottom-left, outside the dial box
+            # - Middle-right dial (index 2): bottom-right, outside the dial box  
+            # - Other dials: above the dial (default)
+            num_dials = len(dials_abs)
+            if num_dials == 4 and (i == 2 or i == 3):
+                # Bottom-left of dial: text right-aligned to left edge of box
+                text_size = cv2.getTextSize(label_text, cv2.FONT_HERSHEY_SIMPLEX, fs * 0.7, th)[0]
+                label_x = x - text_size[0] - 4
+                label_y = y + h - 4
+                _draw_label(ov, label_text, (label_x, label_y), fs * 0.7, color_dials, th, o_th)
+            elif num_dials == 4 and (i == 1 or i == 0):
+                # Bottom-right of dial: text left-aligned to right edge of box
+                label_x = x + w + 4
+                label_y = y + h - 4
+                _draw_label(ov, label_text, (label_x, label_y), fs * 0.7, color_dials, th, o_th)
+            else:
+                # Default: above the dial
+                _draw_label(ov, label_text,
+                            (x, max(12, y - 4)), fs * 0.7, color_dials, th, o_th)
 
     if out_path:
         cv2.imwrite(out_path, ov)
@@ -1074,6 +1099,9 @@ def main():
         prev_int_str = (f"{int(prev_total):0{cfg.digits_count}d}" if prev_total is not None else None)
         resolved_str, per_digits = compose_integer(obs, frac_prog, cfg.rolling_threshold_up, cfg.rolling_threshold_down, prev_int_str)
 
+        # Raw OCR values for overlay (show what was actually read, not the resolved values)
+        raw_ocr_digits = [full for (full, top, bot) in obs]
+
         try:
             integer = int(resolved_str)
         except:
@@ -1127,7 +1155,7 @@ def main():
             ov_img = draw_overlays(
                 img,
                 digits_abs,
-                per_digits,
+                raw_ocr_digits,
                 dials_abs,
                 dial_vals,
                 dial_confidences,
@@ -1135,6 +1163,7 @@ def main():
                 aligned_ok,
                 cfg,
                 center_offsets,
+                resolved_digits=per_digits,
             )
 
             if should_publish_overlay:
