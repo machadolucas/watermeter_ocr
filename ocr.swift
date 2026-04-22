@@ -85,7 +85,7 @@ func recognize(_ image: CGImage, level: VNRequestTextRecognitionLevel) -> String
     } catch {
         return ""
     }
-    let results = (req.results as? [VNRecognizedTextObservation]) ?? []
+    let results = req.results ?? []
     var out = ""
     for obs in results {
         if let cand = obs.topCandidates(1).first {

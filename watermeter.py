@@ -726,33 +726,41 @@ def is_valid_digital_view(raw_total, raw_flow, cfg):
 
     Runs before the stricter regex parse so the diagnostic views (no digits, or
     too few) are rejected without paying for a float() / retry-logic round-trip.
-    Both lines must have been recognized (non-None) and the total line must
-    contain at least `digital_min_digits` digit characters.
+    The total line must contain at least `digital_min_digits` digit characters.
+
+    The flow line is optional: some installations have flash glare that forces
+    camera alignment to favour a clean total line at the expense of the flow
+    line. When `digital_flow_roi` is empty, flow isn't captured or validated
+    here, and `raw_flow` is expected to be None.
     """
-    if raw_total is None or raw_flow is None:
+    if raw_total is None:
         return False
     total_digits = sum(1 for c in raw_total if c.isdigit())
-    flow_digits = sum(1 for c in raw_flow if c.isdigit())
     if total_digits < cfg.digital_min_digits:
         return False
-    if flow_digits < 2:  # flow is at minimum "X.YYY" — 4 digits, but accept minor misses
-        return False
+    if cfg.digital_flow_roi:
+        if raw_flow is None:
+            return False
+        flow_digits = sum(1 for c in raw_flow if c.isdigit())
+        if flow_digits < 2:  # flow is at minimum "X.YYY" — 4 digits, but accept minor misses
+            return False
     return True
 
 
 def validate_digital_reading(total, flow, prev_total, cfg):
     """Post-parse sanity check.
 
-    Rejects None/NaN/inf, negative flow, and totals that drift more than
-    `big_jump_guard` from the previous reading. The first read (prev_total is
-    None) is always accepted so the service has a baseline on a cold start.
+    Rejects None/NaN/inf totals, negative/non-finite flow (when flow tracking
+    is enabled), and totals that drift more than `big_jump_guard` from the
+    previous reading. The first read (prev_total is None) is always accepted
+    so the service has a baseline on a cold start. When `digital_flow_roi` is
+    empty, `flow` is expected to be None and is not evaluated.
     """
-    if total is None or flow is None:
+    if total is None or not math.isfinite(total):
         return False
-    if not (math.isfinite(total) and math.isfinite(flow)):
-        return False
-    if flow < 0:
-        return False
+    if cfg.digital_flow_roi:
+        if flow is None or not math.isfinite(flow) or flow < 0:
+            return False
     if prev_total is not None and abs(total - prev_total) > cfg.big_jump_guard:
         return False
     return True
@@ -891,9 +899,14 @@ class MqttClient:
         self.publish(f"{pre}/sensor/water_rate_lpm/config", json.dumps(rate_lpm), retain=True)
 
         # Digital meters publish an on-meter instantaneous flow in m³/h directly
-        # (no need to infer it from deltas). Only advertise the sensor in digital
-        # mode so mechanical HA installs don't get a dead entity.
-        if getattr(self.cfg, "meter_type", "mechanical") == "digital":
+        # (no need to infer it from deltas). Advertise the sensor only when
+        # (a) we're in digital mode AND (b) a flow ROI is actually configured —
+        # some installs capture only the total line because of flash glare.
+        digital_flow_tracked = (
+            getattr(self.cfg, "meter_type", "mechanical") == "digital"
+            and bool(getattr(self.cfg, "digital_flow_roi", []))
+        )
+        if digital_flow_tracked:
             flow_m3h = {
                 "name": "Water Flow",
                 "state_topic": f"{base}/main/flow_m3h",
@@ -1223,7 +1236,11 @@ def run_digital_cycle(cfg, ocr, aligner, session, prev_total, log, sleep=time.sl
         )
 
         raw_total = ocr.read_line(ocr_path, cfg.digital_total_roi)
-        raw_flow = ocr.read_line(ocr_path, cfg.digital_flow_roi)
+        # Flow line is optional. If the user configured only rois.digital.total
+        # (typical when flash glare forces alignment to favour the total line),
+        # skip the flow OCR call entirely and publish only the delta-based rate.
+        raw_flow = (ocr.read_line(ocr_path, cfg.digital_flow_roi)
+                    if cfg.digital_flow_roi else None)
 
         if not is_valid_digital_view(raw_total, raw_flow, cfg):
             log.info(
@@ -1235,7 +1252,8 @@ def run_digital_cycle(cfg, ocr, aligner, session, prev_total, log, sleep=time.sl
             continue
 
         total = parse_digital_total(raw_total, cfg.digital_total_regex)
-        flow = parse_digital_flow(raw_flow, cfg.digital_flow_regex)
+        flow = (parse_digital_flow(raw_flow, cfg.digital_flow_regex)
+                if cfg.digital_flow_roi else None)
         if not validate_digital_reading(total, flow, prev_total, cfg):
             log.warning(
                 "Parse/validate failed (attempt %d/%d): raw_total=%r raw_flow=%r "
@@ -1430,7 +1448,8 @@ def main():
             mqttc.publish(f"{base}/main/value", f"{publish_total:.6f}", retain=True)
             mqttc.publish(f"{base}/main/rate", f"{rate:.6f}", retain=False)
             mqttc.publish(f"{base}/main/rate_lpm", f"{rate_lpm:.3f}", retain=False)
-            mqttc.publish(f"{base}/main/flow_m3h", f"{flow_m3h:.3f}", retain=False)
+            if flow_m3h is not None:
+                mqttc.publish(f"{base}/main/flow_m3h", f"{flow_m3h:.3f}", retain=False)
 
             should_save_overlay = cfg.save_debug_overlays
             should_publish_overlay = getattr(cfg, "overlay_publish_mqtt", True)

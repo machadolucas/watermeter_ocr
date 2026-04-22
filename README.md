@@ -3,9 +3,9 @@
 Reads a water meter using an **ESP32-S3 AI-on-the-Edge Cam** for image capture and a **Mac** for fast, robust processing. Two pipelines are supported, selectable via `meter.type`:
 
 - **Mechanical** (default): odometer digits + 4 red-pointer dials. Apple **Vision** per-digit OCR (full/top/bottom) resolves rolling digits; OpenCV reads the analog dials.
-- **Digital**: fully electronic LCD (e.g. Qalcosonic W1) with total and instant-flow lines. Apple Vision line OCR only — no dials, no digit composition. Handles the display's rotating views (numeric + two diagnostic) by retrying within a single cycle until a numeric view is captured.
+- **Digital**: fully electronic LCD (e.g. Qalcosonic W1) with total and instant-flow lines. Apple Vision line OCR only — no dials, no digit composition. Handles the display's rotating views (numeric + two diagnostic) by retrying within a single cycle until a numeric view is captured. The flow-line ROI is optional: if flash glare makes both lines hard to capture cleanly, calibrate only the total and the service falls back to delta-computed rate.
 
-Publishes **total (m³)**, **flow rate (m³/min)**, **liters/min**, and an **overlay camera feed** to Home Assistant via **MQTT**. Digital mode additionally publishes **`water_flow_m3h`** — the instant flow read straight off the LCD (more responsive than the delta-based rate).
+Publishes **total (m³)**, **flow rate (m³/min)**, **liters/min**, and an **overlay camera feed** to Home Assistant via **MQTT**. Digital mode additionally publishes **`water_flow_m3h`** — the instant flow read straight off the LCD (more responsive than the delta-based rate) — when the flow-line ROI is configured.
 
 <p align="center">
   <img src="./overlay_example.jpg" alt="Water meter overlay example" width="520">
@@ -71,10 +71,46 @@ open -e ~/watermeter/config.yaml                              # set ESP32 IP + M
 tail -f ~/watermeter/watermeter.log
 ```
 
-> The LaunchAgent will start the service at login/boot. Re-run `./install.sh` any time to update.
+> The LaunchAgent starts the service at login/boot. When updating to newer code on an already-installed Mac, see [Updating an existing installation](#updating-an-existing-installation).
 > Uninstall: `launchctl unload ~/Library/LaunchAgents/com.watermeter.ocr.plist && rm -rf ~/watermeter`.
 
 > **Don't run `python3 calibrate.py` with the system Python** — it will fail with `ModuleNotFoundError: No module named 'cv2'`. Use the deployed venv (`~/watermeter/venv/bin/python3 ...`) or activate it first (`source ~/watermeter/venv/bin/activate`). See [docs/CONFIGURATION.md § Local development environment](./docs/CONFIGURATION.md#local-development-environment).
+
+---
+
+## Updating an existing installation
+
+When new code lands in this repo and you've already installed the service on the target Mac:
+
+1. Pull the latest code in the cloned repo:
+
+   ```bash
+   cd /path/to/watermeter_ocr
+   git pull
+   ```
+
+2. Re-run the installer from the repo directory:
+
+   ```bash
+   ./install.sh
+   ```
+
+   This:
+   - rebuilds the Swift OCR helper at `~/watermeter/bin/ocr`,
+   - overwrites `~/watermeter/watermeter.py` with the new version,
+   - refreshes the LaunchAgent plist and reloads it (unload + load + start),
+   - preserves your `~/watermeter/config.yaml`, `state.json`, `reference.jpg`, and everything under `~/watermeter/debug/`.
+
+3. Confirm the service came back up:
+
+   ```bash
+   launchctl list | grep watermeter
+   tail -f ~/watermeter/watermeter.log
+   ```
+
+> The installer only copies `config.yaml` from the repo if `~/watermeter/config.yaml` is missing — your tuned settings survive. When a release adds new config keys, the service picks them up via `load_config`'s built-in fallbacks; release notes will call out any default changes that matter.
+
+> If the update introduces a schema change your old file doesn't have (e.g. switching from `mechanical` to `digital`), edit `~/watermeter/config.yaml` before step 2, or use `~/watermeter/venv/bin/python3 calibrate.py` for ROI work. When switching meter types, run `~/watermeter/venv/bin/python3 watermeter.py --config ~/watermeter/config.yaml --reset-total 0` once so the monotonic guard accepts the new baseline.
 
 ---
 

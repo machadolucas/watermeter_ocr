@@ -168,7 +168,8 @@ Break these and things go silently wrong.
 - **`run_digital_cycle` is the ONLY place that retries within a single capture cycle.** The display auto-cycles between 3 views (measured dwells 10 s / 5 s / 4 s, total ≈ 19 s). Adding ad-hoc retries elsewhere compounds the budget and can overrun `interval_sec`. If you need more retries, tune `digital_max_retries` in config.
 - **`digital_retry_delay_sec` must exceed the longest diag-view dwell (5 s).** Shorter delays phase-lock: every retry lands on the same diagnostic screen. The default 5.5 s guarantees a retry crosses at least one dwell boundary. If the meter's firmware changes dwell times, recheck this.
 - **`state.json.meter_type` is the cross-contamination guard.** When config flips between `mechanical` and `digital`, the persisted totals aren't comparable. The load path at [watermeter.py](watermeter.py) discards `prev_total` on mismatch and logs a warning; it does NOT exit, because launchd crash-looping is worse than a one-cycle unknown rate.
-- **HA discovery for `water_flow_m3h` is gated on `cfg.meter_type == "digital"`.** Mechanical installs must not see a dead sensor in HA. The gate lives in `MqttClient.discovery`.
+- **HA discovery for `water_flow_m3h` is gated on `cfg.meter_type == "digital"` AND `cfg.digital_flow_roi` being non-empty.** Mechanical installs must not see a dead sensor in HA. Digital installs that chose to skip the flow ROI (flash-glare workaround) also must not see it. The gate lives in `MqttClient.discovery`.
+- **`cfg.digital_flow_roi` is optional.** When it's empty, `run_digital_cycle` skips the flow OCR call, `parse_digital_flow` is not invoked, and `flow` in the result dict is `None`. The `is_valid_digital_view` and `validate_digital_reading` helpers both treat flow as optional when the ROI is unconfigured. Any new code that reads `result["flow_m3h"]` must handle `None`.
 
 ## Config pitfalls
 

@@ -130,6 +130,29 @@ class TestIsValidDigitalView:
     def test_flow_has_no_digits_rejected(self):
         assert is_valid_digital_view("000100.000", "m3/h", _cfg_stub()) is False
 
+    def test_flow_optional_when_roi_unconfigured(self):
+        # If the user chose not to calibrate a flow ROI (e.g. flash glare), the
+        # cheap validator must accept a None raw_flow — the caller also skipped
+        # the read, so we never had a chance to see digits on that line.
+        cfg = _cfg_stub(digital_flow_roi=[])
+        assert is_valid_digital_view("000100.000", None, cfg) is True
+
+    def test_total_still_required_when_flow_disabled(self):
+        cfg = _cfg_stub(digital_flow_roi=[])
+        assert is_valid_digital_view(None, None, cfg) is False
+        assert is_valid_digital_view("QR123", None, cfg) is False
+
+    def test_rejects_qalcosonic_alnum_diag_view(self):
+        # Qalcosonic-style diagnostic screen: mixed letters/digits.
+        # "F6A 1d426" has 5 digit chars; flow "CrC" has 0.
+        assert is_valid_digital_view("F6A 1d426", "CrC", _cfg_stub()) is False
+
+    def test_rejects_qalcosonic_short_number_diag_view(self):
+        # Second diagnostic view: looks numeric but "401.06" has only 5 digit chars;
+        # flow "wEr" has 0. Guards against a 5-digit reading being mis-parsed as
+        # a short total.
+        assert is_valid_digital_view("401.06", "wEr", _cfg_stub()) is False
+
 
 # ---------------------------------------------------------------------------
 # validate_digital_reading
@@ -159,29 +182,45 @@ class TestValidateDigitalReading:
         assert validate_digital_reading(None, 0.1, 100.0, _cfg_stub()) is False
         assert validate_digital_reading(100.0, None, 100.0, _cfg_stub()) is False
 
+    def test_flow_none_accepted_when_roi_unconfigured(self):
+        cfg = _cfg_stub(digital_flow_roi=[])
+        assert validate_digital_reading(100.0, None, 99.5, cfg) is True
+        # Big-jump guard still applies on the total even without flow.
+        assert validate_digital_reading(200.0, None, 99.5, cfg) is False
+
 
 # ---------------------------------------------------------------------------
 # run_digital_cycle retry behaviour
 # ---------------------------------------------------------------------------
 
 class _FakeOCR:
-    """VisionOCR double. Returns a prescripted (total, flow) pair per call."""
+    """VisionOCR double. Returns prescripted line strings in call order.
+
+    When the cycle runs with both total + flow ROIs configured, each "attempt"
+    calls read_line twice (total then flow). With flow disabled it calls once.
+    Test fixtures should pass a flat list of expected strings in call order.
+    """
 
     def __init__(self, script):
-        # script is a list of (raw_total, raw_flow) tuples, consumed in order.
-        # read_line is called twice per cycle (total first, then flow) so we
-        # interleave them here.
         self._script = list(script)
         self._i = 0
 
     def read_line(self, img, roi):
-        # The cycle calls read_line twice per attempt: total, flow.
-        if self._i // 2 >= len(self._script):
+        if self._i >= len(self._script):
             return None
-        pair = self._script[self._i // 2]
-        val = pair[self._i % 2]
+        val = self._script[self._i]
         self._i += 1
         return val
+
+
+def _flatten(pairs):
+    """Interleave a list of (total, flow) pairs into the call order the fake
+    OCR expects. Convenience for tests that want to think in pairs."""
+    out = []
+    for t, f in pairs:
+        out.append(t)
+        out.append(f)
+    return out
 
 
 def _dummy_frame():
@@ -206,7 +245,7 @@ class TestRunDigitalCycle:
     def test_first_attempt_succeeds(self, monkeypatch):
         self._patch_capture(monkeypatch)
         cfg = _cfg_stub()
-        ocr = _FakeOCR([("000100.000", "00.125")])
+        ocr = _FakeOCR(_flatten([("000100.000", "00.125")]))
         result = run_digital_cycle(cfg, ocr, aligner=None, session=None,
                                    prev_total=None, log=_StubLog(), sleep=_noop)
         assert result is not None
@@ -218,11 +257,11 @@ class TestRunDigitalCycle:
     def test_retries_past_diag_view(self, monkeypatch):
         calls = self._patch_capture(monkeypatch)
         cfg = _cfg_stub(digital_max_retries=2)
-        ocr = _FakeOCR([
+        ocr = _FakeOCR(_flatten([
             ("", ""),                    # diag 1 — empty
             ("meter info", "serial"),    # diag 2 — text without enough digits
             ("001234.567", "12.345"),    # numeric view finally
-        ])
+        ]))
         result = run_digital_cycle(cfg, ocr, aligner=None, session=None,
                                    prev_total=None, log=_StubLog(), sleep=_noop)
         assert result is not None
@@ -233,7 +272,7 @@ class TestRunDigitalCycle:
         calls = self._patch_capture(monkeypatch)
         cfg = _cfg_stub(digital_max_retries=2)
         # All three captures see diag screens — caller should skip the cycle.
-        ocr = _FakeOCR([("", ""), ("", ""), ("", "")])
+        ocr = _FakeOCR(_flatten([("", ""), ("", ""), ("", "")]))
         result = run_digital_cycle(cfg, ocr, aligner=None, session=None,
                                    prev_total=None, log=_StubLog(), sleep=_noop)
         assert result is None
@@ -244,7 +283,7 @@ class TestRunDigitalCycle:
         # not give up on a single capture_frame() == None.
         self._patch_capture(monkeypatch, returns_seq=[None, _dummy_frame(), _dummy_frame()])
         cfg = _cfg_stub(digital_max_retries=2)
-        ocr = _FakeOCR([("000100.000", "00.125")])
+        ocr = _FakeOCR(_flatten([("000100.000", "00.125")]))
         result = run_digital_cycle(cfg, ocr, aligner=None, session=None,
                                    prev_total=None, log=_StubLog(), sleep=_noop)
         assert result is not None
@@ -256,10 +295,25 @@ class TestRunDigitalCycle:
         # against prev_total and we bail out.
         self._patch_capture(monkeypatch)
         cfg = _cfg_stub(digital_max_retries=0, big_jump_guard=1.0)
-        ocr = _FakeOCR([("000200.000", "00.100")])
+        ocr = _FakeOCR(_flatten([("000200.000", "00.100")]))
         result = run_digital_cycle(cfg, ocr, aligner=None, session=None,
                                    prev_total=100.0, log=_StubLog(), sleep=_noop)
         assert result is None
+
+    def test_flow_disabled_only_reads_total(self, monkeypatch):
+        # When digital_flow_roi is empty, run_digital_cycle must NOT call
+        # ocr.read_line for flow — the fake only yields one string per attempt.
+        self._patch_capture(monkeypatch)
+        cfg = _cfg_stub(digital_flow_roi=[])
+        ocr = _FakeOCR(["000100.000"])  # exactly one read expected, not two
+        result = run_digital_cycle(cfg, ocr, aligner=None, session=None,
+                                   prev_total=None, log=_StubLog(), sleep=_noop)
+        assert result is not None
+        assert result["total"] == pytest.approx(100.0)
+        assert result["flow_m3h"] is None
+        assert result["raw_flow"] is None
+        # Exhausted exactly one entry — no stray flow reads consumed.
+        assert ocr._i == 1
 
 
 def _noop(_):
@@ -300,23 +354,37 @@ def _recording_mqtt(monkeypatch):
 
 
 class TestDiscoveryFlowM3h:
-    def _cfg(self, tmp_path, meter_type):
+    def _cfg(self, tmp_path, meter_type, flow_roi=True):
         p = tmp_path / "config.yaml"
-        extra = "meter:\n  type: digital\n" if meter_type == "digital" else ""
-        p.write_text(
-            "esp32:\n  base_url: \"http://localhost\"\n"
-            "mqtt:\n  topic: \"home/watermeter\"\n"
-            + extra
-        )
+        parts = [
+            "esp32:\n  base_url: \"http://localhost\"\n",
+            "mqtt:\n  topic: \"home/watermeter\"\n",
+        ]
+        if meter_type == "digital":
+            parts.append("meter:\n  type: digital\n")
+            parts.append("rois:\n  digital:\n    total: [0.1, 0.1, 0.8, 0.2]\n")
+            if flow_roi:
+                parts.append("    flow:  [0.1, 0.5, 0.8, 0.2]\n")
+        p.write_text("".join(parts))
         return load_config(str(p))
 
-    def test_digital_publishes_flow_m3h(self, tmp_path, _recording_mqtt):
-        cfg = self._cfg(tmp_path, "digital")
+    def test_digital_with_flow_roi_publishes_flow_m3h(self, tmp_path, _recording_mqtt):
+        cfg = self._cfg(tmp_path, "digital", flow_roi=True)
         client = MqttClient(cfg, _StubLog())
         client.connected = True  # bypass the gate so publish() actually records
         client.discovery()
         topics = [t for (t, _, _) in _recording_mqtt[0].published]
         assert any("water_flow_m3h/config" in t for t in topics)
+
+    def test_digital_without_flow_roi_skips_flow_m3h(self, tmp_path, _recording_mqtt):
+        # Flash glare etc. — the user captures only the total line. The HA
+        # sensor should be suppressed so the entity list doesn't go stale.
+        cfg = self._cfg(tmp_path, "digital", flow_roi=False)
+        client = MqttClient(cfg, _StubLog())
+        client.connected = True
+        client.discovery()
+        topics = [t for (t, _, _) in _recording_mqtt[0].published]
+        assert not any("water_flow_m3h" in t for t in topics)
 
     def test_mechanical_does_not_publish_flow_m3h(self, tmp_path, _recording_mqtt):
         cfg = self._cfg(tmp_path, "mechanical")

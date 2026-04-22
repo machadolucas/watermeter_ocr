@@ -166,8 +166,19 @@ class TestValidateDigitalPayload:
         err = validate_digital_payload(p)
         assert err and "total" in err
 
-    def test_missing_flow(self):
+    def test_flow_is_optional(self):
+        # Flow ROI is optional — some installs can't align both lines cleanly
+        # due to flash glare and deliberately capture only the total.
         p = _valid_digital_payload(); p["flow"] = None
+        assert validate_digital_payload(p) is None
+
+    def test_flow_missing_key_is_also_ok(self):
+        p = _valid_digital_payload(); del p["flow"]
+        assert validate_digital_payload(p) is None
+
+    def test_flow_bad_shape_still_rejected(self):
+        # But if the user DID draw a flow ROI, its geometry is still validated.
+        p = _valid_digital_payload(); p["flow"] = [0.9, 0.9, 0.5, 0.5]  # x+w > 1
         err = validate_digital_payload(p)
         assert err and "flow" in err
 
@@ -223,6 +234,23 @@ class TestMergeDigitalRois:
         assert merged["rois"]["digital"]["flow"]  == [0.25, 0.50, 0.55, 0.15]
         # Anchors still funnel through the shared alignment.anchor_rois key.
         assert merged["alignment"]["anchor_rois"] == [[0.1, 0.0, 0.6, 0.25]]
+
+    def test_merge_without_flow_removes_existing_flow_key(self):
+        # User previously had a flow ROI, then decided to drop it (e.g. flash
+        # glare). The save should clear the stored flow so the runtime sees
+        # "flow tracking disabled" instead of reading a stale ROI.
+        doc = {"rois": {"digital": {
+            "total": [0.1, 0.1, 0.8, 0.2],
+            "flow":  [0.1, 0.5, 0.8, 0.2],
+        }}}
+        payload = {
+            "total": [0.2, 0.2, 0.6, 0.2],
+            "flow": None,
+            "anchors": [],
+        }
+        merged = merge_digital_rois(doc, payload)
+        assert merged["rois"]["digital"]["total"] == [0.2, 0.2, 0.6, 0.2]
+        assert "flow" not in merged["rois"]["digital"]
 
 
 # ---------------------------------------------------------------------------

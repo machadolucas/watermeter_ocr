@@ -75,8 +75,8 @@ Running [`calibrate.py`](../calibrate.py) edits `~/watermeter/config.yaml` direc
 | `rois.digits` | — | *(mechanical)* Single window enclosing all odometer digits. |
 | `rois.dials[]` | — | *(mechanical)* One entry per dial, ordered `×0.1 → ×0.0001`. **dials[0] must be the tenths wheel.** |
 | `meter.type` | `mechanical` | Pipeline selector: `mechanical` or `digital`. |
-| `rois.digital.total` | — | *(digital)* ROI of the total-consumption LCD line. |
-| `rois.digital.flow` | — | *(digital)* ROI of the instant-flow LCD line. |
+| `rois.digital.total` | — | *(digital)* ROI of the total-consumption LCD line. **Required** in digital mode. |
+| `rois.digital.flow` | — | *(digital)* ROI of the instant-flow LCD line. **Optional** — omit to skip flow OCR and suppress the `flow_m3h` sensor (use when flash glare makes both lines unreadable in the same capture). |
 | `digital.total_regex` | `^\d{6}\.?\d{3}$` | *(digital)* Regex that Vision's raw total output must match. |
 | `digital.flow_regex` | `^\d{1,3}\.\d{3}$` | *(digital)* Regex for Vision's flow output. |
 | `digital.max_retries` | `2` | *(digital)* Extra captures per cycle if the display is on a diagnostic view. |
@@ -187,8 +187,8 @@ processing:
 
 rois:
   digital:
-    total: [x, y, w, h]                 # line with the total consumption (m³)
-    flow:  [x, y, w, h]                 # line with the instantaneous flow (m³/h)
+    total: [x, y, w, h]                 # REQUIRED — line with the total consumption (m³)
+    flow:  [x, y, w, h]                 # OPTIONAL — line with the instant flow (m³/h); omit to skip
 
 digital:
   # Regex the parser uses to validate Vision's raw output. Default accepts both
@@ -202,6 +202,18 @@ digital:
 ```
 
 `alignment.*` still applies — ORB alignment of the whole frame helps keep the LCD ROIs stable under small camera drift, even without dials.
+
+### Flow line is optional
+
+The LCD shows two lines, but in practice camera + flash geometry often makes it hard to get both lines clean in the same capture — flash reflections wash out a band across the glass, and aligning the camera to keep the total line readable sometimes sacrifices the flow line.
+
+If you only calibrate `rois.digital.total` (leave `rois.digital.flow` out of the config), the service:
+
+- Skips the flow OCR call entirely — one less Vision invocation per capture.
+- Does NOT publish `main/flow_m3h` or advertise the HA `water_flow_m3h` sensor.
+- Still publishes total, rate (delta-computed m³/min), and rate_lpm exactly as in mechanical mode — automations that use `water_rate_lpm` continue to work unchanged.
+
+Calibrating both ROIs is strictly better when you can manage the reflections; calibrating only the total is the safe fallback.
 
 ### How the pipeline works
 
@@ -237,10 +249,10 @@ Digital mode publishes all the mechanical topics plus a new one:
 | `{mqtt.topic}/main/value` | yes | Parsed total from the LCD (after guards). |
 | `{mqtt.topic}/main/rate` | no | Delta-computed m³/min (same formula as mechanical). |
 | `{mqtt.topic}/main/rate_lpm` | no | Delta-computed L/min. |
-| `{mqtt.topic}/main/flow_m3h` | no | **New.** Instantaneous flow read directly off the LCD (more responsive than the delta-based rate). |
+| `{mqtt.topic}/main/flow_m3h` | no | **New.** Instantaneous flow read directly off the LCD. Published only when `rois.digital.flow` is configured. |
 | `{overlay.camera_topic}` | yes | Debug overlay JPEG. |
 
-Home Assistant discovery payload for `water_flow_m3h` is published **only** when `meter.type: digital`. Mechanical installs don't see a dead sensor.
+Home Assistant discovery payload for `water_flow_m3h` is published **only** when `meter.type: digital` AND `rois.digital.flow` is set. Mechanical installs and digital-total-only installs don't see a dead sensor.
 
 ### HA automations — which rate to use?
 

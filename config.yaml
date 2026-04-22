@@ -103,9 +103,14 @@ rois:
       zero_angle_deg: -90
 
 # --- digital meter example (uncomment + set meter.type: digital to enable) ---
-# For fully-digital LCD meters (e.g. Qalcosonic W1). Two text lines only:
-# total consumption (m³) and instant flow (m³/h). No dials. See
+# For fully-digital LCD meters (e.g. Qalcosonic W1). The display has two text
+# lines: total consumption (m³) and instant flow (m³/h). No dials. See
 # docs/CONFIGURATION.md § "Digital meter" for the full swap procedure.
+#
+# The flow line is OPTIONAL — some installs can't align both lines cleanly
+# because of flash glare on part of the LCD. Calibrating only `total` makes
+# the service publish just the total and the delta-computed rate; `flow_m3h`
+# and its HA sensor are suppressed automatically.
 #
 # meter:
 #   type: digital                 # default "mechanical"
@@ -115,8 +120,8 @@ rois:
 #
 # rois:
 #   digital:
-#     total: [0.10, 0.25, 0.80, 0.18]   # line with 6 int + 3 decimal digits
-#     flow:  [0.25, 0.50, 0.55, 0.15]   # line with "XX.YYY m³/h"
+#     total: [0.10, 0.25, 0.80, 0.18]   # required — line with 6 int + 3 decimal digits
+#     flow:  [0.25, 0.50, 0.55, 0.15]   # optional — line with "XX.YYY m³/h"; omit if flash glare hides it
 #
 # digital:
 #   # Regex must match Vision's output with or without an auto-detected decimal:

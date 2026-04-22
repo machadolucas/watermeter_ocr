@@ -152,12 +152,20 @@ def merge_digital_rois(doc: dict, new_rois: dict) -> dict:
     """Deep-copy doc; replace rois.digital.{total,flow} and alignment.anchor_rois.
     Mechanical ROI keys (rois.digits, rois.dials) are left untouched so a user
     can swap back to mechanical mode without losing their dial calibration.
+
+    `flow` is optional. When the user didn't draw one (null/missing), we clear
+    the existing flow entry so the saved config matches the UI state — the
+    runtime treats an empty flow ROI as "flow tracking disabled".
     """
     out = copy.deepcopy(doc)
     out.setdefault("rois", {})
     out["rois"].setdefault("digital", {})
     out["rois"]["digital"]["total"] = list(new_rois["total"])
-    out["rois"]["digital"]["flow"] = list(new_rois["flow"])
+    flow = new_rois.get("flow")
+    if flow:
+        out["rois"]["digital"]["flow"] = list(flow)
+    else:
+        out["rois"]["digital"].pop("flow", None)
     anchors = [list(a) for a in new_rois["anchors"] if a is not None]
     out.setdefault("alignment", {})
     out["alignment"]["anchor_rois"] = anchors
@@ -234,16 +242,27 @@ def validate_payload(payload: dict) -> Optional[str]:
 
 
 def validate_digital_payload(payload: dict) -> Optional[str]:
-    """Digital-mode payload: {total: [x,y,w,h], flow: [x,y,w,h], anchors: [...]}."""
+    """Digital-mode payload: {total: [x,y,w,h], flow: [x,y,w,h] | null, anchors: [...]}.
+
+    `total` is required. `flow` is optional — some installs sacrifice the flow
+    line to keep the total line free of flash glare, so a null/missing flow
+    just means the pipeline falls back to delta-computed rate only.
+    """
     if not isinstance(payload, dict):
         return "payload must be a JSON object"
-    for name in DIGITAL_ROI_NAMES:
-        roi = payload.get(name)
-        if roi is None:
-            return f"missing {name} ROI"
-        err = _valid_roi(roi)
+    # total is mandatory
+    roi = payload.get("total")
+    if roi is None:
+        return "missing total ROI"
+    err = _valid_roi(roi)
+    if err:
+        return f"total: {err}"
+    # flow is optional — validate shape only if the user drew one
+    flow = payload.get("flow")
+    if flow is not None:
+        err = _valid_roi(flow)
         if err:
-            return f"{name}: {err}"
+            return f"flow: {err}"
     anchors = payload.get("anchors", [])
     if not isinstance(anchors, list) or len(anchors) > ANCHOR_COUNT:
         return f"anchors must be a list of at most {ANCHOR_COUNT} entries"
@@ -674,7 +693,7 @@ const MECHANICAL_SLOTS = [
 ];
 const DIGITAL_SLOTS = [
   { key: 'total', label: 'Total line (m³)', color: '#4aa3ff', kind: 'digital' },
-  { key: 'flow',  label: 'Flow line (m³/h)', color: '#3ccf7b', kind: 'digital' },
+  { key: 'flow',  label: 'Flow line (optional)', color: '#3ccf7b', kind: 'digital' },
   { key: 'anchor_0', label: 'Anchor 0', color: '#6b7280', kind: 'anchor', idx: 0 },
   { key: 'anchor_1', label: 'Anchor 1', color: '#6b7280', kind: 'anchor', idx: 1 },
   { key: 'anchor_2', label: 'Anchor 2', color: '#6b7280', kind: 'anchor', idx: 2 },
