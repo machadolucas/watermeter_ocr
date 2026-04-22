@@ -164,6 +164,17 @@ rois:
 #   # (busy background, merged digits, etc.). Set false to always use
 #   # equal subdivision.
 #   per_digit_auto_detect: true
+#   # Per-digit OCR upscale factor. 1 (default) = native resolution.
+#   # Values >1 (typical 2-4) resize each sub-ROI crop with cubic
+#   # interpolation before OCR — helps when Vision ignores tight
+#   # single-character crops of small 7-segment glyphs because they're
+#   # below its minimum-feature-size threshold.
+#   ocr_upscale_factor: 1
+#   # Debug: save every per-digit input crop to
+#   # `{debug_dir}/ocr_crops/{region}_a{attempt}_d{idx}.jpg` and INFO-log
+#   # each call's ROI + raw result. Turn on when diagnosing why per-digit
+#   # OCR is returning empty; turn off in production (high write volume).
+#   save_ocr_crops: false
 #   max_retries: 2               # extra captures per cycle if wrong view detected
 #   retry_delay_sec: 5.5         # > longest diag-view dwell (5s) so retries phase-cross
 #   min_digits: 6                # cheap-fail bar for diagnostic screens

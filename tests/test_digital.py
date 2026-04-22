@@ -67,6 +67,9 @@ def _cfg_stub(**over):
         digital_flow_digit_count=0,
         digital_per_digit_inset=0.10,
         digital_per_digit_auto_detect=False,  # default tests use equal subdivision
+        digital_ocr_upscale_factor=1,
+        digital_save_ocr_crops=False,
+        debug_dir="/tmp",
         esp32_base_url="http://unused",
         image_timeout=1.0,
     )

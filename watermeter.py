@@ -153,6 +153,17 @@ class Config:
     # outer ROI. Set False to always use equal subdivision — useful when
     # projection is confused by a busy background.
     digital_per_digit_auto_detect: bool = True
+    # Per-digit OCR upscale factor. 1 (default) keeps the sub-ROI at native
+    # resolution. Values > 1 upscale each sub-ROI with INTER_CUBIC before
+    # OCR — helps when Apple Vision's text detector ignores tight
+    # single-character crops of small 7-segment glyphs because they're
+    # below its minimum-feature-size threshold. Typical useful range: 2–4.
+    digital_ocr_upscale_factor: int = 1
+    # Debug: save every per-digit OCR input crop to
+    # `{debug_dir}/ocr_crops/{region}_a{attempt}_d{idx}.jpg` and log the
+    # call's sub-ROI + raw result at INFO level. Off by default — turn on
+    # when diagnosing why per-digit OCR is returning empty.
+    digital_save_ocr_crops: bool = False
 
 def load_config(path)->Config:
     raw=load_yaml(path)
@@ -235,6 +246,8 @@ def load_config(path)->Config:
         digital_flow_digit_count = int(dig.get("flow_digit_count", 0)),
         digital_per_digit_inset = float(dig.get("per_digit_inset", 0.10)),
         digital_per_digit_auto_detect = bool(dig.get("per_digit_auto_detect", True)),
+        digital_ocr_upscale_factor = int(dig.get("ocr_upscale_factor", 1)),
+        digital_save_ocr_crops = bool(dig.get("save_ocr_crops", False)),
     )
 
 class VisionOCR:
@@ -1374,7 +1387,7 @@ def _auto_detect_digit_sub_rois(img_path, base_roi, expected_count, inset):
 
 
 def build_digit_sub_rois(img_path, base_roi, expected_count, inset=0.10,
-                         auto_detect=True):
+                         auto_detect=True, log=None, label=""):
     """Build normalized sub-ROIs for per-digit OCR.
 
     When `auto_detect` is True (default), tries to locate each digit's
@@ -1382,6 +1395,10 @@ def build_digit_sub_rois(img_path, base_roi, expected_count, inset=0.10,
     miscalibrations of the outer ROI are self-corrected. Falls back to
     equal subdivision when detection fails or finds the wrong number of
     runs. Returns exactly `expected_count` sub-ROIs either way.
+
+    When `log` is provided, logs which path (auto-detect vs fallback) was
+    taken — useful during calibration to tell whether the projection is
+    actually helping or silently falling through to equal subdivision.
     """
     if not base_roi or expected_count <= 0:
         return []
@@ -1389,12 +1406,52 @@ def build_digit_sub_rois(img_path, base_roi, expected_count, inset=0.10,
         detected = _auto_detect_digit_sub_rois(img_path, base_roi,
                                                expected_count, inset)
         if detected is not None:
+            if log is not None:
+                log.info("build_digit_sub_rois[%s]: auto-detect OK (%d digits)",
+                         label, expected_count)
             return detected
+        if log is not None:
+            log.info("build_digit_sub_rois[%s]: auto-detect failed → "
+                     "equal subdivision", label)
     return _equal_subdivide_roi(base_roi, expected_count, inset)
 
 
+def _ocr_digit_upscaled(ocr, img_path, sub_roi, factor, save_to=None):
+    """Crop `sub_roi` out of `img_path`, upscale it by `factor`× with cubic
+    interpolation, write to a temp file, and run single-digit OCR on the
+    upscaled crop. Optionally also save the upscaled crop to `save_to`
+    for debugging. Returns the single-digit string (or "" on failure).
+
+    Upscaling addresses Vision's minimum-feature-size behaviour: a tight
+    7-segment digit crop can be below the recognizer's threshold, so
+    enlarging 2–4× with smooth interpolation gives Vision a bigger glyph
+    on similarly-blurred edges, which it handles far better than the
+    pixel-hinted original.
+    """
+    img = cv2.imread(img_path)
+    if img is None:
+        return ""
+    H, W = img.shape[:2]
+    x, y, w, h = norm_to_abs(sub_roi, W, H)
+    if w <= 0 or h <= 0:
+        return ""
+    crop = img[y:y + h, x:x + w]
+    if crop.size == 0:
+        return ""
+    new_w = max(1, int(w * factor))
+    new_h = max(1, int(h * factor))
+    up = cv2.resize(crop, (new_w, new_h), interpolation=cv2.INTER_CUBIC)
+    temp_path = img_path + ".digit.jpg"
+    cv2.imwrite(temp_path, up)
+    if save_to is not None:
+        ensure_dir(os.path.dirname(save_to))
+        cv2.imwrite(save_to, up)
+    return ocr._run(temp_path, [0.0, 0.0, 1.0, 1.0], "full")
+
+
 def read_region_per_digit(ocr, img_path, base_roi, digit_count, inset=0.10,
-                          auto_detect=True):
+                          auto_detect=True, upscale=1,
+                          crops_dir=None, crops_prefix=None, log=None):
     """OCR a line region digit-by-digit and return the concatenated string.
 
     Builds sub-ROIs (auto-detected when possible, else equal subdivision),
@@ -1402,6 +1459,15 @@ def read_region_per_digit(ocr, img_path, base_roi, digit_count, inset=0.10,
     robust than line OCR for LCDs where Vision's line recognizer drops
     narrow glyphs or flips rotation-ambiguous small digits — every sub-ROI
     is a one-character classification with no line-segmentation involved.
+
+    `upscale` (default 1) scales each sub-ROI crop by that factor before
+    OCR — useful when Vision's text detector ignores crops below its
+    minimum-feature-size threshold.
+
+    `crops_dir` + `crops_prefix`: when set, write each per-digit input
+    crop to `{crops_dir}/{crops_prefix}_d{i}.jpg` for visual debugging.
+    `log`: when set, info-log each call's sub-ROI coords and OCR result
+    so the text log can be cross-referenced with the saved crops.
 
     Returns "" (not None) if the ROI is empty or digit_count <= 0, so the
     downstream concat / regex match treats it as a failed read rather than
@@ -1412,10 +1478,33 @@ def read_region_per_digit(ocr, img_path, base_roi, digit_count, inset=0.10,
     if not base_roi or digit_count <= 0:
         return ""
     subs = build_digit_sub_rois(img_path, base_roi, digit_count, inset,
-                                auto_detect)
+                                auto_detect, log=log, label=crops_prefix or "")
     digits = []
-    for sub in subs:
-        digits.append(ocr._run(img_path, sub, "full") or "")
+    for i, sub in enumerate(subs):
+        save_to = None
+        if crops_dir is not None and crops_prefix is not None:
+            save_to = os.path.join(crops_dir, f"{crops_prefix}_d{i}.jpg")
+        if upscale > 1:
+            digit = _ocr_digit_upscaled(ocr, img_path, sub, upscale,
+                                        save_to=save_to)
+        else:
+            digit = ocr._run(img_path, sub, "full") or ""
+            # Save the raw (un-upscaled) crop when requested, so crops on
+            # disk always reflect what Vision saw regardless of upscale.
+            if save_to is not None:
+                img = cv2.imread(img_path)
+                if img is not None:
+                    H, W = img.shape[:2]
+                    x, y, w, h = norm_to_abs(sub, W, H)
+                    if w > 0 and h > 0:
+                        crop = img[y:y + h, x:x + w]
+                        if crop.size > 0:
+                            ensure_dir(os.path.dirname(save_to))
+                            cv2.imwrite(save_to, crop)
+        if log is not None:
+            log.info("per-digit[%s d%d] roi=[%.4f,%.4f,%.4f,%.4f] → %r",
+                     crops_prefix or "?", i, sub[0], sub[1], sub[2], sub[3], digit)
+        digits.append(digit or "")
     return "".join(digits)
 
 
@@ -1560,32 +1649,48 @@ def run_digital_cycle(cfg, ocr, aligner, session, prev_total, log,
         # configured. Per-digit is slower (N subprocess calls per region)
         # but immune to line-recognition failure modes on small 7-segment
         # glyphs — every sub-ROI is a one-character classification.
-        def _read_region(roi, digit_count):
+        crops_dir = None
+        if cfg.digital_save_ocr_crops:
+            crops_dir = os.path.join(cfg.debug_dir, "ocr_crops")
+            ensure_dir(crops_dir)
+
+        def _read_region(roi, digit_count, region_label):
             if not roi:
                 return None
             if digit_count > 0:
+                prefix = f"{region_label}_a{attempt + 1}"
                 return read_region_per_digit(
                     ocr, ocr_path, roi, digit_count,
                     cfg.digital_per_digit_inset,
                     auto_detect=cfg.digital_per_digit_auto_detect,
+                    upscale=max(1, cfg.digital_ocr_upscale_factor),
+                    crops_dir=crops_dir, crops_prefix=prefix,
+                    log=log,
                 )
-            return ocr.read_line(ocr_path, roi)
+            line_result = ocr.read_line(ocr_path, roi)
+            log.info("line[%s a%d] roi=[%.4f,%.4f,%.4f,%.4f] → %r",
+                     region_label, attempt + 1,
+                     roi[0], roi[1], roi[2], roi[3], line_result)
+            return line_result
 
         raw_total_int = None
         raw_total_frac = None
         if cfg.digital_total_int_roi and cfg.digital_total_frac_roi:
             raw_total_int = _read_region(cfg.digital_total_int_roi,
-                                         cfg.digital_total_int_digit_count) or ""
+                                         cfg.digital_total_int_digit_count,
+                                         "total_int") or ""
             raw_total_frac = _read_region(cfg.digital_total_frac_roi,
-                                          cfg.digital_total_frac_digit_count) or ""
+                                          cfg.digital_total_frac_digit_count,
+                                          "total_frac") or ""
             raw_total = f"{raw_total_int}.{raw_total_frac}"
         else:
-            raw_total = _read_region(cfg.digital_total_roi, 0)
+            raw_total = _read_region(cfg.digital_total_roi, 0, "total")
         # Flow line is optional. If the user configured only rois.digital.total
         # (typical when flash glare forces alignment to favour the total line),
         # skip the flow OCR call entirely and publish only the delta-based rate.
         raw_flow = _read_region(cfg.digital_flow_roi,
-                                cfg.digital_flow_digit_count) if cfg.digital_flow_roi else None
+                                cfg.digital_flow_digit_count,
+                                "flow") if cfg.digital_flow_roi else None
 
         last.update({
             "frame": aligned_img,
@@ -1735,6 +1840,25 @@ def main():
         sys.exit(0)
 
     log.info("Starting watermeter (alignment)")
+    if cfg.meter_type == "digital":
+        log.info(
+            "Digital config: total_int_roi=%s total_frac_roi=%s total_roi=%s "
+            "flow_roi=%s total_regex=%r flow_regex=%r "
+            "total_int_digit_count=%d total_frac_digit_count=%d flow_digit_count=%d "
+            "per_digit_inset=%.2f per_digit_auto_detect=%s "
+            "ocr_upscale_factor=%d save_ocr_crops=%s ocr_preprocess=%r "
+            "max_retries=%d retry_delay_sec=%.1f min_digits=%d",
+            bool(cfg.digital_total_int_roi), bool(cfg.digital_total_frac_roi),
+            bool(cfg.digital_total_roi), bool(cfg.digital_flow_roi),
+            cfg.digital_total_regex.pattern, cfg.digital_flow_regex.pattern,
+            cfg.digital_total_int_digit_count, cfg.digital_total_frac_digit_count,
+            cfg.digital_flow_digit_count,
+            cfg.digital_per_digit_inset, cfg.digital_per_digit_auto_detect,
+            cfg.digital_ocr_upscale_factor, cfg.digital_save_ocr_crops,
+            cfg.digital_ocr_preprocess,
+            cfg.digital_max_retries, cfg.digital_retry_delay_sec,
+            cfg.digital_min_digits,
+        )
     state=read_json(cfg.state_path,{"total":None,"ts":None,"dial_histories":{}})
     prev_total=state.get("total"); prev_ts=state.get("ts")
 
