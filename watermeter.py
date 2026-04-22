@@ -135,6 +135,18 @@ class Config:
     # rendered as two right segments) get dropped by the recognizer.
     # "none" (default) skips preprocessing entirely.
     digital_ocr_preprocess: str = "none"
+    # Optional per-digit OCR mode for the digital pipeline. When a digit_count
+    # is non-zero, the corresponding region's base ROI is subdivided into
+    # that many equal-width sub-ROIs and each digit is recognized
+    # independently via the Swift digit-mode helper, then concatenated. More
+    # robust than line OCR for LCDs where line recognition is unreliable
+    # (rotation ambiguity on small glyphs, narrow "1"s dropped as noise,
+    # etc.) — at the cost of N extra subprocess calls per region per attempt.
+    # 0 (default) means use line OCR for that region (original behaviour).
+    digital_total_int_digit_count: int = 0
+    digital_total_frac_digit_count: int = 0
+    digital_flow_digit_count: int = 0
+    digital_per_digit_inset: float = 0.10
 
 def load_config(path)->Config:
     raw=load_yaml(path)
@@ -212,6 +224,10 @@ def load_config(path)->Config:
         digital_retry_delay_sec = float(dig.get("retry_delay_sec", 5.5)),
         digital_min_digits = int(dig.get("min_digits", 6)),
         digital_ocr_preprocess = str(dig.get("ocr_preprocess", "none")).lower(),
+        digital_total_int_digit_count = int(dig.get("total_int_digit_count", 0)),
+        digital_total_frac_digit_count = int(dig.get("total_frac_digit_count", 0)),
+        digital_flow_digit_count = int(dig.get("flow_digit_count", 0)),
+        digital_per_digit_inset = float(dig.get("per_digit_inset", 0.10)),
     )
 
 class VisionOCR:
@@ -1243,6 +1259,35 @@ def build_digit_rois(cfg,W,H):
     return rois
 
 
+def read_region_per_digit(ocr, img_path, base_roi, digit_count, inset=0.10):
+    """OCR a line region digit-by-digit and return the concatenated string.
+
+    Splits `base_roi` into `digit_count` equal-width sub-ROIs (each shrunk
+    inward by `inset` to avoid the neighbour's edge leaking in), calls the
+    single-digit OCR mode on each, and joins the outputs. More robust than
+    line OCR for LCDs where Vision's line recognizer drops narrow glyphs or
+    flips rotation-ambiguous small digits — every sub-ROI is a one-character
+    classification with no line-segmentation involved.
+
+    Returns "" (not None) if the ROI is empty or digit_count <= 0, so the
+    downstream concat / regex match treats it as a failed read rather than a
+    crash. Each digit that OCR couldn't read contributes an empty string to
+    the join, which naturally shortens the output and fails the strict
+    regex on the total/flow parsers.
+    """
+    if not base_roi or digit_count <= 0:
+        return ""
+    x, y, w, h = base_roi
+    dw = w / digit_count
+    digits = []
+    for i in range(digit_count):
+        sx = x + i * dw
+        sub = [sx + dw * inset, y + h * inset,
+               dw * (1 - 2 * inset), h * (1 - 2 * inset)]
+        digits.append(ocr._run(img_path, sub, "full") or "")
+    return "".join(digits)
+
+
 def apply_ocr_preprocess(src_path, dst_path, mode):
     """Apply optional contrast/sharpening preprocessing to an image before
     it's fed to Apple Vision. Returns True if a new file was written at
@@ -1361,19 +1406,35 @@ def run_digital_cycle(cfg, ocr, aligner, session, prev_total, log, sleep=time.sl
         # OCR them separately and concatenate with "." before parsing. Needed
         # for LCDs whose fractional digits are rendered in a smaller font and
         # get dropped by Vision when included in a single wide ROI.
+        #
+        # Each region (int, frac, flow) is OCR'd in line mode by default, but
+        # switches to per-digit mode when the corresponding digit_count is
+        # configured. Per-digit is slower (N subprocess calls per region)
+        # but immune to line-recognition failure modes on small 7-segment
+        # glyphs — every sub-ROI is a one-character classification.
+        def _read_region(roi, digit_count):
+            if not roi:
+                return None
+            if digit_count > 0:
+                return read_region_per_digit(ocr, ocr_path, roi, digit_count,
+                                             cfg.digital_per_digit_inset)
+            return ocr.read_line(ocr_path, roi)
+
         raw_total_int = None
         raw_total_frac = None
         if cfg.digital_total_int_roi and cfg.digital_total_frac_roi:
-            raw_total_int = ocr.read_line(ocr_path, cfg.digital_total_int_roi) or ""
-            raw_total_frac = ocr.read_line(ocr_path, cfg.digital_total_frac_roi) or ""
+            raw_total_int = _read_region(cfg.digital_total_int_roi,
+                                         cfg.digital_total_int_digit_count) or ""
+            raw_total_frac = _read_region(cfg.digital_total_frac_roi,
+                                          cfg.digital_total_frac_digit_count) or ""
             raw_total = f"{raw_total_int}.{raw_total_frac}"
         else:
-            raw_total = ocr.read_line(ocr_path, cfg.digital_total_roi)
+            raw_total = _read_region(cfg.digital_total_roi, 0)
         # Flow line is optional. If the user configured only rois.digital.total
         # (typical when flash glare forces alignment to favour the total line),
         # skip the flow OCR call entirely and publish only the delta-based rate.
-        raw_flow = (ocr.read_line(ocr_path, cfg.digital_flow_roi)
-                    if cfg.digital_flow_roi else None)
+        raw_flow = _read_region(cfg.digital_flow_roi,
+                                cfg.digital_flow_digit_count) if cfg.digital_flow_roi else None
 
         last.update({
             "frame": aligned_img,

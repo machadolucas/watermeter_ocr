@@ -29,6 +29,7 @@ from watermeter import (
     load_config,
     parse_digital_flow,
     parse_digital_total,
+    read_region_per_digit,
     run_digital_cycle,
     validate_digital_reading,
 )
@@ -60,6 +61,10 @@ def _cfg_stub(**over):
         digital_total_frac_roi=[],
         digital_flow_roi=[0.1, 0.5, 0.8, 0.2],
         digital_ocr_preprocess="none",
+        digital_total_int_digit_count=0,
+        digital_total_frac_digit_count=0,
+        digital_flow_digit_count=0,
+        digital_per_digit_inset=0.10,
         esp32_base_url="http://unused",
         image_timeout=1.0,
     )
@@ -207,11 +212,14 @@ class TestValidateDigitalReading:
 # ---------------------------------------------------------------------------
 
 class _FakeOCR:
-    """VisionOCR double. Returns prescripted line strings in call order.
+    """VisionOCR double. Returns prescripted strings in call order.
 
-    When the cycle runs with both total + flow ROIs configured, each "attempt"
-    calls read_line twice (total then flow). With flow disabled it calls once.
-    Test fixtures should pass a flat list of expected strings in call order.
+    Handles both the line-mode and per-digit modes:
+      - `read_line` is consumed by line OCR (one call per region per attempt).
+      - `_run` is consumed by the single-digit OCR mode used for per-digit
+        mode (N calls per region per attempt).
+    Tests provide a flat list of expected strings; consumption order mirrors
+    the pipeline. In per-digit mode each digit consumes one entry.
     """
 
     def __init__(self, script):
@@ -224,6 +232,15 @@ class _FakeOCR:
         val = self._script[self._i]
         self._i += 1
         return val
+
+    def _run(self, img, roi, half="full"):
+        # Matches VisionOCR._run — returns a single digit string or "".
+        if self._i >= len(self._script):
+            return ""
+        val = self._script[self._i]
+        self._i += 1
+        # The real Swift helper returns at most one char; mimic that.
+        return val[:1] if val else ""
 
 
 def _flatten(pairs):
@@ -399,6 +416,70 @@ class TestRunDigitalCycle:
         # can annotate each sub-ROI independently.
         assert result["raw_total_int"] == "000000"
         assert result["raw_total_frac"] == ""
+
+    def test_per_digit_int_concatenates(self, monkeypatch):
+        # Per-digit OCR for the integer sub-ROI: each digit is recognized
+        # independently via the Swift digit-mode helper (6 subprocess calls)
+        # and concatenated. Frac stays in line mode. Useful when line OCR
+        # drops narrow glyphs on the integer side.
+        self._patch_capture(monkeypatch)
+        cfg = _cfg_stub(
+            digital_total_int_roi=[0.10, 0.25, 0.45, 0.18],
+            digital_total_frac_roi=[0.58, 0.30, 0.22, 0.14],
+            digital_total_int_digit_count=6,  # per-digit
+            digital_total_frac_digit_count=0,  # line mode
+        )
+        # 6 digit calls for int, 1 line call for frac, 1 line call for flow.
+        ocr = _FakeOCR(["0", "0", "0", "0", "0", "0", "148", "00.000"])
+        result = run_digital_cycle(cfg, ocr, aligner=None, session=None,
+                                   prev_total=None, log=_StubLog(), sleep=_noop)
+        assert result["success"] is True
+        assert result["total"] == pytest.approx(0.148)
+        assert result["raw_total_int"] == "000000"
+        assert result["raw_total_frac"] == "148"
+
+    def test_per_digit_full_mode_all_regions(self, monkeypatch):
+        # Per-digit everywhere: int (6) + frac (3) + flow (5).
+        self._patch_capture(monkeypatch)
+        cfg = _cfg_stub(
+            digital_total_int_roi=[0.10, 0.25, 0.45, 0.18],
+            digital_total_frac_roi=[0.58, 0.30, 0.22, 0.14],
+            digital_total_int_digit_count=6,
+            digital_total_frac_digit_count=3,
+            digital_flow_digit_count=5,  # "00125" → injected dot → 0.125
+        )
+        ocr = _FakeOCR([
+            "0", "0", "0", "0", "0", "0",
+            "1", "1", "8",
+            "0", "0", "1", "2", "5",
+        ])
+        result = run_digital_cycle(cfg, ocr, aligner=None, session=None,
+                                   prev_total=None, log=_StubLog(), sleep=_noop)
+        assert result["success"] is True
+        assert result["total"] == pytest.approx(0.118)
+        assert result["flow_m3h"] == pytest.approx(0.125)
+
+    def test_per_digit_missed_digit_fails_parse(self, monkeypatch):
+        # One digit reads empty → concatenated int shortens from 6 to 5
+        # chars → combined "00000.118" fails the 6-digit regex → parse_failed.
+        self._patch_capture(monkeypatch)
+        cfg = _cfg_stub(
+            digital_max_retries=0,
+            digital_total_int_roi=[0.10, 0.25, 0.45, 0.18],
+            digital_total_frac_roi=[0.58, 0.30, 0.22, 0.14],
+            digital_total_int_digit_count=6,
+            digital_total_frac_digit_count=3,
+        )
+        ocr = _FakeOCR([
+            "0", "", "0", "0", "0", "0",  # 2nd digit missed
+            "1", "1", "8",
+            "00.000",
+        ])
+        result = run_digital_cycle(cfg, ocr, aligner=None, session=None,
+                                   prev_total=None, log=_StubLog(), sleep=_noop)
+        assert result["success"] is False
+        assert result["reason"] == "parse_failed"
+        assert result["raw_total_int"] == "00000"
 
     def test_split_mode_wrong_view_when_both_empty(self, monkeypatch):
         # Both split reads come back empty — concat ".", digit count < 6.
@@ -587,6 +668,63 @@ class TestDrawOverlaysDigital:
         top_strip = ov[0:8, :, :]
         # Baseline grey stays roughly equal across channels.
         assert abs(top_strip[:, :, 2].mean() - top_strip[:, :, 0].mean()) < 20
+
+
+# ---------------------------------------------------------------------------
+# read_region_per_digit (per-digit OCR helper)
+# ---------------------------------------------------------------------------
+
+class TestReadRegionPerDigit:
+    class _CollectingOCR:
+        """Minimal VisionOCR stand-in — records each sub-ROI it's asked to
+        recognize and returns a scripted digit per call so tests can assert
+        both the concatenation and the geometric subdivision."""
+        def __init__(self, script):
+            self.script = list(script)
+            self.calls = []
+
+        def _run(self, img, roi, half="full"):
+            self.calls.append(list(roi))
+            return self.script.pop(0) if self.script else ""
+
+    def test_empty_roi_returns_empty(self):
+        ocr = self._CollectingOCR(["9"])
+        assert read_region_per_digit(ocr, "p", [], 6) == ""
+        assert ocr.calls == []  # never invoked
+
+    def test_zero_count_returns_empty(self):
+        ocr = self._CollectingOCR(["9"])
+        assert read_region_per_digit(ocr, "p", [0.1, 0.2, 0.6, 0.1], 0) == ""
+        assert ocr.calls == []
+
+    def test_concatenates_all_digits(self):
+        ocr = self._CollectingOCR(["1", "2", "3", "4", "5", "6"])
+        result = read_region_per_digit(
+            ocr, "p", [0.0, 0.0, 0.6, 0.1], 6, inset=0.0,
+        )
+        assert result == "123456"
+        assert len(ocr.calls) == 6
+
+    def test_missed_digit_yields_shorter_string(self):
+        # Individual digit OCR failure just drops that character from the
+        # join — downstream regex catches the length mismatch.
+        ocr = self._CollectingOCR(["1", "", "3"])
+        result = read_region_per_digit(ocr, "p", [0.0, 0.0, 0.3, 0.1], 3, inset=0.0)
+        assert result == "13"
+
+    def test_subdivisions_span_base_roi_evenly(self):
+        # Sub-ROIs should collectively cover the base ROI with inset-respecting
+        # gaps. Specifically: x-coords are monotonic; first starts after the
+        # inset; last ends before the ROI's right edge minus the inset.
+        ocr = self._CollectingOCR(["0"] * 6)
+        read_region_per_digit(ocr, "p", [0.10, 0.20, 0.60, 0.10], 6, inset=0.10)
+        xs = [c[0] for c in ocr.calls]
+        assert xs == sorted(xs)  # monotonic left-to-right
+        # First sub-ROI's x is at least inset into the first cell.
+        assert xs[0] >= 0.10
+        # Last sub-ROI's right edge (x + w) is within the base ROI.
+        last_x, _, last_w, _ = ocr.calls[-1]
+        assert last_x + last_w <= 0.10 + 0.60 + 1e-9
 
 
 # ---------------------------------------------------------------------------

@@ -83,7 +83,10 @@ func recognize(_ image: CGImage, level: VNRequestTextRecognitionLevel) -> String
     // be silently dropped from the output.
     req.minimumTextHeight = 0
 
-    let handler = VNImageRequestHandler(cgImage: image, options: [:])
+    // Pin orientation to .up so Vision doesn't silently choose a rotated
+    // interpretation when the text is rotationally ambiguous — e.g. a
+    // 7-segment "26" whose segments also match "92" when flipped 180°.
+    let handler = VNImageRequestHandler(cgImage: image, orientation: .up, options: [:])
     do {
         try handler.perform([req])
     } catch {
@@ -103,15 +106,15 @@ if mode == "line" {
     // Keep digits plus the decimal point. Strip everything else Vision might
     // have emitted (spaces, units like "m³", stray punctuation).
     let allowed: Set<Character> = Set("0123456789.")
-    // Use .accurate first — .fast silently drops narrow glyphs (like the "1"
-    // in 7-segment displays) even when they're clearly visible. For a meter
-    // that samples every 10–20 s, the extra ~100 ms of accurate OCR is
-    // invisible and worth the reliability gain. Fall back to .fast only if
-    // accurate somehow returns nothing.
-    var text = recognize(roi, level: .accurate).filter { allowed.contains($0) }
-    if text.isEmpty {
-        text = recognize(roi, level: .fast).filter { allowed.contains($0) }
-    }
+    // Run BOTH levels and keep the longer output. Each level has a failure
+    // mode on 7-segment LCDs: .fast can drop narrow glyphs (e.g. a "1"
+    // rendered as two segments), while .accurate sometimes returns nothing
+    // when confidence is borderline on low-contrast fractional digits.
+    // Taking the longer result is a cheap way to catch both cases. The
+    // extra ~100 ms is invisible at 10–20 s sampling.
+    let fast = recognize(roi, level: .fast).filter { allowed.contains($0) }
+    let accurate = recognize(roi, level: .accurate).filter { allowed.contains($0) }
+    let text = accurate.count > fast.count ? accurate : fast
     print(text)
     exit(0)
 }

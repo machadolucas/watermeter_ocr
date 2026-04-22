@@ -147,6 +147,16 @@ rois:
 #   # Equalization — enable if Vision consistently drops thin glyphs (e.g. a
 #   # narrow "1") that are clearly visible in the debug overlay.
 #   ocr_preprocess: "none"
+#   # Optional per-digit OCR. When a digit_count is > 0 for a region, that
+#   # region's base ROI is subdivided into that many equal sub-ROIs and each
+#   # digit is recognized independently (one Swift call per digit). Slower
+#   # but immune to line-recognition failures on small 7-segment glyphs
+#   # (narrow "1"s dropped as noise, small digits mis-rotated 180°, etc.).
+#   # 0 (default) = line OCR for that region (original behaviour).
+#   total_int_digit_count: 0     # e.g. 6 for a 6-digit integer segment
+#   total_frac_digit_count: 0    # e.g. 3 for a 3-digit fractional segment
+#   flow_digit_count: 0          # e.g. 5 for "XX.YYY"
+#   per_digit_inset: 0.10        # shrink each sub-ROI inward to avoid bleed
 #   max_retries: 2               # extra captures per cycle if wrong view detected
 #   retry_delay_sec: 5.5         # > longest diag-view dwell (5s) so retries phase-cross
 #   min_digits: 6                # cheap-fail bar for diagnostic screens
