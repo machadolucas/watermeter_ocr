@@ -78,6 +78,8 @@ tail -f ~/watermeter/watermeter.log
 
 Your config lives at `~/watermeter/config.yaml`. The defaults work for a 640×480-ish frame; adjust ROIs to your meter.
 
+> The YAML below is an **illustrative example** for a different physical meter — the exact ROI coordinates and dial rotations it uses will not match your hardware. The installer seeds `~/watermeter/config.yaml` from [`config.yaml`](./config.yaml) in the repo, which reflects the author's actual meter. Use either as a starting point and tune with the debug overlay.
+
 ```yaml
 esp32:
   base_url: "http://192.168.1.90"
@@ -176,7 +178,6 @@ auto_centering:
   enabled: true                    # Enable automatic dial center detection and ROI adjustment
   smoothing_alpha: 0.3             # ROI adjustment speed (0.1=stable/slow, 0.5=fast/responsive)
   min_confidence_threshold: 0.4    # Log warning if dial detection confidence drops below this
-  max_dial_change_per_sec: 0.5     # Maximum expected dial change per second (for temporal validation)
 ```
 
 ### ROI tips
@@ -393,16 +394,15 @@ The installer compiles it to `~/watermeter/bin/ocr`. You can replace it with you
 
 **System rejects valid readings during high flow**
 
-* Increase `max_dial_change_per_sec` if you have unusually high water flow rates
-* Default is 0.5 (meaning 5 units per 10 seconds at 10-second intervals)
-* For high-flow scenarios, try 1.0 or higher
 * Check logs for "Low confidence" warnings during high flow periods
+* If persistent, raise `postproc.big_jump_guard` to accept larger deltas
+* Verify the dial ROIs are tight around each dial (loose ROIs pick up neighbour needles and confuse detection)
 
 **Readings lag behind actual meter during flow changes**
 
-* This is expected behavior - the temporal validation smooths rapid changes
-* Increase `max_dial_change_per_sec` for faster response to flow changes
-* Trade-off: higher values = faster response but less outlier rejection
+* This is expected behavior — the rolling-digit resolver biases toward `prev_digit` in the stable zone and only flips at the thresholds
+* Tighten the flip points by lowering `digits.rolling_threshold_up` (e.g. 0.85) or raising `rolling_threshold_down` (e.g. 0.15)
+* Trade-off: faster flips = more sensitivity to transient OCR noise
 
 **Overlay camera shows corrupted/empty image**
 

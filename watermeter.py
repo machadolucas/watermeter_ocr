@@ -21,11 +21,30 @@ def save_json(path,obj):
     os.replace(tmp,path)
 def read_json(path,default=None):
     try: return json.load(open(path,"r"))
-    except: return default
+    except (OSError, ValueError): return default
 def ensure_dir(p): os.makedirs(p, exist_ok=True)
 def norm_to_abs(box,W,H):
     x,y,w,h=box; return (int(x*W),int(y*H),int(w*W),int(h*H))
 def clip01(v): return max(0.0, min(1.0, v))
+
+def circular_blend(a, b, alpha, period=10.0):
+    """Weighted blend of two values on a circular scale [0, period).
+
+    Avoids the failure mode of a linear blend across the wrap boundary
+    (e.g. linear 0.7*9.9 + 0.3*0.1 = 6.96, circular ≈ 9.96).
+    alpha is the weight of `a`; (1-alpha) is the weight of `b`.
+    """
+    ta = 2.0 * math.pi * (a % period) / period
+    tb = 2.0 * math.pi * (b % period) / period
+    x = alpha * math.cos(ta) + (1.0 - alpha) * math.cos(tb)
+    y = alpha * math.sin(ta) + (1.0 - alpha) * math.sin(tb)
+    theta = math.atan2(y, x)
+    return (theta * period / (2.0 * math.pi)) % period
+
+def circular_dist(a, b, period=10.0):
+    """Shortest distance on a circular scale [0, period)."""
+    d = abs(a - b) % period
+    return min(d, period - d)
 
 @dataclass
 class DialConfig:
@@ -161,61 +180,66 @@ class VisionOCR:
             out=subprocess.check_output(cmd,stderr=subprocess.DEVNULL,timeout=5).decode().strip()
             out="".join(c for c in out if c.isdigit())
             return out[0] if len(out)>1 else out
-        except: return ""
+        except (subprocess.SubprocessError, OSError):
+            return ""
     def full_top_bottom(self,img,roi):
         return self._run(img,roi,"full"), self._run(img,roi,"top"), self._run(img,roi,"bottom")
 
 def detect_dial_markings(roi_img, cx, cy, radius):
     """
-    Detect the 0 and 5 markings on the dial to refine center and validate rotation.
+    Detect the 0 and 5 markings on the dial to validate rotation.
     Returns (rotation_offset_deg, marking_confidence) or (0.0, 0.0) if detection fails.
-    
-    The markings should be at -90° (top, 0) and +90° (bottom, 5) from the true center.
+
+    The markings should sit at -90° (top, 0) and +90° (bottom, 5) from the true
+    dial center. If the dial face is rotated relative to the ROI (camera tilt,
+    loose sensor mount) the marking centroids fall at slightly different angles;
+    the returned `rotation_offset_deg` is the mean deviation, signed.
     """
     hh, ww = roi_img.shape[:2]
-    
-    # Sample regions where we expect 0 (top) and 5 (bottom) markings
-    # These are typically near the outer edge of the dial
     sample_radius = radius * 0.85
-    
-    # Expected positions for 0 (top, -90°) and 5 (bottom, +90°)
+
+    # Expected (digit, expected_angle_deg, sample_px, sample_py)
     positions = [
-        ("0", -90, cx, cy - sample_radius),  # top
-        ("5", 90, cx, cy + sample_radius),    # bottom
+        ("0", -90.0, cx, cy - sample_radius),  # top
+        ("5",  90.0, cx, cy + sample_radius),  # bottom
     ]
-    
-    detected_angles = []
+
     gray = cv2.cvtColor(roi_img, cv2.COLOR_BGR2GRAY)
-    
-    for digit, expected_angle, px, py in positions:
-        # Sample a small region around expected position
+    detections = []  # (expected_angle_deg, actual_angle_deg)
+
+    for _digit, expected_angle, px, py in positions:
         sample_size = int(radius * 0.15)
         x1 = max(0, int(px - sample_size))
         x2 = min(ww, int(px + sample_size))
         y1 = max(0, int(py - sample_size))
         y2 = min(hh, int(py + sample_size))
-        
         if x2 - x1 < 5 or y2 - y1 < 5:
             continue
-            
+
         sample = gray[y1:y2, x1:x2]
-        
-        # Use simple threshold to find dark text on light background
         _, thresh = cv2.threshold(sample, 0, 255, cv2.THRESH_BINARY_INV + cv2.THRESH_OTSU)
-        
-        # Look for significant features (text-like regions)
         contours, _ = cv2.findContours(thresh, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-        
-        if contours:
-            # If we found features in expected location, mark as detected
-            detected_angles.append((digit, expected_angle))
-    
-    if len(detected_angles) >= 1:
-        # We detected at least one marking - assume rotation is correct
-        confidence = len(detected_angles) / 2.0  # 0.5 for one, 1.0 for both
-        return (0.0, confidence)
-    
-    return (0.0, 0.0)
+        if not contours:
+            continue
+
+        # Use the centroid of the largest dark blob as the marking position.
+        largest = max(contours, key=cv2.contourArea)
+        M = cv2.moments(largest)
+        if M['m00'] <= 0:
+            continue
+        actual_px = x1 + M['m10'] / M['m00']
+        actual_py = y1 + M['m01'] / M['m00']
+        actual_angle = math.degrees(math.atan2(actual_py - cy, actual_px - cx))
+        detections.append((expected_angle, actual_angle))
+
+    if not detections:
+        return (0.0, 0.0)
+
+    # Mean signed angular deviation, wrapped to [-180, 180].
+    offsets = [((act - exp + 180.0) % 360.0) - 180.0 for exp, act in detections]
+    rotation_offset = sum(offsets) / len(offsets)
+    confidence = len(detections) / 2.0  # 0.5 for one mark, 1.0 for both
+    return (rotation_offset, confidence)
 
 
 def detect_needle_center(roi_img):
@@ -436,28 +460,19 @@ def validate_reading_with_history(current_reading, history):
     return (current_reading, 0.5)
 
 
-def predict_expected_reading(history, factor):
+def predict_expected_reading(history):
     """
-    Predict expected reading based on history and flow rate.
-    Useful for resolving ambiguous readings near transitions.
-    
-    Returns predicted reading or None if insufficient data.
+    Predict the next dial reading by linear extrapolation from the most recent
+    history window. Useful for biasing ambiguous readings toward the trend.
+
+    Returns predicted reading in [0, 10) or None if insufficient data.
     """
     if len(history) < 3:
         return None
-    
-    # Linear extrapolation from last few points
     recent = history[-5:]
-    
-    # Calculate average rate of change
-    changes = [recent[i+1] - recent[i] for i in range(len(recent)-1)]
+    changes = [recent[i + 1] - recent[i] for i in range(len(recent) - 1)]
     avg_change = sum(changes) / len(changes)
-    
-    # Predict next value
-    predicted = recent[-1] + avg_change
-    
-    # Keep in 0-10 range
-    return predicted % 10.0
+    return (recent[-1] + avg_change) % 10.0
 
 
 def read_dial(roi_img, zero_angle_deg=-90.0, rotation="cw", prev_reading=None, history=None):
@@ -498,7 +513,7 @@ def read_dial(roi_img, zero_angle_deg=-90.0, rotation="cw", prev_reading=None, h
     # Step 3: Predict expected reading from history
     predicted = None
     if history and len(history) >= 3:
-        predicted = predict_expected_reading(history, 1.0)
+        predicted = predict_expected_reading(history)
     
     if not methods:
         # No detection - use previous or predicted reading if available
@@ -545,13 +560,13 @@ def read_dial(roi_img, zero_angle_deg=-90.0, rotation="cw", prev_reading=None, h
     if history and len(history) > 0:
         validated_reading, temporal_conf = validate_reading_with_history(reading, history)
         
-        # If predicted reading exists and current reading is ambiguous, 
-        # bias toward prediction
+        # If predicted reading exists and current reading is ambiguous,
+        # bias toward prediction using a circular blend so values across the
+        # 9→0 wrap (e.g. reading=9.9, predicted=0.1) collapse to the correct
+        # side of the ring rather than a linear midpoint.
         if predicted is not None and conf < 0.6:
-            # Check if predicted is closer to current than previous
-            if abs(reading - predicted) < 1.5:
-                # Blend current and predicted
-                reading = 0.7 * reading + 0.3 * predicted
+            if circular_dist(reading, predicted) < 1.5:
+                reading = circular_blend(reading, predicted, alpha=0.7)
                 conf = conf * 0.8 + 0.2  # small boost for using prediction
         
         # Apply temporal confidence adjustment
@@ -591,25 +606,26 @@ def decide_digit(bottom, top, full, progress, thr_up, thr_dn, prev_digit=None):
     if b is not None and t is not None and b == t:
         return b
 
-    # 3) Check if we just rolled over (low progress after high, OCR may fail during transition)
-    # This handles the case where digit is cropped/transitioning but dials show rollover happened
+    # 3) Check if we just rolled over (low progress, OCR shows the new digit)
+    # This handles the case where digit is cropped/transitioning but dials show rollover happened.
+    # NOTE: we deliberately do NOT infer a rollover when all OCR is None. Progress alone is not a
+    # transition signal (decide_digit is stateless per call), so "progress low + OCR silent" also
+    # matches a long-stable low-progress window. Speculatively incrementing there caused a
+    # runaway drift of ~1 digit per cycle under persistent OCR failure.
     if prev_digit is not None and progress <= thr_dn:
-        # Low progress means dials show values near 0, indicating a rollover just occurred
         next_digit = (prev_digit + 1) % 10
-        
+
         # If OCR managed to see the new digit, great! Use it
         if f == next_digit or t == next_digit or b == next_digit:
             return next_digit
-        
+
         # If OCR clearly shows the previous digit is still there, trust OCR
         # (rollover hasn't happened yet, or low progress is normal for this digit)
         if f == prev_digit or t == prev_digit or b == prev_digit:
             return prev_digit
-        
-        # OCR shows something else entirely - trust OCR reading over dial inference
-        # Only use dial-based inference when OCR completely fails (all None)
-        if f is None and t is None and b is None:
-            return next_digit
+
+        # Otherwise fall through to the standard fallback, which prefers prev.
+        # Worst case: we lag by one reading for one cycle — far safer than creeping drift.
 
     # 4) If we have previous digit and we're in stable zone, use it
     if prev_digit is not None and in_middle:
@@ -664,8 +680,22 @@ class MqttClient:
         self._last_attempt=0.0
         self._reconnect_delay=5.0
         def _on_connect(client, userdata, flags, reason_code, properties=None):
-            self.connected = True
-            self.log.info(f"MQTT connected rc={reason_code}")
+            # reason_code 0 == Success. Anything else means the broker rejected
+            # the CONNECT (bad credentials, protocol mismatch, etc). Publishing
+            # in that state silently no-ops because `if self.connected:` passes,
+            # so keep the flag False on failure.
+            if reason_code == 0:
+                self.connected = True
+                self.log.info(f"MQTT connected rc={reason_code}")
+                # Republish HA discovery payloads on every (re)connect. These are
+                # retained on the broker so we do NOT need to republish every loop.
+                try:
+                    self.discovery()
+                except Exception as e:
+                    self.log.warning(f"MQTT discovery publish failed: {e}")
+            else:
+                self.connected = False
+                self.log.error(f"MQTT connect rejected rc={reason_code}")
 
         def _on_disconnect(client, userdata, disconnect_flags, reason_code, properties=None):
             self.connected = False
@@ -779,7 +809,18 @@ class Aligner:
     def align(self,img):
         if not self.ensure_reference(img): return img,None,False
         gray=cv2.cvtColor(img,cv2.COLOR_BGR2GRAY)
-        kpC,descC=self.orb.detectAndCompute(gray,self.mask)
+        # The mask is sized for the reference frame. If the incoming frame has
+        # a different shape (e.g. ESP32 resolution changed), cv2.detectAndCompute
+        # would raise; detect a shape mismatch and fall through without a mask
+        # rather than crash.
+        mask = self.mask
+        if mask is not None and mask.shape[:2] != gray.shape[:2]:
+            self.log.warning(
+                f"Incoming frame {gray.shape[:2]} != reference {mask.shape[:2]}; "
+                "aligning without anchor mask this cycle"
+            )
+            mask = None
+        kpC,descC=self.orb.detectAndCompute(gray,mask)
         if descC is None or self.descR is None or len(kpC)<10 or len(self.kpR)<10: return img,None,False
         bf=cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=False)
         matches=bf.knnMatch(self.descR,descC,k=2)
@@ -976,8 +1017,10 @@ def main():
             d.reading_history = dial_histories[dial_key]
             log.info(f"Restored {len(d.reading_history)} historical readings for {d.name}")
     
-    ocr=VisionOCR(cfg.ocr_bin); mqttc=MqttClient(cfg,log); mqttc.connect(); mqttc.discovery()
-    aligner=AlignConfig() and Aligner(cfg.align,log) if cfg.align.enabled else None
+    # discovery() fires automatically from on_connect (see MqttClient._on_connect);
+    # no need to invoke it explicitly here or in the loop.
+    ocr=VisionOCR(cfg.ocr_bin); mqttc=MqttClient(cfg,log); mqttc.connect()
+    aligner = Aligner(cfg.align, log) if cfg.align.enabled else None
     session=requests.Session()
     mode_prev = None
 
@@ -1048,10 +1091,13 @@ def main():
             dial_confidences.append(confidence)
             center_offsets.append(center_offset)
             
-            # Update dial tracking data
-            d.reading_history.append(reading)
-            if len(d.reading_history) > 20:  # Keep last 20 readings for better trend analysis
-                d.reading_history.pop(0)
+            # Update dial tracking data. Gate on confidence so that zero-confidence
+            # fallback readings (blank image, total detection failure) don't pollute the
+            # history that validate_reading_with_history and predict_expected_reading rely on.
+            if confidence > 0.2:
+                d.reading_history.append(reading)
+                if len(d.reading_history) > 20:  # Keep last 20 readings for trend analysis
+                    d.reading_history.pop(0)
             
             # Update average confidence
             if d.avg_confidence == 0.0:
@@ -1104,7 +1150,7 @@ def main():
 
         try:
             integer = int(resolved_str)
-        except:
+        except (TypeError, ValueError):
             integer = int(prev_int_str) if prev_int_str else 0
         total = float(integer) + float(frac_pub)
 
@@ -1135,7 +1181,10 @@ def main():
             dv=max(0.0, publish_total - prev_total); dt=(now-prev_ts)/60.0; rate=dv/dt if dt>1e-6 else 0.0
 
         base=cfg.mqtt_main_topic
-        mqttc.discovery()
+        # Discovery payloads are retained on the broker; republishing every cycle
+        # is pure waste. Initial discovery happens once at startup; if we
+        # reconnect, ensure_connection will bring us back and the broker will
+        # replay retained config to late subscribers.
         mqttc.publish(f"{base}/main/value", f"{publish_total:.6f}", retain=True)
         mqttc.publish(f"{base}/main/rate", f"{rate:.6f}", retain=False)
         rate_lpm = rate * 1000.0

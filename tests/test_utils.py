@@ -12,6 +12,8 @@ from watermeter import (
     _in_window_local,
     adjust_dial_roi,
     build_digit_rois,
+    circular_blend,
+    circular_dist,
     clip01,
     norm_to_abs,
 )
@@ -174,3 +176,52 @@ class TestAdjustDialRoi:
         out = adjust_dial_roi([0.4, 0.4, 0.13, 0.17], (20.0, 10.0), 640, 480, smoothing_alpha=0.3)
         assert out[2] == pytest.approx(0.13)
         assert out[3] == pytest.approx(0.17)
+
+
+class TestCircularDist:
+    def test_zero_distance(self):
+        assert circular_dist(3.0, 3.0) == pytest.approx(0.0)
+
+    def test_linear_distance_in_range(self):
+        assert circular_dist(2.0, 5.0) == pytest.approx(3.0)
+
+    def test_wraparound_is_shorter(self):
+        # 9.5 → 0.5 is 1.0 via wrap, not 9.0 linear.
+        assert circular_dist(9.5, 0.5) == pytest.approx(1.0)
+        assert circular_dist(0.5, 9.5) == pytest.approx(1.0)
+
+    def test_halfway_point(self):
+        assert circular_dist(0.0, 5.0) == pytest.approx(5.0)
+
+    def test_custom_period(self):
+        # 350° to 10° is 20° apart on a 360 ring.
+        assert circular_dist(350.0, 10.0, period=360.0) == pytest.approx(20.0)
+
+
+class TestCircularBlend:
+    def test_equal_inputs_return_input(self):
+        assert circular_blend(3.0, 3.0, alpha=0.5) == pytest.approx(3.0)
+
+    def test_linear_blend_within_ring(self):
+        # 2.0 and 4.0 are in the same half-ring; blend is near 3.0.
+        result = circular_blend(2.0, 4.0, alpha=0.5)
+        assert result == pytest.approx(3.0, abs=0.01)
+
+    def test_wraparound_blend_stays_on_short_arc(self):
+        # Linear blend of 9.9 and 0.1 would give ~5.0 (garbage).
+        # Circular blend should stay near 0.0 (the true midpoint across the wrap).
+        result = circular_blend(9.9, 0.1, alpha=0.5)
+        # Must be close to 0.0 (or 10.0 ≡ 0.0), not around 5.0.
+        assert circular_dist(result, 0.0) < 0.1
+
+    def test_weighted_blend_biases_to_alpha(self):
+        # alpha=0.9 puts most of the weight on a.
+        result = circular_blend(9.9, 0.1, alpha=0.9)
+        # Should sit much closer to 9.9 than to 0.1.
+        assert circular_dist(result, 9.9) < circular_dist(result, 0.1)
+
+    def test_alpha_one_returns_first_value(self):
+        assert circular_blend(3.7, 8.2, alpha=1.0) == pytest.approx(3.7, abs=0.01)
+
+    def test_alpha_zero_returns_second_value(self):
+        assert circular_blend(3.7, 8.2, alpha=0.0) == pytest.approx(8.2, abs=0.01)

@@ -72,16 +72,19 @@ class TestDecideDigitRolloverFromPrev:
         # prev=4, low progress, OCR shows 7 → trust OCR over dial inference.
         assert decide_digit("", "", "7", progress=0.05, thr_up=THR_UP, thr_dn=THR_DN, prev_digit=4) == 7
 
-    def test_all_ocr_none_infers_rollover(self):
-        # prev=4, low progress, OCR silent → infer prev+1 = 5.
-        assert decide_digit(None, None, None, progress=0.05, thr_up=THR_UP, thr_dn=THR_DN, prev_digit=4) == 5
+    def test_all_ocr_none_holds_prev(self):
+        # prev=4, low progress, OCR silent → DO NOT speculatively increment.
+        # decide_digit is stateless, so "low progress" alone can't distinguish
+        # "just rolled over" from "stable low-progress window with bad OCR".
+        # The safe fallback is to hold prev and let the next cycle recover.
+        assert decide_digit(None, None, None, progress=0.05, thr_up=THR_UP, thr_dn=THR_DN, prev_digit=4) == 4
 
-    def test_empty_strings_treated_as_none(self):
-        assert decide_digit("", "", "", progress=0.05, thr_up=THR_UP, thr_dn=THR_DN, prev_digit=4) == 5
+    def test_empty_strings_treated_as_none_holds_prev(self):
+        assert decide_digit("", "", "", progress=0.05, thr_up=THR_UP, thr_dn=THR_DN, prev_digit=4) == 4
 
-    def test_nine_prev_wraps_to_zero(self):
-        # prev=9, low progress, all OCR none → infer (9+1)%10 = 0.
-        assert decide_digit(None, None, None, progress=0.05, thr_up=THR_UP, thr_dn=THR_DN, prev_digit=9) == 0
+    def test_nine_prev_without_ocr_holds(self):
+        # prev=9, low progress, OCR silent → hold prev=9 (no speculative wrap).
+        assert decide_digit(None, None, None, progress=0.05, thr_up=THR_UP, thr_dn=THR_DN, prev_digit=9) == 9
 
 
 class TestDecideDigitStableZone:

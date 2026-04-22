@@ -105,20 +105,20 @@ class TestValidateReadingWithHistory:
 
 class TestPredictExpectedReading:
     def test_insufficient_history_returns_none(self):
-        assert predict_expected_reading([], 1.0) is None
-        assert predict_expected_reading([1.0], 1.0) is None
-        assert predict_expected_reading([1.0, 2.0], 1.0) is None
+        assert predict_expected_reading([]) is None
+        assert predict_expected_reading([1.0]) is None
+        assert predict_expected_reading([1.0, 2.0]) is None
 
     def test_linear_trend_predicts_next(self):
         # Steady +1 per step; next should be 5.
-        predicted = predict_expected_reading([1.0, 2.0, 3.0, 4.0], 1.0)
+        predicted = predict_expected_reading([1.0, 2.0, 3.0, 4.0])
         assert predicted == pytest.approx(5.0)
 
     def test_wrapping_at_ten(self):
         # Steady +1 per step climbing past 10 → wraps via %10.
-        predicted = predict_expected_reading([7.0, 8.0, 9.0, 10.0], 1.0)
+        predicted = predict_expected_reading([7.0, 8.0, 9.0, 10.0])
         assert predicted == pytest.approx(1.0)  # 11 % 10
 
     def test_flat_trend_predicts_same(self):
-        predicted = predict_expected_reading([5.0, 5.0, 5.0, 5.0], 1.0)
+        predicted = predict_expected_reading([5.0, 5.0, 5.0, 5.0])
         assert predicted == pytest.approx(5.0)

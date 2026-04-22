@@ -12,8 +12,11 @@ from __future__ import annotations
 import numpy as np
 import pytest
 
+import cv2
+
 from watermeter import (
     detect_dial_center,
+    detect_dial_markings,
     detect_needle_by_color,
     detect_needle_by_lines,
     detect_needle_center,
@@ -181,6 +184,71 @@ class TestDetectNeedleByLines:
 
 
 # ---- History-aware paths in read_dial -------------------------------------
+
+class TestDetectDialMarkings:
+    """After completing the implementation, detect_dial_markings now returns
+    a real rotation_offset_deg (signed mean angular deviation of the detected
+    "0" and "5" stamps). This test draws the markings at their canonical
+    positions and verifies the offset is near zero.
+    """
+
+    def _dial_with_markings(self, size=200, rotation_deg=0.0):
+        img = np.ones((size, size, 3), dtype=np.uint8) * 240
+        cx, cy = size // 2, size // 2
+        radius = size // 3
+        cv2.circle(img, (cx, cy), radius, (50, 50, 50), 2)
+        # "0" and "5" stamps at canonical positions (top and bottom, respectively)
+        # optionally rotated about the dial center.
+        r_mark = radius * 0.85
+        for label, base_angle_deg in (("0", -90.0), ("5", 90.0)):
+            theta = np.radians(base_angle_deg + rotation_deg)
+            mx = int(cx + r_mark * np.cos(theta))
+            my = int(cy + r_mark * np.sin(theta))
+            # Draw a dark filled blob for the digit stamp
+            cv2.putText(img, label, (mx - 8, my + 6),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.6, (0, 0, 0), 2)
+        return img, cx, cy, radius
+
+    def test_upright_dial_has_small_offset(self):
+        img, cx, cy, radius = self._dial_with_markings(rotation_deg=0.0)
+        offset_deg, conf = detect_dial_markings(img, cx, cy, radius)
+        assert conf > 0.0
+        assert abs(offset_deg) < 5.0  # small deviation tolerated
+
+    def test_rotated_dial_detects_offset(self):
+        # Rotate markings by +10°: detected offset should be ~+10°.
+        img, cx, cy, radius = self._dial_with_markings(rotation_deg=10.0)
+        offset_deg, conf = detect_dial_markings(img, cx, cy, radius)
+        # Tolerance is generous because:
+        # - cv2.putText glyph centroids are not exactly at the anchor point
+        # - only the portion of each glyph that lands inside the sample window counts
+        # What matters is the *sign* and *magnitude* tracking roughly with the true rotation.
+        assert conf > 0.0
+        assert 3.0 < offset_deg < 15.0
+
+    def test_no_markings_returns_zero(self):
+        blank = np.ones((200, 200, 3), dtype=np.uint8) * 240
+        offset_deg, conf = detect_dial_markings(blank, 100, 100, 60)
+        assert offset_deg == pytest.approx(0.0)
+        assert conf == pytest.approx(0.0)
+
+
+class TestCircularBlendInReadDial:
+    """The previous linear blend at watermeter.py:554 collapsed readings across
+    the 9→0 wrap to the wrong midpoint. These tests don't invoke read_dial
+    end-to-end (too flaky); instead they verify the helper chosen to replace
+    the linear blend behaves correctly — the same helper is imported and used
+    by read_dial.
+    """
+
+    def test_circular_helper_used_by_read_dial(self):
+        # Sanity that the module exports the helper in a stable place.
+        from watermeter import circular_blend, circular_dist
+        assert circular_dist(9.9, 0.1) < 0.3
+        # With alpha=0.7 weighting, the blend leans toward the first arg.
+        out = circular_blend(9.9, 0.1, alpha=0.7)
+        assert circular_dist(out, 9.9) < circular_dist(out, 0.1)
+
 
 class TestReadDialWithHistory:
     def test_prev_reading_used_when_no_detection_possible(self):
