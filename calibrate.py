@@ -169,8 +169,9 @@ def merge_digital_rois(doc: dict, new_rois: dict) -> dict:
     out = copy.deepcopy(doc)
     out.setdefault("rois", {})
     out["rois"].setdefault("digital", {})
-    out["rois"]["digital"]["total"] = list(new_rois["total"])
-    for key in ("total_int", "total_frac", "flow"):
+    # All four keys follow the same draw-or-drop contract: drawn → write,
+    # null/missing → remove any stale entry so the runtime sees a clean state.
+    for key in ("total", "total_int", "total_frac", "flow"):
         val = new_rois.get(key)
         if val:
             out["rois"]["digital"][key] = list(val)
@@ -254,28 +255,34 @@ def validate_payload(payload: dict) -> Optional[str]:
 def validate_digital_payload(payload: dict) -> Optional[str]:
     """Digital-mode payload validation.
 
-    {total: [x,y,w,h], total_int: [...]?, total_frac: [...]?,
+    {total: [x,y,w,h]?, total_int: [...]?, total_frac: [...]?,
      flow: [...]?, anchors: [...]}
 
-    `total` is required (pipeline uses it as the fallback for single-ROI mode
-    and as an overlay frame). `total_int` and `total_frac` are the split-ROI
-    pair — BOTH must be drawn together, or NEITHER, to activate split mode.
-    `flow` is optional — some installs sacrifice the flow line to keep the
-    total line free of flash glare, so a null/missing flow just means the
-    pipeline falls back to delta-computed rate only.
+    Exactly one of these reading modes must be configured:
+      - single-ROI: `total` alone
+      - split-ROI:  `total_int` + `total_frac` (both required together)
+    At least one mode is mandatory. Both modes can coexist — in that case the
+    runtime uses split. `total_int` and `total_frac` must be BOTH drawn
+    together or NEITHER. `flow` is optional — some installs sacrifice the
+    flow line to keep the total line free of flash glare, so a null/missing
+    flow just means the pipeline falls back to delta-computed rate only.
     """
     if not isinstance(payload, dict):
         return "payload must be a JSON object"
-    # total is mandatory
-    roi = payload.get("total")
-    if roi is None:
-        return "missing total ROI"
-    err = _valid_roi(roi)
-    if err:
-        return f"total: {err}"
-    # split-ROI pair: both or neither
+    total = payload.get("total")
     total_int = payload.get("total_int")
     total_frac = payload.get("total_frac")
+    has_split = bool(total_int) and bool(total_frac)
+    # Need either single-ROI total or the split-ROI pair.
+    if total is None and not has_split:
+        return ("missing total ROI — configure either `total` (single-ROI mode) "
+                "or both `total_int` + `total_frac` (split-ROI mode)")
+    # total is optional; validate shape only if drawn
+    if total is not None:
+        err = _valid_roi(total)
+        if err:
+            return f"total: {err}"
+    # split-ROI pair: both or neither
     if bool(total_int) ^ bool(total_frac):
         return "total_int and total_frac must be set together (both or neither)"
     for key, val in (("total_int", total_int), ("total_frac", total_frac)):
@@ -718,9 +725,9 @@ const MECHANICAL_SLOTS = [
   { key: 'anchor_2', label: 'Anchor 2', color: '#6b7280', kind: 'anchor', idx: 2 },
 ];
 const DIGITAL_SLOTS = [
-  { key: 'total', label: 'Total (single-ROI, required)', color: '#4aa3ff', kind: 'digital' },
-  { key: 'total_int',  label: 'Total integer (split, optional)', color: '#5bb1ff', kind: 'digital' },
-  { key: 'total_frac', label: 'Total fractional (split, optional)', color: '#ffb547', kind: 'digital' },
+  { key: 'total', label: 'Total (single-ROI mode)', color: '#4aa3ff', kind: 'digital' },
+  { key: 'total_int',  label: 'Total integer (split mode)', color: '#5bb1ff', kind: 'digital' },
+  { key: 'total_frac', label: 'Total fractional (split mode)', color: '#ffb547', kind: 'digital' },
   { key: 'flow',  label: 'Flow line (optional)', color: '#3ccf7b', kind: 'digital' },
   { key: 'anchor_0', label: 'Anchor 0', color: '#6b7280', kind: 'anchor', idx: 0 },
   { key: 'anchor_1', label: 'Anchor 1', color: '#6b7280', kind: 'anchor', idx: 1 },

@@ -23,6 +23,7 @@ import pytest
 
 from watermeter import (
     MqttClient,
+    apply_ocr_preprocess,
     draw_overlays_digital,
     is_valid_digital_view,
     load_config,
@@ -58,6 +59,7 @@ def _cfg_stub(**over):
         digital_total_int_roi=[],
         digital_total_frac_roi=[],
         digital_flow_roi=[0.1, 0.5, 0.8, 0.2],
+        digital_ocr_preprocess="none",
         esp32_base_url="http://unused",
         image_timeout=1.0,
     )
@@ -585,3 +587,44 @@ class TestDrawOverlaysDigital:
         top_strip = ov[0:8, :, :]
         # Baseline grey stays roughly equal across channels.
         assert abs(top_strip[:, :, 2].mean() - top_strip[:, :, 0].mean()) < 20
+
+
+# ---------------------------------------------------------------------------
+# apply_ocr_preprocess (opt-in contrast enhancement before Vision)
+# ---------------------------------------------------------------------------
+
+class TestApplyOcrPreprocess:
+    def test_none_is_noop(self, tmp_path):
+        src = str(tmp_path / "in.jpg")
+        dst = str(tmp_path / "out.jpg")
+        import cv2
+        cv2.imwrite(src, np.full((20, 20, 3), 128, dtype=np.uint8))
+        assert apply_ocr_preprocess(src, dst, "none") is False
+
+    def test_unknown_mode_is_noop(self, tmp_path):
+        assert apply_ocr_preprocess("x", "y", "sharpen") is False
+
+    def test_missing_source_returns_false(self, tmp_path):
+        dst = str(tmp_path / "out.jpg")
+        # File at this path doesn't exist; cv2.imread returns None.
+        assert apply_ocr_preprocess(str(tmp_path / "missing.jpg"), dst, "clahe") is False
+
+    def test_clahe_produces_output_file(self, tmp_path):
+        import cv2
+        src = str(tmp_path / "in.jpg")
+        dst = str(tmp_path / "out.jpg")
+        # Low-contrast synthetic image: gray background with slightly-lighter
+        # vertical bars mimicking faint 7-segment digits.
+        img = np.full((80, 160, 3), 110, dtype=np.uint8)
+        for x in (20, 50, 80, 110):
+            img[20:60, x:x+8] = 130
+        cv2.imwrite(src, img)
+        ok = apply_ocr_preprocess(src, dst, "clahe")
+        assert ok is True
+        out = cv2.imread(dst)
+        assert out is not None
+        assert out.shape == img.shape
+        # CLAHE stretches local contrast, so the output's standard deviation
+        # should be noticeably higher than the input's. Margin is small
+        # because JPEG re-encoding smooths some of the gain.
+        assert out.std() > img.std() + 2

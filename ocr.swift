@@ -78,6 +78,10 @@ func recognize(_ image: CGImage, level: VNRequestTextRecognitionLevel) -> String
     req.usesLanguageCorrection = false
     req.recognitionLanguages = ["en-US"]
     req.automaticallyDetectsLanguage = false
+    // 0 = disable Vision's built-in small-text filter (default is ~3% of image
+    // height in .fast mode). Small 7-segment fractional digits would otherwise
+    // be silently dropped from the output.
+    req.minimumTextHeight = 0
 
     let handler = VNImageRequestHandler(cgImage: image, options: [:])
     do {
@@ -99,10 +103,14 @@ if mode == "line" {
     // Keep digits plus the decimal point. Strip everything else Vision might
     // have emitted (spaces, units like "m³", stray punctuation).
     let allowed: Set<Character> = Set("0123456789.")
-    var text = recognize(roi, level: .fast).filter { allowed.contains($0) }
-    // 7-segment LCDs sometimes defeat the fast recognizer but pass the accurate one.
-    if text.isEmpty || text.filter({ $0.isNumber }).isEmpty {
-        text = recognize(roi, level: .accurate).filter { allowed.contains($0) }
+    // Use .accurate first — .fast silently drops narrow glyphs (like the "1"
+    // in 7-segment displays) even when they're clearly visible. For a meter
+    // that samples every 10–20 s, the extra ~100 ms of accurate OCR is
+    // invisible and worth the reliability gain. Fall back to .fast only if
+    // accurate somehow returns nothing.
+    var text = recognize(roi, level: .accurate).filter { allowed.contains($0) }
+    if text.isEmpty {
+        text = recognize(roi, level: .fast).filter { allowed.contains($0) }
     }
     print(text)
     exit(0)

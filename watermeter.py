@@ -129,6 +129,12 @@ class Config:
     digital_max_retries: int = 2
     digital_retry_delay_sec: float = 5.5
     digital_min_digits: int = 6
+    # Optional OCR preprocessing. "clahe" applies Contrast Limited Adaptive
+    # Histogram Equalization to the captured frame before Vision OCR runs —
+    # useful for low-contrast 7-segment LCDs where thin glyphs (e.g. a "1"
+    # rendered as two right segments) get dropped by the recognizer.
+    # "none" (default) skips preprocessing entirely.
+    digital_ocr_preprocess: str = "none"
 
 def load_config(path)->Config:
     raw=load_yaml(path)
@@ -205,6 +211,7 @@ def load_config(path)->Config:
         digital_max_retries = int(dig.get("max_retries", 2)),
         digital_retry_delay_sec = float(dig.get("retry_delay_sec", 5.5)),
         digital_min_digits = int(dig.get("min_digits", 6)),
+        digital_ocr_preprocess = str(dig.get("ocr_preprocess", "none")).lower(),
     )
 
 class VisionOCR:
@@ -1236,6 +1243,31 @@ def build_digit_rois(cfg,W,H):
     return rois
 
 
+def apply_ocr_preprocess(src_path, dst_path, mode):
+    """Apply optional contrast/sharpening preprocessing to an image before
+    it's fed to Apple Vision. Returns True if a new file was written at
+    dst_path, False if the mode is unrecognized or the source couldn't be
+    loaded (caller should fall back to the original image in that case).
+
+    Supported modes:
+      - "clahe": Contrast Limited Adaptive Histogram Equalization (grayscale).
+        Locally stretches contrast without blowing out highlights. Good for
+        7-segment LCDs where a narrow "1" glyph can be lower contrast than
+        its taller-stroke neighbours and get dropped by Vision's recognizer.
+    """
+    if mode == "clahe":
+        img = cv2.imread(src_path)
+        if img is None:
+            return False
+        gray = cv2.cvtColor(img, cv2.COLOR_BGR2GRAY)
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        enhanced = clahe.apply(gray)
+        out = cv2.cvtColor(enhanced, cv2.COLOR_GRAY2BGR)
+        cv2.imwrite(dst_path, out)
+        return True
+    return False
+
+
 def capture_frame(cfg, session, log):
     """Fetch + decode one JPEG from the ESP32 camera.
 
@@ -1316,6 +1348,14 @@ def run_digital_cycle(cfg, ocr, aligner, session, prev_total, log, sleep=time.sl
             if aligned_ok
             else cfg.image_path
         )
+
+        # Optional contrast preprocessing before OCR. When enabled, writes a
+        # preprocessed copy and redirects OCR calls to it. Fallthrough on
+        # failure — better to OCR the raw frame than to skip the cycle.
+        if cfg.digital_ocr_preprocess and cfg.digital_ocr_preprocess != "none":
+            preproc_path = ocr_path + ".preproc.jpg"
+            if apply_ocr_preprocess(ocr_path, preproc_path, cfg.digital_ocr_preprocess):
+                ocr_path = preproc_path
 
         # Split-ROI mode: when both integer and fractional sub-ROIs are set,
         # OCR them separately and concatenate with "." before parsing. Needed

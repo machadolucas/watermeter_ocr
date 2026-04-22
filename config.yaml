@@ -120,13 +120,17 @@ rois:
 #
 # rois:
 #   digital:
-#     total: [0.10, 0.25, 0.80, 0.18]   # single-ROI mode — line with 6 int + 3 decimal digits
-#     # Split-ROI mode (optional): when BOTH keys below are set, the pipeline
-#     # OCRs the integer and fractional parts separately and joins them with
-#     # "." before parsing. Useful for LCDs whose fractional digits are a
-#     # different size from the integer digits — Vision tends to drop the
-#     # smaller glyphs when both are captured in a single wide ROI. When set,
-#     # `total` above is only used as an overlay fallback for unrelated code.
+#     # Configure ONE of the two reading modes below.
+#     #
+#     # Single-ROI mode — one rectangle covers the whole total line:
+#     total: [0.10, 0.25, 0.80, 0.18]     # line with 6 int + 3 decimal digits
+#     #
+#     # Split-ROI mode — two rectangles, one per sub-line. Needed for LCDs
+#     # whose fractional digits are visibly smaller than the integer digits
+#     # (Vision tends to drop the smaller glyphs when both are captured in a
+#     # single wide ROI). When BOTH keys below are set, the pipeline OCRs
+#     # them separately and joins with "." before parsing — `total` above
+#     # becomes optional and can be removed.
 #     # total_int:  [0.10, 0.25, 0.48, 0.18]
 #     # total_frac: [0.58, 0.30, 0.22, 0.14]
 #     flow:  [0.25, 0.50, 0.55, 0.15]   # optional — line with "XX.YYY m³/h"; omit if flash glare hides it
@@ -138,6 +142,11 @@ rois:
 #   # is present, so a dotless read like "00000" is accepted as "00.000".
 #   total_regex: "^\\d{6}\\.?\\d{3}$"
 #   flow_regex:  "^\\d{2,5}\\.?\\d{3}$"
+#   # Optional OCR contrast preprocessing. "none" (default) leaves the captured
+#   # frame untouched. "clahe" applies Contrast Limited Adaptive Histogram
+#   # Equalization — enable if Vision consistently drops thin glyphs (e.g. a
+#   # narrow "1") that are clearly visible in the debug overlay.
+#   ocr_preprocess: "none"
 #   max_retries: 2               # extra captures per cycle if wrong view detected
 #   retry_delay_sec: 5.5         # > longest diag-view dwell (5s) so retries phase-cross
 #   min_digits: 6                # cheap-fail bar for diagnostic screens

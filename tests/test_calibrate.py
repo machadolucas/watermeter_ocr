@@ -161,10 +161,22 @@ class TestValidateDigitalPayload:
     def test_valid(self):
         assert validate_digital_payload(_valid_digital_payload()) is None
 
-    def test_missing_total(self):
+    def test_missing_total_when_no_split_mode(self):
+        # Single-ROI mode and split-ROI mode are mutually exclusive-OR-both.
+        # Missing BOTH is a config error — nothing tells the pipeline where
+        # to OCR the total line.
         p = _valid_digital_payload(); p["total"] = None
         err = validate_digital_payload(p)
         assert err and "total" in err
+
+    def test_missing_total_allowed_in_split_mode(self):
+        # When the split-ROI pair is set, `total` is no longer needed — the
+        # pipeline reads from the split sub-ROIs and concatenates.
+        p = _valid_digital_payload()
+        p["total"] = None
+        p["total_int"]  = [0.10, 0.25, 0.48, 0.18]
+        p["total_frac"] = [0.58, 0.30, 0.22, 0.14]
+        assert validate_digital_payload(p) is None
 
     def test_flow_is_optional(self):
         # Flow ROI is optional — some installs can't align both lines cleanly
