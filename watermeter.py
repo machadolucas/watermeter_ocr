@@ -812,7 +812,11 @@ def is_valid_digital_view(raw_total, raw_flow, cfg):
     total_digits = sum(1 for c in raw_total if c.isdigit())
     if total_digits < cfg.digital_min_digits:
         return False
-    if cfg.digital_flow_roi:
+    # Flow is tracked when EITHER the legacy single-ROI or the per-digit
+    # list is configured. Only one of the two is ever populated per
+    # calibration session, so checking both covers both modes.
+    flow_tracked = bool(cfg.digital_flow_roi) or bool(cfg.digital_flow_digits)
+    if flow_tracked:
         if raw_flow is None:
             return False
         flow_digits = sum(1 for c in raw_flow if c.isdigit())
@@ -824,15 +828,18 @@ def is_valid_digital_view(raw_total, raw_flow, cfg):
 def validate_digital_reading(total, flow, prev_total, cfg):
     """Post-parse sanity check.
 
-    Rejects None/NaN/inf totals, negative/non-finite flow (when flow tracking
-    is enabled), and totals that drift more than `big_jump_guard` from the
-    previous reading. The first read (prev_total is None) is always accepted
-    so the service has a baseline on a cold start. When `digital_flow_roi` is
-    empty, `flow` is expected to be None and is not evaluated.
+    Rejects None/NaN/inf totals, negative/non-finite flow (when flow
+    tracking is enabled), and totals that drift more than `big_jump_guard`
+    from the previous reading. The first read (prev_total is None) is
+    always accepted so the service has a baseline on a cold start. Flow
+    is evaluated when EITHER `digital_flow_roi` or `digital_flow_digits`
+    is configured; when both are empty, `flow` is expected to be None
+    and is not evaluated.
     """
     if total is None or not math.isfinite(total):
         return False
-    if cfg.digital_flow_roi:
+    flow_tracked = bool(cfg.digital_flow_roi) or bool(cfg.digital_flow_digits)
+    if flow_tracked:
         if flow is None or not math.isfinite(flow) or flow < 0:
             return False
     if prev_total is not None and abs(total - prev_total) > cfg.big_jump_guard:
@@ -1486,32 +1493,205 @@ def read_region_individual_digits(ocr, img_path, digit_rois, upscale=1,
         save_to = None
         if crops_dir is not None and crops_prefix is not None:
             save_to = os.path.join(crops_dir, f"{crops_prefix}_d{i}.jpg")
-        if upscale > 1:
-            digit = _ocr_digit_upscaled(ocr, img_path, sub, upscale,
-                                        save_to=save_to)
-        else:
-            digit = ocr._run(img_path, sub, "full") or ""
-            if not digit:
-                line = ocr.read_line(img_path, sub) or ""
-                digits_only = "".join(c for c in line if c.isdigit())
-                if digits_only:
-                    digit = digits_only[0]
-            if save_to is not None:
-                img = cv2.imread(img_path)
-                if img is not None:
-                    H, W = img.shape[:2]
-                    x, y, w, h = norm_to_abs(sub, W, H)
-                    if w > 0 and h > 0:
-                        crop = img[y:y + h, x:x + w]
-                        if crop.size > 0:
-                            ensure_dir(os.path.dirname(save_to))
-                            cv2.imwrite(save_to, crop)
+        # Classical 7-segment pattern classifier — the only path. Reads
+        # hollow 7-segment glyphs reliably (which Vision systematically
+        # mis-reads as "1"s) and, crucially, returns "" when it's
+        # uncertain. Previous versions fell back to Apple Vision on
+        # empty 7seg output, but Vision would HALLUCINATE plausible-
+        # looking digits for clipped / partial crops (e.g. emit "1" for
+        # a crop showing only one vertical edge), which then passed
+        # through parsing and produced wrong totals. An empty read
+        # failing the regex → retry → we get a clean frame eventually
+        # is strictly better than a confidently-wrong digit going live.
+        digit = _classify_7seg_from_path(img_path, sub, save_to=save_to)
         if log is not None:
             log.info("individual[%s d%d] roi=[%.4f,%.4f,%.4f,%.4f] → %r",
                      crops_prefix or "?", i,
                      sub[0], sub[1], sub[2], sub[3], digit)
         digits.append(digit or "")
     return "".join(digits)
+
+
+# Canonical 7-segment patterns. Segment order:
+#   (top, top-right, bottom-right, bottom, bottom-left, top-left, middle).
+# This is a CLASSICAL OCR approach for seven-segment LCDs — it doesn't
+# depend on Apple Vision's text recognizer, which struggles with hollow
+# 7-segment glyphs (the vertical strokes of a "0" are read as "|||" →
+# "111", and Vision sometimes refuses to emit anything at all on isolated
+# single-character crops).
+_SEVEN_SEG_PATTERNS = {
+    (1, 1, 1, 1, 1, 1, 0): "0",
+    (0, 1, 1, 0, 0, 0, 0): "1",
+    (1, 1, 0, 1, 1, 0, 1): "2",
+    (1, 1, 1, 1, 0, 0, 1): "3",
+    (0, 1, 1, 0, 0, 1, 1): "4",
+    (1, 0, 1, 1, 0, 1, 1): "5",
+    (1, 0, 1, 1, 1, 1, 1): "6",
+    (1, 1, 1, 0, 0, 0, 0): "7",
+    (1, 1, 1, 1, 1, 1, 1): "8",
+    (1, 1, 1, 1, 0, 1, 1): "9",
+}
+
+
+def _ink_fraction(bw, y0, y1, x0, x1):
+    """Fraction of INK pixels (0 = ink, 255 = background) in the rect."""
+    y0 = max(0, int(y0)); y1 = min(bw.shape[0], int(y1))
+    x0 = max(0, int(x0)); x1 = min(bw.shape[1], int(x1))
+    if x1 <= x0 or y1 <= y0:
+        return 0.0
+    region = bw[y0:y1, x0:x1]
+    if region.size == 0:
+        return 0.0
+    return float((region == 0).sum()) / region.size
+
+
+def _isolate_main_digit(crop_bw):
+    """Return a version of `crop_bw` where only the largest ink CLUSTER
+    (the real digit) is preserved; neighbouring-digit slivers and
+    isolated noise blobs elsewhere in the crop are erased. The result
+    is CROPPED to the cluster's bounding box so segment-position math
+    in `classify_7seg` aligns regardless of where the digit sat in the
+    original crop.
+
+    7-segment glyphs are made of multiple disconnected strokes (e.g. a
+    "0" has no pixel-level connection between its six segments), so a
+    naive connected-components pass would find each stroke as a
+    separate component. We dilate the binary-inverse by a small kernel
+    before labelling so nearby strokes merge into one cluster — a
+    single "digit blob" — and the largest blob wins. The mask is then
+    projected back onto the ORIGINAL (un-dilated) crop so segment-ink
+    fractions stay accurate.
+
+    Returns None if no ink meets the minimum size threshold.
+    """
+    h_crop, w_crop = crop_bw.shape
+    inv = 255 - crop_bw
+    # Dilate by ~15% of the crop's smaller dimension — enough to bridge
+    # the typical gap between adjacent 7-segment strokes without bridging
+    # the gap to a neighbouring digit's ROI bleed.
+    k = max(3, min(h_crop, w_crop) // 7)
+    kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (k, k))
+    dilated = cv2.dilate(inv, kernel)
+    num, labels, stats, _ = cv2.connectedComponentsWithStats(dilated, connectivity=8)
+    if num <= 1:
+        return None
+    areas = stats[1:, cv2.CC_STAT_AREA]
+    if areas.size == 0:
+        return None
+    main = int(np.argmax(areas)) + 1
+    if stats[main, cv2.CC_STAT_AREA] < 8:
+        return None
+    x = int(stats[main, cv2.CC_STAT_LEFT])
+    y = int(stats[main, cv2.CC_STAT_TOP])
+    w = int(stats[main, cv2.CC_STAT_WIDTH])
+    h = int(stats[main, cv2.CC_STAT_HEIGHT])
+    # Build the cluster mask, but apply it to the ORIGINAL (un-dilated)
+    # ink pixels so segment-ink fractions reflect real stroke coverage.
+    mask = (labels == main)
+    isolated = np.full_like(crop_bw, 255)
+    isolated[mask & (crop_bw == 0)] = 0
+    isolated = isolated[y:y + h, x:x + w]
+    return isolated
+
+
+def classify_7seg(crop_bw, threshold=0.18):
+    """Classify a binarized single-digit crop via 7-segment pattern lookup.
+
+    `crop_bw` is uint8 grayscale with 0 = ink and 255 = background. The
+    function first isolates the LARGEST ink component (erasing any
+    neighbouring-digit slivers that bled in from an overlapping ROI)
+    and crops to its bounding box, then measures ink fraction in each
+    of seven segment regions relative to that bounding box.
+
+    Returns a single-char digit string, or "" if no ink is present, the
+    crop is too small, or the detected pattern isn't a valid digit.
+    """
+    if crop_bw is None or crop_bw.size == 0:
+        return ""
+    h, w = crop_bw.shape
+    if h < 8 or w < 4:
+        return ""
+    if int((crop_bw == 0).sum()) < 4:
+        return ""
+
+    # Isolate just the main digit component and size segment regions off
+    # its bounding box. This is what makes the classifier robust to
+    # neighbour-digit bleed on overlapping user calibrations.
+    isolated = _isolate_main_digit(crop_bw)
+    if isolated is None:
+        return ""
+    ih, iw = isolated.shape
+    if ih < 8 or iw < 2:
+        return ""
+
+    # If the component is distinctly TALLER than WIDE by a large margin,
+    # it's almost certainly a "1" — only the two right-side vertical
+    # strokes are drawn. Threshold at 3.5 so "3" / "7" (h/w ≈ 2.3 for a
+    # standard 7-segment font) aren't misclassified as "1".
+    if ih > 0 and iw > 0 and ih / iw >= 3.5:
+        return "1"
+
+    y0, y1 = 0, ih
+    x0, x1 = 0, iw
+    top_band    = (y0,                  y0 + int(ih * 0.22))
+    middle_band = (y0 + int(ih * 0.42), y0 + int(ih * 0.58))
+    bottom_band = (y0 + int(ih * 0.78), y1)
+    left_col    = (x0,                  x0 + int(iw * 0.30))
+    right_col   = (x0 + int(iw * 0.70), x1)
+    upper_half  = (y0 + int(ih * 0.10), y0 + int(ih * 0.48))
+    lower_half  = (y0 + int(ih * 0.52), y0 + int(ih * 0.90))
+    inner_x     = (x0 + int(iw * 0.25), x0 + int(iw * 0.75))
+
+    segs = (
+        _ink_fraction(isolated, *top_band,    *inner_x),
+        _ink_fraction(isolated, *upper_half,  *right_col),
+        _ink_fraction(isolated, *lower_half,  *right_col),
+        _ink_fraction(isolated, *bottom_band, *inner_x),
+        _ink_fraction(isolated, *lower_half,  *left_col),
+        _ink_fraction(isolated, *upper_half,  *left_col),
+        _ink_fraction(isolated, *middle_band, *inner_x),
+    )
+    bits = tuple(1 if v > threshold else 0 for v in segs)
+    return _SEVEN_SEG_PATTERNS.get(bits, "")
+
+
+def _classify_7seg_from_path(img_path, sub_roi, save_to=None):
+    """Crop `sub_roi` out of the full image at `img_path`, binarize, and
+    run the 7-segment classifier. Returns a single-char digit or "".
+
+    If `save_to` is set, writes the binarized single-digit crop there so
+    the debug overlay can show what the classifier saw."""
+    img = cv2.imread(img_path)
+    if img is None:
+        return ""
+    H, W = img.shape[:2]
+    x, y, w, h = norm_to_abs(sub_roi, W, H)
+    if w <= 0 or h <= 0:
+        return ""
+    # Minimal inside-trim so a slightly-overlapping user calibration
+    # doesn't bleed a neighbouring digit's edge into the crop, but
+    # large enough to keep the glyph's own outer strokes inside. For
+    # 7-segment glyphs the outer strokes sit right at the cell edge, so
+    # aggressive trimming (e.g. 10%+) risks clipping a "0"'s left
+    # vertical stroke and collapsing the pattern to "7".
+    trim_x = int(w * 0.04)
+    trim_y = int(h * 0.04)
+    x2 = x + trim_x
+    y2 = y + trim_y
+    w2 = max(1, w - 2 * trim_x)
+    h2 = max(1, h - 2 * trim_y)
+    crop = img[y2:y2 + h2, x2:x2 + w2]
+    if crop.size == 0:
+        return ""
+    gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY) if crop.ndim == 3 else crop
+    _, bw = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    # Make sure ink is 0 and background is 255 regardless of Otsu polarity.
+    if bw.mean() < 127:
+        bw = cv2.bitwise_not(bw)
+    if save_to is not None:
+        ensure_dir(os.path.dirname(save_to))
+        cv2.imwrite(save_to, bw)
+    return classify_7seg(bw)
 
 
 def _ocr_digit_upscaled(ocr, img_path, sub_roi, factor, save_to=None):
@@ -1540,32 +1720,52 @@ def _ocr_digit_upscaled(ocr, img_path, sub_roi, factor, save_to=None):
     x, y, w, h = norm_to_abs(sub_roi, W, H)
     if w <= 0 or h <= 0:
         return ""
-    crop = img[y:y + h, x:x + w]
+    # Shrink 10% on each side (inward) before cropping. Defends against
+    # user-calibrated ROIs that slightly overlap neighbouring digits;
+    # without this, each crop contains a sliver of the next digit's edge
+    # and Vision sees "0|0|0|" instead of a clean "0", which throws off
+    # the recognizer even under the 3x-tiling trick below.
+    trim_x = int(w * 0.10)
+    trim_y = int(h * 0.05)
+    x2 = x + trim_x
+    y2 = y + trim_y
+    w2 = max(1, w - 2 * trim_x)
+    h2 = max(1, h - 2 * trim_y)
+    crop = img[y2:y2 + h2, x2:x2 + w2]
     if crop.size == 0:
         return ""
-    new_w = max(1, int(w * factor))
-    new_h = max(1, int(h * factor))
+    new_w = max(1, int(w2 * factor))
+    new_h = max(1, int(h2 * factor))
     up = cv2.resize(crop, (new_w, new_h), interpolation=cv2.INTER_CUBIC)
-    # Pad with a neutral border roughly matching the LCD background. Apple
-    # Vision's text DETECTION stage (before recognition) treats a tight
-    # single-character image as "not text" and refuses to recognize even
-    # a clearly-visible glyph — padding turns the crop into "a glyph on a
-    # page", which Vision's detector accepts. Border size = 1x the glyph
-    # dimensions (empirically a comfortable margin). Background colour is
-    # sampled from the crop's own corners so the padding blends with the
-    # LCD rather than introducing a hard colour edge.
-    corners = np.vstack([
-        up[:5, :5].reshape(-1, up.shape[-1]) if up.ndim == 3 else up[:5, :5].reshape(-1, 1),
-        up[:5, -5:].reshape(-1, up.shape[-1]) if up.ndim == 3 else up[:5, -5:].reshape(-1, 1),
-        up[-5:, :5].reshape(-1, up.shape[-1]) if up.ndim == 3 else up[-5:, :5].reshape(-1, 1),
-        up[-5:, -5:].reshape(-1, up.shape[-1]) if up.ndim == 3 else up[-5:, -5:].reshape(-1, 1),
-    ])
-    bg = tuple(int(v) for v in corners.mean(axis=0))
-    if up.ndim == 2:
-        bg = bg[0]
-    pad_px = max(new_w, new_h)
-    up = cv2.copyMakeBorder(up, pad_px, pad_px, pad_px, pad_px,
-                            cv2.BORDER_CONSTANT, value=bg)
+    # Binarize: 7-segment glyphs are dark-ish ink on gray LCD background, a
+    # palette very different from printed text Vision was trained on.
+    # Otsu threshold flips it to stark black-on-white, which matches the
+    # training distribution and dramatically improves recognition.
+    gray = cv2.cvtColor(up, cv2.COLOR_BGR2GRAY) if up.ndim == 3 else up
+    _, bw = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+    # After Otsu, "ink" is whichever class is the minority. Our LCD glyphs
+    # are darker than the background, so after THRESH_BINARY with Otsu the
+    # ink becomes 0 (black), which is what we want for black-on-white
+    # output. If Otsu happens to produce the opposite polarity (white ink
+    # on black background), invert so we always feed Vision black-on-white.
+    if bw.mean() < 127:
+        bw = cv2.bitwise_not(bw)
+    up3 = cv2.cvtColor(bw, cv2.COLOR_GRAY2BGR)
+    # TILE 3 copies side-by-side with small gaps on a white canvas.
+    # Apple Vision's text DETECTION stage treats a single isolated glyph
+    # as noise; three identical copies look like a number and activate
+    # the recognizer. The Swift digit-mode extractor grabs the first
+    # character — all three copies are identical so first == correct.
+    copies = 3
+    gap_px = max(4, new_w // 6)
+    margin_px = max(4, new_h // 6)
+    canvas_w = copies * new_w + (copies - 1) * gap_px + 2 * margin_px
+    canvas_h = new_h + 2 * margin_px
+    canvas = np.full((canvas_h, canvas_w, 3), 255, dtype=np.uint8)
+    for i in range(copies):
+        x0 = margin_px + i * (new_w + gap_px)
+        canvas[margin_px:margin_px + new_h, x0:x0 + new_w] = up3
+    up = canvas
     temp_path = img_path + ".digit.jpg"
     cv2.imwrite(temp_path, up)
     if save_to is not None:
@@ -1873,12 +2073,15 @@ def run_digital_cycle(cfg, ocr, aligner, session, prev_total, log,
             continue
 
         total = parse_digital_total(raw_total, cfg.digital_total_regex)
+        # Flow is parsed whenever EITHER the legacy flow_roi or the
+        # per-digit flow_digits list is configured — i.e. whenever the
+        # pipeline actually read something for the flow line.
         flow = (parse_digital_flow(raw_flow, cfg.digital_flow_regex)
-                if cfg.digital_flow_roi else None)
+                if flow_active else None)
         last["total"] = total
         last["flow_m3h"] = flow
 
-        parse_ok = total is not None and (flow is not None or not cfg.digital_flow_roi)
+        parse_ok = total is not None and (flow is not None or not flow_active)
         if not parse_ok:
             log.warning(
                 "Parse failed (attempt %d/%d): raw_total=%r raw_flow=%r parsed=(%s, %s)",

@@ -18,6 +18,7 @@ import json
 from dataclasses import dataclass
 from types import SimpleNamespace
 
+import cv2
 import numpy as np
 import pytest
 
@@ -25,6 +26,7 @@ from watermeter import (
     MqttClient,
     apply_ocr_preprocess,
     build_digit_sub_rois,
+    classify_7seg,
     draw_overlays_digital,
     is_valid_digital_view,
     load_config,
@@ -266,6 +268,36 @@ def _dummy_frame():
     return np.zeros((10, 10, 3), dtype=np.uint8)
 
 
+def _synth_digital_frame(w, h, digits_at, bg_gray=180, ink_gray=40):
+    """Render a synthetic digital-meter frame with 7-segment glyphs at the
+    specified ROIs. `digits_at` is a list of (digit_char, roi_norm) pairs
+    where roi_norm is [x, y, w, h] in [0,1]. Returns a BGR uint8 frame.
+
+    Each digit is drawn scaled to its ROI, with small margin on all sides
+    so the classifier's inset trim doesn't clip off ink.
+    """
+    frame = np.full((h, w, 3), bg_gray, dtype=np.uint8)
+    for ch, roi in digits_at:
+        rx, ry, rw, rh = roi
+        x0 = int(rx * w); y0 = int(ry * h)
+        x1 = int((rx + rw) * w); y1 = int((ry + rh) * h)
+        dw, dh = x1 - x0, y1 - y0
+        # Draw the glyph inside the ROI with a small inner margin so the
+        # classifier's 10% x / 5% y trim doesn't bite into the ink.
+        mx = max(2, int(dw * 0.18))
+        my = max(2, int(dh * 0.10))
+        glyph = _seg_digit(ch, height=max(10, dh - 2 * my),
+                           width=max(6, dw - 2 * mx),
+                           stroke=max(1, dh // 12))
+        glyph_bgr = cv2.cvtColor(
+            np.where(glyph == 0, ink_gray, bg_gray).astype(np.uint8),
+            cv2.COLOR_GRAY2BGR,
+        )
+        gh, gw = glyph_bgr.shape[:2]
+        frame[y0 + my:y0 + my + gh, x0 + mx:x0 + mx + gw] = glyph_bgr
+    return frame
+
+
 class TestRunDigitalCycle:
     def _patch_capture(self, monkeypatch, return_value=None, returns_seq=None):
         calls = {"n": 0}
@@ -495,66 +527,79 @@ class TestRunDigitalCycle:
         assert result["reason"] == "parse_failed"
         assert result["raw_total_int"] == "00000"
 
-    def test_individual_digits_mode_bypasses_subdivision(self, monkeypatch):
+    def test_individual_digits_mode_bypasses_subdivision(self, monkeypatch, tmp_path):
         # When per-digit ROI lists are configured, the pipeline OCRs each
-        # ROI directly — no subdivision, no auto-detect. Gives the user
-        # pixel-perfect control over each digit's bounding box, useful for
-        # LCDs where digits aren't evenly spaced in a single enclosing ROI.
-        self._patch_capture(monkeypatch)
+        # ROI directly via the classical 7-segment classifier — no Vision,
+        # no subdivision, no auto-detect. This test synthesizes a frame
+        # with actual 7-segment glyphs at the configured ROIs so the
+        # classifier has real pixels to read.
+        import cv2
+        frame = _synth_digital_frame(
+            w=640, h=480,
+            digits_at=[
+                ("0", [0.10, 0.25, 0.05, 0.10]),
+                ("0", [0.17, 0.25, 0.05, 0.10]),
+                ("0", [0.24, 0.25, 0.05, 0.10]),
+                ("0", [0.31, 0.25, 0.05, 0.10]),
+                ("0", [0.38, 0.25, 0.05, 0.10]),
+                ("0", [0.45, 0.25, 0.05, 0.10]),
+                ("1", [0.56, 0.31, 0.04, 0.08]),
+                ("1", [0.62, 0.31, 0.04, 0.08]),
+                ("8", [0.70, 0.31, 0.04, 0.08]),
+            ],
+        )
+        image_path = str(tmp_path / "test_frame.jpg")
+        cv2.imwrite(image_path, frame)
+        self._patch_capture(monkeypatch, return_value=frame)
         cfg = _cfg_stub(
             digital_total_int_digits=[
-                [0.10, 0.25, 0.05, 0.10],
-                [0.17, 0.25, 0.05, 0.10],
-                [0.24, 0.25, 0.05, 0.10],
-                [0.31, 0.25, 0.05, 0.10],
-                [0.38, 0.25, 0.05, 0.10],
-                [0.45, 0.25, 0.05, 0.10],
+                [0.10, 0.25, 0.05, 0.10], [0.17, 0.25, 0.05, 0.10],
+                [0.24, 0.25, 0.05, 0.10], [0.31, 0.25, 0.05, 0.10],
+                [0.38, 0.25, 0.05, 0.10], [0.45, 0.25, 0.05, 0.10],
             ],
             digital_total_frac_digits=[
-                [0.56, 0.31, 0.04, 0.08],
-                [0.62, 0.31, 0.04, 0.08],
-                [0.70, 0.31, 0.04, 0.08],  # extra gap before this one
+                [0.56, 0.31, 0.04, 0.08], [0.62, 0.31, 0.04, 0.08],
+                [0.70, 0.31, 0.04, 0.08],
             ],
-            # digital_total_*_roi intentionally empty — individual-digits
-            # mode must still detect split mode is active.
-            digital_total_int_roi=[],
-            digital_total_frac_roi=[],
+            digital_total_int_roi=[], digital_total_frac_roi=[],
+            digital_flow_roi=[],
+            image_path=image_path,
         )
-        # 6 int + 3 frac + 1 flow-line-mode = 10 calls per attempt. All digits
-        # come back non-empty on first attempt → no line-mode fallback needed.
-        ocr = _FakeOCR([
-            "0", "0", "0", "0", "0", "0",
-            "1", "1", "8",
-            "00.000",
-        ])
-        result = run_digital_cycle(cfg, ocr, aligner=None, session=None,
+        result = run_digital_cycle(cfg, _FakeOCR([]), aligner=None, session=None,
                                    prev_total=None, log=_StubLog(), sleep=_noop)
-        assert result["success"] is True
-        assert result["total"] == pytest.approx(0.118)
+        assert result["success"] is True, f"reason={result['reason']!r} raw={result['raw_total']!r}"
         assert result["raw_total_int"] == "000000"
         assert result["raw_total_frac"] == "118"
+        assert result["total"] == pytest.approx(0.118)
 
-    def test_individual_digits_missed_triggers_line_fallback(self, monkeypatch):
-        # When digit mode returns empty for one cell, the line-mode
-        # fallback inside the individual-digits path consumes the next
-        # script entry and tries to extract a digit from it.
-        self._patch_capture(monkeypatch)
+    def test_individual_digits_mode_returns_empty_for_missing_digit(self, monkeypatch, tmp_path):
+        # When a digit's ROI is drawn in an empty area of the frame (no
+        # ink), the classifier returns "" and the cycle fails parse —
+        # correct behaviour, since we'd rather fail than hallucinate a
+        # digit. (Previously the Vision fallback would sometimes emit a
+        # plausible-but-wrong character; we removed that.)
+        import cv2
+        frame = _synth_digital_frame(
+            w=640, h=480,
+            digits_at=[("0", [0.10, 0.25, 0.05, 0.10])],  # only one digit rendered
+        )
+        image_path = str(tmp_path / "sparse.jpg")
+        cv2.imwrite(image_path, frame)
+        self._patch_capture(monkeypatch, return_value=frame)
         cfg = _cfg_stub(
+            digital_max_retries=0,
             digital_total_int_digits=[[0.10 + i*0.07, 0.25, 0.05, 0.10] for i in range(6)],
             digital_total_frac_digits=[[0.56 + i*0.06, 0.31, 0.04, 0.08] for i in range(3)],
             digital_total_int_roi=[], digital_total_frac_roi=[],
+            digital_flow_roi=[],
+            image_path=image_path,
         )
-        # First frac digit: _run empty, read_line returns "1" → "1" survives.
-        ocr = _FakeOCR([
-            "0", "0", "0", "0", "0", "0",
-            "", "1",           # frac d0 empty + line fallback returns "1"
-            "1", "8",          # frac d1, d2
-            "00.000",
-        ])
-        result = run_digital_cycle(cfg, ocr, aligner=None, session=None,
+        result = run_digital_cycle(cfg, _FakeOCR([]), aligner=None, session=None,
                                    prev_total=None, log=_StubLog(), sleep=_noop)
-        assert result["success"] is True
-        assert result["raw_total_frac"] == "118"
+        # d0 reads "0", d1..d5 all empty (no ink in those ROIs) → int = "0"
+        # which is shorter than 6 → combined "0.###" fails regex → parse_failed.
+        assert result["success"] is False
+        assert result["reason"] in ("parse_failed", "wrong_view")
 
     def test_split_mode_wrong_view_when_both_empty(self, monkeypatch):
         # Both split reads come back empty — concat ".", digit count < 6.
@@ -973,6 +1018,71 @@ class TestBuildDigitSubRois:
         # padding of the detected run itself).
         for w in widths:
             assert digit_w * 0.5 < w < digit_w * 1.4
+
+
+# ---------------------------------------------------------------------------
+# classify_7seg — classical segment-pattern classifier
+# ---------------------------------------------------------------------------
+
+def _seg_digit(digit, height=60, width=30, stroke=4):
+    """Render a synthetic 7-segment digit as a grayscale array with 0=ink
+    and 255=background. Good enough to exercise the classifier's segment
+    picker without depending on a font file."""
+    img = np.full((height, width), 255, dtype=np.uint8)
+    segs = {
+        "0": (1, 1, 1, 1, 1, 1, 0),
+        "1": (0, 1, 1, 0, 0, 0, 0),
+        "2": (1, 1, 0, 1, 1, 0, 1),
+        "3": (1, 1, 1, 1, 0, 0, 1),
+        "4": (0, 1, 1, 0, 0, 1, 1),
+        "5": (1, 0, 1, 1, 0, 1, 1),
+        "6": (1, 0, 1, 1, 1, 1, 1),
+        "7": (1, 1, 1, 0, 0, 0, 0),
+        "8": (1, 1, 1, 1, 1, 1, 1),
+        "9": (1, 1, 1, 1, 0, 1, 1),
+    }[digit]
+    top, tr, br, bot, bl, tl, mid = segs
+    h, w = height, width
+    mid_y = h // 2
+    if top: img[0:stroke, stroke:w-stroke] = 0
+    if bot: img[h-stroke:h, stroke:w-stroke] = 0
+    if mid: img[mid_y-stroke//2:mid_y+stroke//2, stroke:w-stroke] = 0
+    if tl:  img[0:mid_y, 0:stroke] = 0
+    if tr:  img[0:mid_y, w-stroke:w] = 0
+    if bl:  img[mid_y:h, 0:stroke] = 0
+    if br:  img[mid_y:h, w-stroke:w] = 0
+    return img
+
+
+class TestClassify7Seg:
+    def test_all_digits_round_trip(self):
+        # Synthesize each digit, classify, check it's returned correctly.
+        for d in "0123456789":
+            bw = _seg_digit(d)
+            assert classify_7seg(bw) == d, f"failed for {d!r}"
+
+    def test_empty_image_returns_empty_string(self):
+        bw = np.full((60, 30), 255, dtype=np.uint8)
+        assert classify_7seg(bw) == ""
+
+    def test_none_input_returns_empty_string(self):
+        assert classify_7seg(None) == ""
+
+    def test_tiny_image_returns_empty_string(self):
+        # Below the minimum-size sanity check.
+        bw = np.full((5, 3), 0, dtype=np.uint8)
+        assert classify_7seg(bw) == ""
+
+    def test_padding_is_self_corrected_via_component_isolation(self):
+        # The classifier isolates the largest connected ink component and
+        # crops to its bbox before measuring segments — so extra padding
+        # around a centred glyph is cleanly absorbed. This is the same
+        # mechanism that filters out neighbour-digit bleed on
+        # overlapping user calibrations.
+        core = _seg_digit("3")
+        padded = np.full((120, 80), 255, dtype=np.uint8)
+        padded[30:90, 25:55] = core
+        assert classify_7seg(padded) == "3"
 
 
 # ---------------------------------------------------------------------------
