@@ -55,6 +55,8 @@ def _cfg_stub(**over):
         image_path="/tmp/watermeter_test_raw.jpg",
         meter_type="digital",
         digital_total_roi=[0.1, 0.1, 0.8, 0.2],
+        digital_total_int_roi=[],
+        digital_total_frac_roi=[],
         digital_flow_roi=[0.1, 0.5, 0.8, 0.2],
         esp32_base_url="http://unused",
         image_timeout=1.0,
@@ -356,6 +358,59 @@ class TestRunDigitalCycle:
         assert result["success"] is False
         assert result["reason"] == "parse_failed"
         assert result["raw_total"] == "1234567"
+
+    def test_split_mode_concatenates_int_and_frac(self, monkeypatch):
+        # When total_int + total_frac ROIs are both set, the cycle OCRs them
+        # separately and joins with "." before parsing. Needed for LCDs whose
+        # fractional digits are visibly smaller than the integer digits and
+        # get dropped when captured in a single wide ROI.
+        self._patch_capture(monkeypatch)
+        cfg = _cfg_stub(
+            digital_total_int_roi=[0.10, 0.25, 0.45, 0.18],
+            digital_total_frac_roi=[0.58, 0.30, 0.22, 0.14],
+        )
+        # Per attempt, OCR is called three times in order: int, frac, flow.
+        ocr = _FakeOCR(["000000", "148", "00.000"])
+        result = run_digital_cycle(cfg, ocr, aligner=None, session=None,
+                                   prev_total=None, log=_StubLog(), sleep=_noop)
+        assert result["success"] is True
+        assert result["total"] == pytest.approx(0.148)
+        assert result["raw_total"] == "000000.148"
+        assert result["raw_total_int"] == "000000"
+        assert result["raw_total_frac"] == "148"
+
+    def test_split_mode_parse_fails_when_frac_empty(self, monkeypatch):
+        # Int read succeeds but frac comes back empty → concatenated
+        # "000000." fails the total regex → parse_failed.
+        self._patch_capture(monkeypatch)
+        cfg = _cfg_stub(
+            digital_max_retries=0,
+            digital_total_int_roi=[0.10, 0.25, 0.45, 0.18],
+            digital_total_frac_roi=[0.58, 0.30, 0.22, 0.14],
+        )
+        ocr = _FakeOCR(["000000", "", "00.000"])
+        result = run_digital_cycle(cfg, ocr, aligner=None, session=None,
+                                   prev_total=None, log=_StubLog(), sleep=_noop)
+        assert result["success"] is False
+        assert result["reason"] == "parse_failed"
+        # The split-side reads are preserved on the result so the overlay
+        # can annotate each sub-ROI independently.
+        assert result["raw_total_int"] == "000000"
+        assert result["raw_total_frac"] == ""
+
+    def test_split_mode_wrong_view_when_both_empty(self, monkeypatch):
+        # Both split reads come back empty — concat ".", digit count < 6.
+        self._patch_capture(monkeypatch)
+        cfg = _cfg_stub(
+            digital_max_retries=0,
+            digital_total_int_roi=[0.10, 0.25, 0.45, 0.18],
+            digital_total_frac_roi=[0.58, 0.30, 0.22, 0.14],
+        )
+        ocr = _FakeOCR(["", "", "00.000"])
+        result = run_digital_cycle(cfg, ocr, aligner=None, session=None,
+                                   prev_total=None, log=_StubLog(), sleep=_noop)
+        assert result["success"] is False
+        assert result["reason"] == "wrong_view"
 
     def test_flow_disabled_only_reads_total(self, monkeypatch):
         # When digital_flow_roi is empty, run_digital_cycle must NOT call

@@ -112,6 +112,13 @@ class Config:
     # Digital (LCD) meter options
     meter_type: str = "mechanical"
     digital_total_roi: List[float] = field(default_factory=list)
+    # Optional split-ROI mode for LCDs whose fractional digits are a different
+    # size from the integer digits (Apple Vision tends to drop the smaller
+    # ones). When BOTH _int and _frac are set, the pipeline OCRs them
+    # separately and concatenates with a "." before parsing. When both are
+    # empty, the pipeline falls back to single-ROI mode using digital_total_roi.
+    digital_total_int_roi: List[float] = field(default_factory=list)
+    digital_total_frac_roi: List[float] = field(default_factory=list)
     digital_flow_roi: List[float] = field(default_factory=list)
     digital_total_regex: "re.Pattern" = field(
         default_factory=lambda: re.compile(_DEFAULT_DIGITAL_TOTAL_REGEX)
@@ -190,6 +197,8 @@ def load_config(path)->Config:
         min_confidence_threshold = ac.get("min_confidence_threshold", 0.4),
         meter_type = str(meter.get("type", "mechanical")).lower(),
         digital_total_roi = list(dig_rois.get("total", []) or []),
+        digital_total_int_roi = list(dig_rois.get("total_int", []) or []),
+        digital_total_frac_roi = list(dig_rois.get("total_frac", []) or []),
         digital_flow_roi = list(dig_rois.get("flow", []) or []),
         digital_total_regex = re.compile(dig.get("total_regex", _DEFAULT_DIGITAL_TOTAL_REGEX)),
         digital_flow_regex = re.compile(dig.get("flow_regex", _DEFAULT_DIGITAL_FLOW_REGEX)),
@@ -1031,7 +1040,11 @@ def adjust_dial_roi(original_roi, center_offset, W, H, smoothing_alpha=0.3):
 def _overlay_base(img, cfg, aligned_ok):
     """Shared overlay preamble: copy, compute scales, stamp timestamp and
     alignment-tinted status. Returns (ov, fs, th, o_th, box_th, status_color).
-    Used by both the mechanical and digital draw_overlays_* helpers."""
+    Used by both the mechanical and digital draw_overlays_* helpers.
+
+    Timestamp is drawn at the BOTTOM-LEFT so it doesn't collide with a
+    failure banner rendered later in draw_overlays_digital (the banner sits
+    at the top of the image)."""
     ov = img.copy()
     H = ov.shape[0]
     fs = cfg.overlay_font_scale * (H / 480.0)
@@ -1040,7 +1053,8 @@ def _overlay_base(img, cfg, aligned_ok):
     box_th = int(cfg.overlay_line_thickness)
     status_color = (0, 255, 0) if aligned_ok else (0, 0, 255)
     timestamp = datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-    _draw_label(ov, timestamp, (10, int(20 * fs)), fs * 0.6, (255, 255, 255), th, o_th)
+    _draw_label(ov, timestamp, (10, H - int(8 * fs)), fs * 0.6,
+                (255, 255, 255), th, o_th)
     return ov, fs, th, o_th, box_th, status_color
 
 
@@ -1122,12 +1136,21 @@ def draw_overlays_digital(img, total_roi_abs, flow_roi_abs,
                           raw_total_str, raw_flow_str,
                           parsed_total, parsed_flow,
                           aligned_ok, cfg, reason=None,
-                          out_path=None, log=None):
-    """Overlay for digital LCD meters: two rectangles (total + flow), each
-    labelled with what Vision read raw and what the parser produced.
+                          out_path=None, log=None,
+                          total_int_roi_abs=None, total_frac_roi_abs=None,
+                          raw_total_int_str=None, raw_total_frac_str=None):
+    """Overlay for digital LCD meters: rectangles for the total/flow ROIs,
+    each labelled with what Vision read raw and what the parser produced.
     `raw_*_str` may be None/empty when the display was on a diag view at the
     moment of capture — we still draw the rectangle so ROI placement is
     visible in the debug image.
+
+    Split-ROI mode: when both `total_int_roi_abs` and `total_frac_roi_abs`
+    are provided, those two rectangles are drawn (labelled INT/FRAC with
+    their individual raw OCR strings) and `total_roi_abs` is ignored. The
+    combined parsed value is still shown on the INT rect. This lets the
+    debug JPEG reflect the actual OCR geometry when the fractional digits
+    are captured from a separate, smaller ROI.
 
     `reason` is an optional failure tag ("wrong_view" / "parse_failed" /
     "validate_failed" / "no_frame"); when set (and not "ok"), a coloured
@@ -1148,7 +1171,13 @@ def draw_overlays_digital(img, total_roi_abs, flow_roi_abs,
         _draw_label(ov, f"raw: {raw_disp}",
                     (x, y + h + int(18 * fs)), fs * 0.55, (220, 220, 220), th, o_th)
 
-    _draw_line(total_roi_abs, raw_total_str, parsed_total, "TOTAL m³")
+    split_mode = (total_int_roi_abs is not None and len(total_int_roi_abs) == 4
+                  and total_frac_roi_abs is not None and len(total_frac_roi_abs) == 4)
+    if split_mode:
+        _draw_line(total_int_roi_abs, raw_total_int_str, parsed_total, "TOTAL m³ (int)")
+        _draw_line(total_frac_roi_abs, raw_total_frac_str, None, "frac")
+    else:
+        _draw_line(total_roi_abs, raw_total_str, parsed_total, "TOTAL m³")
     _draw_line(flow_roi_abs, raw_flow_str, parsed_flow, "FLOW m³/h")
 
     if reason and reason != "ok":
@@ -1262,6 +1291,8 @@ def run_digital_cycle(cfg, ocr, aligner, session, prev_total, log, sleep=time.sl
         "frame": None,
         "aligned_ok": False,
         "raw_total": None,
+        "raw_total_int": None,
+        "raw_total_frac": None,
         "raw_flow": None,
         "total": None,
         "flow_m3h": None,
@@ -1286,7 +1317,18 @@ def run_digital_cycle(cfg, ocr, aligner, session, prev_total, log, sleep=time.sl
             else cfg.image_path
         )
 
-        raw_total = ocr.read_line(ocr_path, cfg.digital_total_roi)
+        # Split-ROI mode: when both integer and fractional sub-ROIs are set,
+        # OCR them separately and concatenate with "." before parsing. Needed
+        # for LCDs whose fractional digits are rendered in a smaller font and
+        # get dropped by Vision when included in a single wide ROI.
+        raw_total_int = None
+        raw_total_frac = None
+        if cfg.digital_total_int_roi and cfg.digital_total_frac_roi:
+            raw_total_int = ocr.read_line(ocr_path, cfg.digital_total_int_roi) or ""
+            raw_total_frac = ocr.read_line(ocr_path, cfg.digital_total_frac_roi) or ""
+            raw_total = f"{raw_total_int}.{raw_total_frac}"
+        else:
+            raw_total = ocr.read_line(ocr_path, cfg.digital_total_roi)
         # Flow line is optional. If the user configured only rois.digital.total
         # (typical when flash glare forces alignment to favour the total line),
         # skip the flow OCR call entirely and publish only the delta-based rate.
@@ -1297,6 +1339,8 @@ def run_digital_cycle(cfg, ocr, aligner, session, prev_total, log, sleep=time.sl
             "frame": aligned_img,
             "aligned_ok": aligned_ok,
             "raw_total": raw_total,
+            "raw_total_int": raw_total_int,
+            "raw_total_frac": raw_total_frac,
             "raw_flow": raw_flow,
             "total": None,
             "flow_m3h": None,
@@ -1348,6 +1392,8 @@ def run_digital_cycle(cfg, ocr, aligner, session, prev_total, log, sleep=time.sl
             "total": total,
             "flow_m3h": flow,
             "raw_total": raw_total,
+            "raw_total_int": raw_total_int,
+            "raw_total_frac": raw_total_frac,
             "raw_flow": raw_flow,
         }
 
@@ -1557,12 +1603,21 @@ def main():
                     Hi, Wi = img.shape[:2]
                     total_abs = norm_to_abs(cfg.digital_total_roi, Wi, Hi) if cfg.digital_total_roi else None
                     flow_abs = norm_to_abs(cfg.digital_flow_roi, Wi, Hi) if cfg.digital_flow_roi else None
+                    split_mode = bool(cfg.digital_total_int_roi) and bool(cfg.digital_total_frac_roi)
+                    total_int_abs = norm_to_abs(cfg.digital_total_int_roi, Wi, Hi) if split_mode else None
+                    total_frac_abs = norm_to_abs(cfg.digital_total_frac_roi, Wi, Hi) if split_mode else None
+                    raw_total_int_str = result.get("raw_total_int")
+                    raw_total_frac_str = result.get("raw_total_frac")
                     overlay_total = publish_total if success else total
                     ov_img = draw_overlays_digital(
                         img, total_abs, flow_abs,
                         raw_total_str, raw_flow_str,
                         overlay_total, flow_m3h,
                         aligned_ok, cfg, reason=reason, out_path=out, log=log,
+                        total_int_roi_abs=total_int_abs,
+                        total_frac_roi_abs=total_frac_abs,
+                        raw_total_int_str=raw_total_int_str,
+                        raw_total_frac_str=raw_total_frac_str,
                     )
                     if should_publish_overlay:
                         topic = getattr(cfg, "overlay_camera_topic", f"{cfg.mqtt_main_topic}/debug/overlay")

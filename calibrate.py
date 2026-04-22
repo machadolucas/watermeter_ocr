@@ -134,7 +134,12 @@ def merge_rois(doc: dict, new_rois: dict) -> dict:
 # ---------------------------------------------------------------------------
 
 def extract_digital_rois(doc: dict) -> dict:
-    """Like extract_rois but for a digital LCD meter (total + flow line ROIs)."""
+    """Like extract_rois but for a digital LCD meter.
+
+    Surfaces three total-line ROIs: the single-ROI `total` plus the optional
+    `total_int` / `total_frac` pair used in split-ROI mode (LCDs whose
+    fractional digits are a different size from the integer digits).
+    """
     rois = doc.get("rois", {}) or {}
     digital = rois.get("digital", {}) or {}
     anchors = (doc.get("alignment", {}) or {}).get("anchor_rois") or []
@@ -143,29 +148,34 @@ def extract_digital_rois(doc: dict) -> dict:
         anchors_out.append(None)
     return {
         "total": digital.get("total"),
+        "total_int": digital.get("total_int"),
+        "total_frac": digital.get("total_frac"),
         "flow": digital.get("flow"),
         "anchors": anchors_out,
     }
 
 
 def merge_digital_rois(doc: dict, new_rois: dict) -> dict:
-    """Deep-copy doc; replace rois.digital.{total,flow} and alignment.anchor_rois.
-    Mechanical ROI keys (rois.digits, rois.dials) are left untouched so a user
-    can swap back to mechanical mode without losing their dial calibration.
+    """Deep-copy doc; replace rois.digital.{total,total_int,total_frac,flow}
+    and alignment.anchor_rois. Mechanical ROI keys (rois.digits, rois.dials)
+    are left untouched so a user can swap back to mechanical mode without
+    losing their dial calibration.
 
-    `flow` is optional. When the user didn't draw one (null/missing), we clear
-    the existing flow entry so the saved config matches the UI state — the
-    runtime treats an empty flow ROI as "flow tracking disabled".
+    Only the single-ROI `total` is mandatory. `total_int`/`total_frac`
+    are the split-ROI pair (both must be set together to activate split
+    mode) and `flow` is optional — any of these that the user didn't draw
+    are removed from the saved config so the pipeline sees a clean state.
     """
     out = copy.deepcopy(doc)
     out.setdefault("rois", {})
     out["rois"].setdefault("digital", {})
     out["rois"]["digital"]["total"] = list(new_rois["total"])
-    flow = new_rois.get("flow")
-    if flow:
-        out["rois"]["digital"]["flow"] = list(flow)
-    else:
-        out["rois"]["digital"].pop("flow", None)
+    for key in ("total_int", "total_frac", "flow"):
+        val = new_rois.get(key)
+        if val:
+            out["rois"]["digital"][key] = list(val)
+        else:
+            out["rois"]["digital"].pop(key, None)
     anchors = [list(a) for a in new_rois["anchors"] if a is not None]
     out.setdefault("alignment", {})
     out["alignment"]["anchor_rois"] = anchors
@@ -242,11 +252,17 @@ def validate_payload(payload: dict) -> Optional[str]:
 
 
 def validate_digital_payload(payload: dict) -> Optional[str]:
-    """Digital-mode payload: {total: [x,y,w,h], flow: [x,y,w,h] | null, anchors: [...]}.
+    """Digital-mode payload validation.
 
-    `total` is required. `flow` is optional — some installs sacrifice the flow
-    line to keep the total line free of flash glare, so a null/missing flow
-    just means the pipeline falls back to delta-computed rate only.
+    {total: [x,y,w,h], total_int: [...]?, total_frac: [...]?,
+     flow: [...]?, anchors: [...]}
+
+    `total` is required (pipeline uses it as the fallback for single-ROI mode
+    and as an overlay frame). `total_int` and `total_frac` are the split-ROI
+    pair — BOTH must be drawn together, or NEITHER, to activate split mode.
+    `flow` is optional — some installs sacrifice the flow line to keep the
+    total line free of flash glare, so a null/missing flow just means the
+    pipeline falls back to delta-computed rate only.
     """
     if not isinstance(payload, dict):
         return "payload must be a JSON object"
@@ -257,6 +273,16 @@ def validate_digital_payload(payload: dict) -> Optional[str]:
     err = _valid_roi(roi)
     if err:
         return f"total: {err}"
+    # split-ROI pair: both or neither
+    total_int = payload.get("total_int")
+    total_frac = payload.get("total_frac")
+    if bool(total_int) ^ bool(total_frac):
+        return "total_int and total_frac must be set together (both or neither)"
+    for key, val in (("total_int", total_int), ("total_frac", total_frac)):
+        if val is not None:
+            err = _valid_roi(val)
+            if err:
+                return f"{key}: {err}"
     # flow is optional — validate shape only if the user drew one
     flow = payload.get("flow")
     if flow is not None:
@@ -692,7 +718,9 @@ const MECHANICAL_SLOTS = [
   { key: 'anchor_2', label: 'Anchor 2', color: '#6b7280', kind: 'anchor', idx: 2 },
 ];
 const DIGITAL_SLOTS = [
-  { key: 'total', label: 'Total line (m³)', color: '#4aa3ff', kind: 'digital' },
+  { key: 'total', label: 'Total (single-ROI, required)', color: '#4aa3ff', kind: 'digital' },
+  { key: 'total_int',  label: 'Total integer (split, optional)', color: '#5bb1ff', kind: 'digital' },
+  { key: 'total_frac', label: 'Total fractional (split, optional)', color: '#ffb547', kind: 'digital' },
   { key: 'flow',  label: 'Flow line (optional)', color: '#3ccf7b', kind: 'digital' },
   { key: 'anchor_0', label: 'Anchor 0', color: '#6b7280', kind: 'anchor', idx: 0 },
   { key: 'anchor_1', label: 'Anchor 1', color: '#6b7280', kind: 'anchor', idx: 1 },
@@ -739,6 +767,8 @@ async function loadConfig() {
   const rois = data.rois;
   if (METER_TYPE === 'digital') {
     if (rois.total) state.rois.total = roiArrToObj(rois.total);
+    if (rois.total_int)  state.rois.total_int  = roiArrToObj(rois.total_int);
+    if (rois.total_frac) state.rois.total_frac = roiArrToObj(rois.total_frac);
     if (rois.flow)  state.rois.flow  = roiArrToObj(rois.flow);
   } else {
     if (rois.digits) state.rois.digits = roiArrToObj(rois.digits);
@@ -964,8 +994,10 @@ function buildPayload() {
   });
   if (METER_TYPE === 'digital') {
     return {
-      total: state.rois.total ? roiObjToArr(state.rois.total) : null,
-      flow:  state.rois.flow  ? roiObjToArr(state.rois.flow)  : null,
+      total:      state.rois.total      ? roiObjToArr(state.rois.total)      : null,
+      total_int:  state.rois.total_int  ? roiObjToArr(state.rois.total_int)  : null,
+      total_frac: state.rois.total_frac ? roiObjToArr(state.rois.total_frac) : null,
+      flow:       state.rois.flow       ? roiObjToArr(state.rois.flow)       : null,
       anchors,
     };
   }

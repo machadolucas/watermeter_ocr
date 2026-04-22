@@ -252,6 +252,69 @@ class TestMergeDigitalRois:
         assert merged["rois"]["digital"]["total"] == [0.2, 0.2, 0.6, 0.2]
         assert "flow" not in merged["rois"]["digital"]
 
+    def test_merge_writes_split_roi_pair(self):
+        # Split-ROI mode: total_int + total_frac stored alongside total.
+        doc = {"rois": {"digital": {"total": [0.1, 0.1, 0.8, 0.2]}}}
+        payload = {
+            "total":      [0.10, 0.25, 0.80, 0.18],
+            "total_int":  [0.10, 0.25, 0.48, 0.18],
+            "total_frac": [0.58, 0.30, 0.22, 0.14],
+            "flow":       [0.25, 0.50, 0.55, 0.15],
+            "anchors":    [],
+        }
+        merged = merge_digital_rois(doc, payload)
+        assert merged["rois"]["digital"]["total_int"]  == [0.10, 0.25, 0.48, 0.18]
+        assert merged["rois"]["digital"]["total_frac"] == [0.58, 0.30, 0.22, 0.14]
+
+    def test_merge_clears_stale_split_keys(self):
+        # User had split-ROI mode configured, then decided to revert to single
+        # ROI. The save must drop total_int / total_frac so the pipeline reads
+        # a clean state (otherwise it would keep reading from stale sub-ROIs).
+        doc = {"rois": {"digital": {
+            "total":      [0.1, 0.1, 0.8, 0.2],
+            "total_int":  [0.1, 0.1, 0.4, 0.2],
+            "total_frac": [0.5, 0.1, 0.3, 0.2],
+        }}}
+        payload = {
+            "total": [0.15, 0.20, 0.70, 0.20],
+            "total_int": None,
+            "total_frac": None,
+            "flow": None,
+            "anchors": [],
+        }
+        merged = merge_digital_rois(doc, payload)
+        assert "total_int"  not in merged["rois"]["digital"]
+        assert "total_frac" not in merged["rois"]["digital"]
+
+
+class TestValidateDigitalSplitRois:
+    def test_both_split_rois_accepted(self):
+        p = _valid_digital_payload()
+        p["total_int"]  = [0.10, 0.25, 0.48, 0.18]
+        p["total_frac"] = [0.58, 0.30, 0.22, 0.14]
+        assert validate_digital_payload(p) is None
+
+    def test_only_total_int_rejected(self):
+        # Either BOTH split keys or NEITHER — one alone is an incomplete
+        # configuration and would crash the pipeline expecting both.
+        p = _valid_digital_payload()
+        p["total_int"] = [0.10, 0.25, 0.48, 0.18]
+        err = validate_digital_payload(p)
+        assert err and "total_int and total_frac" in err
+
+    def test_only_total_frac_rejected(self):
+        p = _valid_digital_payload()
+        p["total_frac"] = [0.58, 0.30, 0.22, 0.14]
+        err = validate_digital_payload(p)
+        assert err and "total_int and total_frac" in err
+
+    def test_split_roi_bad_shape_rejected(self):
+        p = _valid_digital_payload()
+        p["total_int"]  = [0.9, 0.9, 0.5, 0.5]  # x+w > 1
+        p["total_frac"] = [0.58, 0.30, 0.22, 0.14]
+        err = validate_digital_payload(p)
+        assert err and "total_int" in err
+
 
 # ---------------------------------------------------------------------------
 # extract_rois
