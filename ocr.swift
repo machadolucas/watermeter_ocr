@@ -3,11 +3,19 @@ import Foundation
 import Vision
 import AppKit
 
-// OCR for a single odometer digit using Apple Vision.
-// Usage: ocr <image> <x> <y> <w> <h> [--half full|top|bottom]
-// Returns a single digit (or empty line).
+// OCR helper for the watermeter project using Apple Vision.
+//
+// Two modes:
+//   --mode digit   (default) — returns a single digit character (backward-compatible
+//                              behavior for the mechanical odometer pipeline).
+//                              Supports --half full|top|bottom to sub-crop the ROI.
+//   --mode line               — returns the full recognized text from the ROI
+//                              (digits plus ".") for LCD lines on digital meters.
+//                              Falls back from .fast to .accurate on empty output.
+//
+// Usage: ocr <image> <x> <y> <w> <h> [--half full|top|bottom] [--mode digit|line]
 func usage() {
-    fputs("usage: ocr <image> <x> <y> <w> <h> [--half full|top|bottom]\n", stderr)
+    fputs("usage: ocr <image> <x> <y> <w> <h> [--half full|top|bottom] [--mode digit|line]\n", stderr)
 }
 
 let A = CommandLine.arguments
@@ -25,17 +33,33 @@ guard let nx = Double(A[2]), let ny = Double(A[3]), let nw = Double(A[4]), let n
     usage(); exit(2)
 }
 
+// Parse optional flags in any order.
 var half = "full"
-if A.count >= 8 && A[6] == "--half" { half = A[7] }
+var mode = "digit"
+var i = 6
+while i < A.count {
+    let flag = A[i]
+    if flag == "--half", i + 1 < A.count {
+        half = A[i + 1]; i += 2
+    } else if flag == "--mode", i + 1 < A.count {
+        mode = A[i + 1]; i += 2
+    } else {
+        // Unknown or malformed flag — skip so we stay forward-compatible with older callers.
+        i += 1
+    }
+}
 
 var rect = CGRect(x: CGFloat(nx)*W, y: CGFloat(ny)*H, width: CGFloat(nw)*W, height: CGFloat(nh)*H).integral
 
-if half == "top" {
-    rect.size.height = floor(rect.size.height * 0.55)
-} else if half == "bottom" {
-    let h2 = floor(rect.size.height * 0.55)
-    rect.origin.y += rect.size.height - h2
-    rect.size.height = h2
+// --half only applies to single-digit mode. Line mode always uses the full rect.
+if mode == "digit" {
+    if half == "top" {
+        rect.size.height = floor(rect.size.height * 0.55)
+    } else if half == "bottom" {
+        let h2 = floor(rect.size.height * 0.55)
+        rect.origin.y += rect.size.height - h2
+        rect.size.height = h2
+    }
 }
 
 func clamp(_ v: CGFloat, _ lo: CGFloat, _ hi: CGFloat) -> CGFloat { max(lo, min(hi, v)) }
@@ -46,28 +70,49 @@ rect.size.height = clamp(rect.size.height, 1, H - rect.origin.y)
 
 guard let roi = cg.cropping(to: rect) else { print(""); exit(0) }
 
-let req = VNRecognizeTextRequest()
-req.recognitionLevel = .fast
-req.usesLanguageCorrection = false
-req.recognitionLanguages = ["en-US"]
-req.automaticallyDetectsLanguage = false
+// Run Vision text recognition at a given level; returns the raw concatenated text
+// across all observations (no digit/decimal filtering applied here).
+func recognize(_ image: CGImage, level: VNRequestTextRecognitionLevel) -> String {
+    let req = VNRecognizeTextRequest()
+    req.recognitionLevel = level
+    req.usesLanguageCorrection = false
+    req.recognitionLanguages = ["en-US"]
+    req.automaticallyDetectsLanguage = false
 
-let handler = VNImageRequestHandler(cgImage: roi, options: [:])
-do {
-    try handler.perform([req])
+    let handler = VNImageRequestHandler(cgImage: image, options: [:])
+    do {
+        try handler.perform([req])
+    } catch {
+        return ""
+    }
     let results = (req.results as? [VNRecognizedTextObservation]) ?? []
-    var s = ""
+    var out = ""
     for obs in results {
         if let cand = obs.topCandidates(1).first {
-            s += cand.string.filter { $0.isNumber }
+            out += cand.string
         }
     }
-    if s.isEmpty {
-        print("")
-    } else {
-        let c = s.first!
-        print(String(c))
+    return out
+}
+
+if mode == "line" {
+    // Keep digits plus the decimal point. Strip everything else Vision might
+    // have emitted (spaces, units like "m³", stray punctuation).
+    let allowed: Set<Character> = Set("0123456789.")
+    var text = recognize(roi, level: .fast).filter { allowed.contains($0) }
+    // 7-segment LCDs sometimes defeat the fast recognizer but pass the accurate one.
+    if text.isEmpty || text.filter({ $0.isNumber }).isEmpty {
+        text = recognize(roi, level: .accurate).filter { allowed.contains($0) }
     }
-} catch {
+    print(text)
+    exit(0)
+}
+
+// Default: single-digit mode (backward-compatible).
+let full = recognize(roi, level: .fast)
+let digitsOnly = full.filter { $0.isNumber }
+if digitsOnly.isEmpty {
     print("")
+} else {
+    print(String(digitsOnly.first!))
 }

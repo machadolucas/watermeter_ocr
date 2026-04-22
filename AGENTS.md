@@ -4,9 +4,12 @@ Guide for AI agents (and humans) working on `watermeter_ocr`. Complements [READM
 
 ## Orientation
 
-A macOS service that reads a mechanical water meter (5 odometer digits + 4 red-pointer dials) from an ESP32 PoE camera every 10 s, resolves the reading with OpenCV + Apple Vision, and publishes to Home Assistant over MQTT.
+A macOS service that reads a water meter from an ESP32 PoE camera on a fixed interval, resolves the reading, and publishes to Home Assistant over MQTT. Two pipelines are selectable via `meter.type` in config:
 
-Entry point: `main()` at [watermeter.py:961](watermeter.py:961). Main capture loop: [watermeter.py:984](watermeter.py:984).
+- `mechanical` (default) — 5 odometer digits + 4 red-pointer dials, resolved with OpenCV (needle detection) + Apple Vision (per-digit OCR).
+- `digital` — fully electronic LCD showing total (m³) and instant flow (m³/h) as two text lines. Apple Vision line OCR only; no dials. Handles the display's rotating numeric/diagnostic views via in-cycle retry.
+
+Entry point: `main()` at [watermeter.py](watermeter.py). The mechanical pipeline and the digital pipeline (`run_digital_cycle`) share the capture helper, alignment, MQTT publish, overlay + state code; they diverge only in how a reading is resolved.
 
 ## Repo layout
 
@@ -116,6 +119,32 @@ Two fractions coexist — do not confuse:
 - **`frac_pub`** (line ~1087): what we **publish**. Sum of floored dial digits × factor. No double counting.
 - **`frac_prog`** (line ~1090): smooth progress `[0..1)` from the **tenths dial only**, used to drive rolling digit logic.
 
+## Digital-meter pipeline (`meter.type: digital`)
+
+Alternative, simpler pipeline for fully-digital LCD meters. Runs instead of the mechanical one when `meter.type: digital` in config. Skips `read_dial`, `decide_digit`, `compose_integer`, `estimate_total_from_dials` entirely.
+
+```
+ ESP32 capture  ─►  Aligner (optional)  ─►  VisionOCR.read_line(total_roi)     ─┐
+                                            VisionOCR.read_line(flow_roi)      ─┤
+                                                     │                         │
+                                          is_valid_digital_view?  ── no ─► retry
+                                                     │                         │
+                                          parse_digital_total / _flow          │
+                                                     │                         │
+                                          validate_digital_reading ── no ─► retry
+                                                     │                         │
+                                                     ▼                         │
+                                run_digital_cycle returns a dict ───────◄──────┘
+                                                     │
+                                                     ▼
+                    guards (monotonic, big_jump) → publish value, rate, rate_lpm, flow_m3h
+                                                     │
+                                                     ▼
+                                        draw_overlays_digital, save state, sleep
+```
+
+All orchestrated by `run_digital_cycle` ([watermeter.py](watermeter.py)), called from `main()` when `cfg.meter_type == "digital"`.
+
 ## Load-bearing invariants
 
 Break these and things go silently wrong.
@@ -134,6 +163,12 @@ Break these and things go silently wrong.
 - **`MqttClient.connected` is gated on `reason_code == 0`.** A rejected CONNECT (bad credentials, protocol mismatch, access denied) leaves `connected=False` and `publish()` silently no-ops. Watch the logs for `MQTT connect rejected` to spot this; the service will keep attempting `reconnect()` every `_reconnect_delay` seconds.
 - **Readings in `read_dial` are blended circularly** when `conf < 0.6` and a prediction is available. The helper is `circular_blend(a, b, alpha)` (mod 10). A previous linear blend produced nonsensical midpoints across the 9→0 wrap; do not revert without replacing the helper.
 - **Per-dial `reading_history` is only appended when `confidence > 0.2`.** Low-confidence fallback readings (blank frame → `reading=0.0`) were previously polluting the temporal validator; the gate lives in the main loop around [watermeter.py:1052](watermeter.py:1052).
+- **Digital pipeline bypasses `compose_integer` and all rolling-threshold logic.** LCD digits transition atomically; there's no in-between frame to arbitrate with top/bottom crops. Do NOT try to graft mechanical composition onto the digital path — it reintroduces the drift bug warned about at [watermeter.py:611-614](watermeter.py:611) (persistent silent OCR + stateless progress heuristics creeping the counter).
+- **`digital_total_regex` must accept both dotted and undotted input.** Vision is unreliable about the decimal point on 7-segment LCDs — some frames emit `"000100.000"`, others `"000100000"`. `parse_digital_total` injects a `.` at position `-3` when missing. The default regex `^\d{6}\.?\d{3}$` matches both; a stricter regex will silently drop half your readings.
+- **`run_digital_cycle` is the ONLY place that retries within a single capture cycle.** The display auto-cycles between 3 views (measured dwells 10 s / 5 s / 4 s, total ≈ 19 s). Adding ad-hoc retries elsewhere compounds the budget and can overrun `interval_sec`. If you need more retries, tune `digital_max_retries` in config.
+- **`digital_retry_delay_sec` must exceed the longest diag-view dwell (5 s).** Shorter delays phase-lock: every retry lands on the same diagnostic screen. The default 5.5 s guarantees a retry crosses at least one dwell boundary. If the meter's firmware changes dwell times, recheck this.
+- **`state.json.meter_type` is the cross-contamination guard.** When config flips between `mechanical` and `digital`, the persisted totals aren't comparable. The load path at [watermeter.py](watermeter.py) discards `prev_total` on mismatch and logs a warning; it does NOT exit, because launchd crash-looping is worse than a one-cycle unknown rate.
+- **HA discovery for `water_flow_m3h` is gated on `cfg.meter_type == "digital"`.** Mechanical installs must not see a dead sensor in HA. The gate lives in `MqttClient.discovery`.
 
 ## Config pitfalls
 
@@ -152,6 +187,8 @@ Break these and things go silently wrong.
 - **New guard/clamp**: the publish branch at [watermeter.py:1122-1131](watermeter.py:1122) is where `publish_total` is decided separately from the raw `total` — add behavior there if you want the raw reading logged but not published.
 - **Changing ROIs**: prefer `python3 calibrate.py` over hand-editing `config.yaml`. The tool validates (ROI bounds, dial ordering, round-trip through `load_config`) before writing and creates a timestamped backup. Hand-editing is the fallback for headless boxes — see [docs/CONFIGURATION.md](docs/CONFIGURATION.md) § "Manual ROI tuning".
 - **Physical meter replacement**: the full procedure lives in [docs/CONFIGURATION.md](docs/CONFIGURATION.md) § "Meter-swap procedure". Short version: stop LaunchAgent → delete `reference.jpg` → run `calibrate.py` → `watermeter.py --reset-total 0` → restart LaunchAgent.
+- **Swap to a digital LCD meter**: set `meter.type: digital` in config, bump `processing.interval_sec` to 15, calibrate the two line ROIs, then the standard meter-swap procedure. State's `meter_type` field auto-discards `prev_total` on mismatch. See [docs/CONFIGURATION.md](docs/CONFIGURATION.md) § "Digital meter".
+- **Adapt the digital pipeline to a different LCD layout**: change `digital.total_regex` and `digital.flow_regex` in config to match your meter's display format (e.g. 8 integer digits with no decimal: `^\d{8}$`). If the layout has no decimal at all, adjust `parse_digital_total` so it doesn't inject one. ROI count stays at two — total and flow.
 
 ## Testing strategy
 
@@ -167,12 +204,13 @@ pytest -q --tb=long                                # longer tracebacks for debug
 
 Coverage is organized by concern:
 - `test_utils.py` — small helpers (`clip01`, `norm_to_abs`, time windows, ROI math)
-- `test_config.py` — `load_config` on minimal/full YAML
-- `test_digit_logic.py` — `decide_digit` branches, `compose_integer` rollover scenarios (highest-value module)
+- `test_config.py` — `load_config` on minimal/full YAML, including digital keys
+- `test_digit_logic.py` — `decide_digit` branches, `compose_integer` rollover scenarios (highest-value mechanical module)
 - `test_postproc.py` — `estimate_total_from_dials`, temporal validation & prediction
-- `test_dial_detection.py` — synthetic-dial tests for `detect_dial_center`, `read_dial`, needle methods
-- `test_alignment.py` — `Aligner` on translated/rotated synthetic pairs
-- `test_ocr_wrapper.py` — `VisionOCR` via a mock shell script (exercises the silent-failure contract)
+- `test_dial_detection.py` — synthetic-dial tests for `detect_dial_center`, `read_dial`, needle methods (mechanical only)
+- `test_alignment.py` — `Aligner` on translated/rotated synthetic pairs (shared)
+- `test_ocr_wrapper.py` — `VisionOCR` via a mock shell script; both `full_top_bottom` (digit mode) and `read_line` (line mode) contracts
+- `test_digital.py` — `parse_digital_total`/`parse_digital_flow`, `is_valid_digital_view`, `validate_digital_reading`, `run_digital_cycle` retry behaviour, HA `flow_m3h` discovery gating, `draw_overlays_digital` smoke
 
 Tolerances on image tests are deliberately loose. ORB, Hough, and the dial-detection cascade are non-deterministic enough that per-pixel assertions will flake across OpenCV versions. Use `pytest.approx` and statistical (mean-error) assertions, never exact equality, for anything downstream of a cv2 primitive.
 

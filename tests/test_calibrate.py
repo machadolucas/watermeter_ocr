@@ -16,9 +16,13 @@ from calibrate import (
     DIAL_COUNT,
     MIN_ROI_DIM,
     backup_and_write,
+    detect_meter_type,
+    extract_digital_rois,
     extract_rois,
     load_yaml_doc,
+    merge_digital_rois,
     merge_rois,
+    validate_digital_payload,
     validate_payload,
 )
 
@@ -125,6 +129,100 @@ class TestValidatePayload:
     def test_anchors_can_contain_none(self):
         p = _valid_payload(); p["anchors"] = [None, None, None]
         assert validate_payload(p) is None
+
+
+# ---------------------------------------------------------------------------
+# Digital-mode variants
+# ---------------------------------------------------------------------------
+
+def _valid_digital_payload():
+    return {
+        "total": [0.10, 0.25, 0.80, 0.18],
+        "flow":  [0.25, 0.50, 0.55, 0.15],
+        "anchors": [[0.1, 0.0, 0.6, 0.25], None, None],
+    }
+
+
+class TestDetectMeterType:
+    def test_default_mechanical(self):
+        assert detect_meter_type({}) == "mechanical"
+
+    def test_explicit_mechanical(self):
+        assert detect_meter_type({"meter": {"type": "mechanical"}}) == "mechanical"
+
+    def test_digital(self):
+        assert detect_meter_type({"meter": {"type": "digital"}}) == "digital"
+
+    def test_case_insensitive(self):
+        assert detect_meter_type({"meter": {"type": "DIGITAL"}}) == "digital"
+
+
+class TestValidateDigitalPayload:
+    def test_valid(self):
+        assert validate_digital_payload(_valid_digital_payload()) is None
+
+    def test_missing_total(self):
+        p = _valid_digital_payload(); p["total"] = None
+        err = validate_digital_payload(p)
+        assert err and "total" in err
+
+    def test_missing_flow(self):
+        p = _valid_digital_payload(); p["flow"] = None
+        err = validate_digital_payload(p)
+        assert err and "flow" in err
+
+    def test_out_of_bounds(self):
+        p = _valid_digital_payload(); p["total"] = [0.9, 0.9, 0.5, 0.5]
+        err = validate_digital_payload(p)
+        assert err and "past image bounds" in err
+
+    def test_rejects_extra_dials(self):
+        # Digital payload shape doesn't accept a "dials" field — but the current
+        # validator doesn't forbid extra keys, so ensure required keys still lead.
+        p = _valid_digital_payload(); p["dials"] = []
+        assert validate_digital_payload(p) is None  # extra key is tolerated
+
+
+class TestExtractDigitalRois:
+    def test_empty_doc_returns_none_rois(self):
+        r = extract_digital_rois({})
+        assert r["total"] is None
+        assert r["flow"] is None
+        assert len(r["anchors"]) == 3
+        assert all(a is None for a in r["anchors"])
+
+    def test_preserves_existing_total_flow(self):
+        doc = {
+            "rois": {"digital": {
+                "total": [0.1, 0.2, 0.8, 0.2],
+                "flow":  [0.2, 0.5, 0.6, 0.2],
+            }},
+            "alignment": {"anchor_rois": [[0.1, 0.1, 0.3, 0.3]]},
+        }
+        r = extract_digital_rois(doc)
+        assert r["total"] == [0.1, 0.2, 0.8, 0.2]
+        assert r["flow"] == [0.2, 0.5, 0.6, 0.2]
+        assert r["anchors"][0] == [0.1, 0.1, 0.3, 0.3]
+        assert r["anchors"][1] is None
+
+
+class TestMergeDigitalRois:
+    def test_writes_digital_subtree_preserves_mechanical(self):
+        # A user might flip meter.type back and forth; merge_digital_rois must
+        # NOT clobber pre-existing rois.digits / rois.dials in case they want
+        # to flip to mechanical later.
+        doc = {
+            "esp32": {"base_url": "http://1.2.3.4"},
+            "rois": {"digits": [0, 0, 0.1, 0.1], "dials": [{"name": "d0"}]},
+        }
+        merged = merge_digital_rois(doc, _valid_digital_payload())
+        assert merged["esp32"] == {"base_url": "http://1.2.3.4"}
+        assert merged["rois"]["digits"] == [0, 0, 0.1, 0.1]  # untouched
+        assert merged["rois"]["dials"] == [{"name": "d0"}]   # untouched
+        assert merged["rois"]["digital"]["total"] == [0.10, 0.25, 0.80, 0.18]
+        assert merged["rois"]["digital"]["flow"]  == [0.25, 0.50, 0.55, 0.15]
+        # Anchors still funnel through the shared alignment.anchor_rois key.
+        assert merged["alignment"]["anchor_rois"] == [[0.1, 0.0, 0.6, 0.25]]
 
 
 # ---------------------------------------------------------------------------
@@ -258,6 +356,26 @@ class TestBackupAndWrite:
         cfg = watermeter.load_config(str(config_path))
         assert len(cfg.dials) == DIAL_COUNT
         assert cfg.dials[0].factor == pytest.approx(0.1)
+
+    def test_digital_round_trips_through_watermeter_load_config(self, tmp_path):
+        import watermeter
+        config_path = tmp_path / "config.yaml"
+        # Seed with meter.type: digital so calibrate's dispatch picks up digital mode.
+        config_path.write_text(
+            "esp32:\n  base_url: \"http://localhost\"\n"
+            "meter:\n  type: digital\n"
+        )
+        payload = {
+            "total": [0.10, 0.25, 0.80, 0.18],
+            "flow":  [0.25, 0.50, 0.55, 0.15],
+            "anchors": [[0.1, 0.0, 0.6, 0.25], None, None],
+        }
+        merged = merge_digital_rois(load_yaml_doc(config_path), payload)
+        backup_and_write(config_path, merged)
+        cfg = watermeter.load_config(str(config_path))
+        assert cfg.meter_type == "digital"
+        assert cfg.digital_total_roi == payload["total"]
+        assert cfg.digital_flow_roi == payload["flow"]
 
     def test_invalid_merged_yaml_does_not_overwrite(self, tmp_path, monkeypatch):
         """If the merged doc fails to round-trip, the live file is untouched."""

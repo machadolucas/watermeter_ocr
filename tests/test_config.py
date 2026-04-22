@@ -120,3 +120,48 @@ def test_auto_centering_loaded(full_config_yaml):
     assert cfg.auto_center_dials is True
     assert cfg.center_smoothing_alpha == pytest.approx(0.3)
     assert cfg.min_confidence_threshold == pytest.approx(0.4)
+
+
+def test_meter_type_defaults_to_mechanical(minimal_config_yaml):
+    cfg = load_config(str(minimal_config_yaml))
+    assert cfg.meter_type == "mechanical"
+    assert cfg.digital_total_roi == []
+    assert cfg.digital_flow_roi == []
+    # Defaults must still compile and accept canonical formats.
+    assert cfg.digital_total_regex.match("000100.000")
+    assert cfg.digital_total_regex.match("000100000")
+    assert cfg.digital_flow_regex.match("00.000")
+    assert cfg.digital_max_retries == 2
+    assert cfg.digital_retry_delay_sec == pytest.approx(5.5)
+    assert cfg.digital_min_digits == 6
+
+
+def test_digital_meter_config_loads(tmp_path):
+    p = tmp_path / "config.yaml"
+    p.write_text(
+        "esp32:\n  base_url: \"http://localhost\"\n"
+        "meter:\n  type: digital\n"
+        "processing:\n  interval_sec: 15\n"
+        "rois:\n"
+        "  digital:\n"
+        "    total: [0.10, 0.25, 0.80, 0.18]\n"
+        "    flow:  [0.25, 0.50, 0.55, 0.15]\n"
+        "digital:\n"
+        "  total_regex: \"^\\\\d{6}\\\\.?\\\\d{3}$\"\n"
+        "  flow_regex:  \"^\\\\d{1,3}\\\\.\\\\d{3}$\"\n"
+        "  max_retries: 3\n"
+        "  retry_delay_sec: 6.0\n"
+        "  min_digits: 5\n"
+    )
+    cfg = load_config(str(p))
+    assert cfg.meter_type == "digital"
+    assert cfg.interval_sec == 15
+    assert cfg.digital_total_roi == [0.10, 0.25, 0.80, 0.18]
+    assert cfg.digital_flow_roi == [0.25, 0.50, 0.55, 0.15]
+    assert cfg.digital_max_retries == 3
+    assert cfg.digital_retry_delay_sec == pytest.approx(6.0)
+    assert cfg.digital_min_digits == 5
+    # Regex accepts both dotted and undotted totals (Vision may or may not find the decimal).
+    assert cfg.digital_total_regex.match("000100.000")
+    assert cfg.digital_total_regex.match("000100000")
+    assert cfg.digital_flow_regex.match("12.345")

@@ -47,6 +47,16 @@ MIN_ROI_DIM = 0.005  # reject rectangles smaller than 0.5% in either dimension
 DIAL_FACTORS = [0.1, 0.01, 0.001, 0.0001]
 DIAL_NAMES = ["dial_0_1", "dial_0_01", "dial_0_001", "dial_0_0001"]
 
+# Digital meter (LCD, e.g. Qalcosonic W1): two line ROIs for the two text lines
+# the display shows — total consumption and instantaneous flow.
+DIGITAL_ROI_NAMES = ["total", "flow"]
+
+
+def detect_meter_type(doc: dict) -> str:
+    """Return "digital" if the config declares meter.type: digital, else "mechanical"."""
+    m = (doc.get("meter") or {}).get("type")
+    return "digital" if str(m or "mechanical").lower() == "digital" else "mechanical"
+
 
 # ---------------------------------------------------------------------------
 # YAML helpers
@@ -120,6 +130,41 @@ def merge_rois(doc: dict, new_rois: dict) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Digital-meter variants (meter.type: digital)
+# ---------------------------------------------------------------------------
+
+def extract_digital_rois(doc: dict) -> dict:
+    """Like extract_rois but for a digital LCD meter (total + flow line ROIs)."""
+    rois = doc.get("rois", {}) or {}
+    digital = rois.get("digital", {}) or {}
+    anchors = (doc.get("alignment", {}) or {}).get("anchor_rois") or []
+    anchors_out = list(anchors[:ANCHOR_COUNT])
+    while len(anchors_out) < ANCHOR_COUNT:
+        anchors_out.append(None)
+    return {
+        "total": digital.get("total"),
+        "flow": digital.get("flow"),
+        "anchors": anchors_out,
+    }
+
+
+def merge_digital_rois(doc: dict, new_rois: dict) -> dict:
+    """Deep-copy doc; replace rois.digital.{total,flow} and alignment.anchor_rois.
+    Mechanical ROI keys (rois.digits, rois.dials) are left untouched so a user
+    can swap back to mechanical mode without losing their dial calibration.
+    """
+    out = copy.deepcopy(doc)
+    out.setdefault("rois", {})
+    out["rois"].setdefault("digital", {})
+    out["rois"]["digital"]["total"] = list(new_rois["total"])
+    out["rois"]["digital"]["flow"] = list(new_rois["flow"])
+    anchors = [list(a) for a in new_rois["anchors"] if a is not None]
+    out.setdefault("alignment", {})
+    out["alignment"]["anchor_rois"] = anchors
+    return out
+
+
+# ---------------------------------------------------------------------------
 # Validation
 # ---------------------------------------------------------------------------
 
@@ -185,6 +230,29 @@ def validate_payload(payload: dict) -> Optional[str]:
         if err:
             return f"anchors[{i}]: {err}"
 
+    return None
+
+
+def validate_digital_payload(payload: dict) -> Optional[str]:
+    """Digital-mode payload: {total: [x,y,w,h], flow: [x,y,w,h], anchors: [...]}."""
+    if not isinstance(payload, dict):
+        return "payload must be a JSON object"
+    for name in DIGITAL_ROI_NAMES:
+        roi = payload.get(name)
+        if roi is None:
+            return f"missing {name} ROI"
+        err = _valid_roi(roi)
+        if err:
+            return f"{name}: {err}"
+    anchors = payload.get("anchors", [])
+    if not isinstance(anchors, list) or len(anchors) > ANCHOR_COUNT:
+        return f"anchors must be a list of at most {ANCHOR_COUNT} entries"
+    for i, a in enumerate(anchors):
+        if a is None:
+            continue
+        err = _valid_roi(a)
+        if err:
+            return f"anchors[{i}]: {err}"
     return None
 
 
@@ -278,6 +346,16 @@ def run_dial_tests(frame_bytes: bytes, dials: list[dict]) -> list[dict]:
 # HTTP server + routes
 # ---------------------------------------------------------------------------
 
+def _current_meter_type(config_path: Path) -> str:
+    """Re-read config on each request so mode flips (e.g. user edits YAML by
+    hand while calibrator is running) take effect without restarting."""
+    try:
+        doc = load_yaml_doc(config_path)
+    except Exception:
+        return "mechanical"
+    return detect_meter_type(doc)
+
+
 def make_handler_class(config_path: Path, esp32_url: str, frame_cache: FrameCache):
 
     class Handler(http.server.BaseHTTPRequestHandler):
@@ -329,9 +407,14 @@ def make_handler_class(config_path: Path, esp32_url: str, frame_cache: FrameCach
             if self.path == "/config":
                 try:
                     doc = load_yaml_doc(config_path)
+                    meter_type = detect_meter_type(doc)
+                    rois = (extract_digital_rois(doc)
+                            if meter_type == "digital"
+                            else extract_rois(doc))
                     self._send_json({
                         "config_path": str(config_path),
-                        "rois": extract_rois(doc),
+                        "meter_type": meter_type,
+                        "rois": rois,
                         "exists": config_path.exists(),
                     })
                 except Exception as e:
@@ -347,13 +430,19 @@ def make_handler_class(config_path: Path, esp32_url: str, frame_cache: FrameCach
                 except json.JSONDecodeError as e:
                     self._send_json({"error": f"invalid JSON: {e}"}, 400)
                     return
-                err = validate_payload(payload)
+                meter_type = _current_meter_type(config_path)
+                validator = (validate_digital_payload
+                             if meter_type == "digital"
+                             else validate_payload)
+                err = validator(payload)
                 if err:
                     self._send_json({"error": err}, 400)
                     return
                 try:
                     doc = load_yaml_doc(config_path)
-                    merged = merge_rois(doc, payload)
+                    merged = (merge_digital_rois(doc, payload)
+                              if meter_type == "digital"
+                              else merge_rois(doc, payload))
                     backup = backup_and_write(config_path, merged)
                 except Exception as e:
                     traceback.print_exc()
@@ -372,6 +461,20 @@ def make_handler_class(config_path: Path, esp32_url: str, frame_cache: FrameCach
                 except json.JSONDecodeError as e:
                     self._send_json({"error": f"invalid JSON: {e}"}, 400)
                     return
+                meter_type = _current_meter_type(config_path)
+                if meter_type == "digital":
+                    err = validate_digital_payload(payload)
+                    if err:
+                        self._send_json({"error": err}, 400)
+                        return
+                    # Digital test currently reports placeholders: actual line OCR
+                    # needs the Swift Vision binary, which is deployment-local.
+                    # The calibrator confirms ROI geometry; live verification
+                    # happens once the service is restarted.
+                    self._send_json({"meter_type": "digital",
+                                     "note": "ROI geometry validated; OCR verified on the live service"})
+                    return
+
                 err = validate_payload(payload)
                 if err:
                     self._send_json({"error": err}, 400)
@@ -390,7 +493,7 @@ def make_handler_class(config_path: Path, esp32_url: str, frame_cache: FrameCach
                     traceback.print_exc()
                     self._send_json({"error": str(e)}, 500)
                     return
-                self._send_json({"dials": dial_results})
+                self._send_json({"meter_type": "mechanical", "dials": dial_results})
                 return
 
             self._send_text("not found", 404)
@@ -562,13 +665,22 @@ const DIAL_SLOTS = [
   { key: 'dial_2', label: 'Dial 2 (×0.001)', factor: 0.001, color: '#3ccf7b' },
   { key: 'dial_3', label: 'Dial 3 (×0.0001)', factor: 0.0001, color: '#c08eff' },
 ];
-const SLOTS = [
+const MECHANICAL_SLOTS = [
   { key: 'digits', label: 'Digits window', color: '#ff5577', kind: 'digits' },
   ...DIAL_SLOTS.map(d => ({ ...d, kind: 'dial' })),
   { key: 'anchor_0', label: 'Anchor 0', color: '#6b7280', kind: 'anchor', idx: 0 },
   { key: 'anchor_1', label: 'Anchor 1', color: '#6b7280', kind: 'anchor', idx: 1 },
   { key: 'anchor_2', label: 'Anchor 2', color: '#6b7280', kind: 'anchor', idx: 2 },
 ];
+const DIGITAL_SLOTS = [
+  { key: 'total', label: 'Total line (m³)', color: '#4aa3ff', kind: 'digital' },
+  { key: 'flow',  label: 'Flow line (m³/h)', color: '#3ccf7b', kind: 'digital' },
+  { key: 'anchor_0', label: 'Anchor 0', color: '#6b7280', kind: 'anchor', idx: 0 },
+  { key: 'anchor_1', label: 'Anchor 1', color: '#6b7280', kind: 'anchor', idx: 1 },
+  { key: 'anchor_2', label: 'Anchor 2', color: '#6b7280', kind: 'anchor', idx: 2 },
+];
+let SLOTS = MECHANICAL_SLOTS;
+let METER_TYPE = 'mechanical';
 
 const canvas = document.getElementById('canvas');
 const ctx = canvas.getContext('2d');
@@ -600,23 +712,28 @@ async function loadConfig() {
   const r = await fetch('/config');
   const data = await r.json();
   if (data.error) { toast(data.error, 'err'); return; }
-  document.getElementById('meta').textContent = data.config_path + (data.exists ? '' : ' (new)');
+  METER_TYPE = data.meter_type || 'mechanical';
+  SLOTS = METER_TYPE === 'digital' ? DIGITAL_SLOTS : MECHANICAL_SLOTS;
+  document.getElementById('meta').textContent =
+    data.config_path + (data.exists ? '' : ' (new)') + ` · ${METER_TYPE}`;
 
   const rois = data.rois;
-  // digits
-  if (rois.digits) state.rois.digits = roiArrToObj(rois.digits);
-  // dials
-  rois.dials.forEach((d, i) => {
-    const key = 'dial_' + i;
-    if (d.roi) state.rois[key] = roiArrToObj(d.roi);
-    state.dialMeta[key] = {
-      rotation: d.rotation || 'cw',
-      zero_angle_deg: d.zero_angle_deg ?? -90,
-      factor: d.factor ?? DIAL_SLOTS[i].factor,
-      name: d.name,
-    };
-  });
-  // anchors
+  if (METER_TYPE === 'digital') {
+    if (rois.total) state.rois.total = roiArrToObj(rois.total);
+    if (rois.flow)  state.rois.flow  = roiArrToObj(rois.flow);
+  } else {
+    if (rois.digits) state.rois.digits = roiArrToObj(rois.digits);
+    rois.dials.forEach((d, i) => {
+      const key = 'dial_' + i;
+      if (d.roi) state.rois[key] = roiArrToObj(d.roi);
+      state.dialMeta[key] = {
+        rotation: d.rotation || 'cw',
+        zero_angle_deg: d.zero_angle_deg ?? -90,
+        factor: d.factor ?? DIAL_SLOTS[i].factor,
+        name: d.name,
+      };
+    });
+  }
   rois.anchors.forEach((a, i) => {
     if (a) state.rois['anchor_' + i] = roiArrToObj(a);
   });
@@ -822,6 +939,17 @@ canvas.addEventListener('mouseup', (ev) => {
 // ----- actions -------------------------------------------------------------
 
 function buildPayload() {
+  const anchors = [0, 1, 2].map(i => {
+    const r = state.rois['anchor_' + i];
+    return r ? roiObjToArr(r) : null;
+  });
+  if (METER_TYPE === 'digital') {
+    return {
+      total: state.rois.total ? roiObjToArr(state.rois.total) : null,
+      flow:  state.rois.flow  ? roiObjToArr(state.rois.flow)  : null,
+      anchors,
+    };
+  }
   const dials = DIAL_SLOTS.map((d, i) => {
     const key = 'dial_' + i;
     const roi = state.rois[key];
@@ -833,10 +961,6 @@ function buildPayload() {
       rotation: meta.rotation || 'cw',
       zero_angle_deg: meta.zero_angle_deg ?? -90,
     };
-  });
-  const anchors = [0, 1, 2].map(i => {
-    const r = state.rois['anchor_' + i];
-    return r ? roiObjToArr(r) : null;
   });
   return {
     digits: state.rois.digits ? roiObjToArr(state.rois.digits) : null,
@@ -860,9 +984,13 @@ document.getElementById('test-btn').addEventListener('click', async () => {
   const data = await r.json();
   if (!r.ok || data.error) { toast(data.error || 'test failed', 'err'); return; }
   state.testResults = {};
-  data.dials.forEach((res, i) => { state.testResults['dial_' + i] = res; });
+  if (METER_TYPE === 'digital') {
+    toast(data.note || 'Digital ROIs validated', 'ok');
+  } else {
+    (data.dials || []).forEach((res, i) => { state.testResults['dial_' + i] = res; });
+    toast('Test complete — see per-dial readings in the sidebar', 'ok');
+  }
   renderSelectedPanel();
-  toast('Test complete — see per-dial readings in the sidebar', 'ok');
 });
 
 document.getElementById('save-btn').addEventListener('click', async () => {

@@ -2,6 +2,40 @@
 
 End-to-end guide to configuring `watermeter_ocr`, including the meter-swap procedure, the interactive calibration tool, and the `--reset-total` flag. Complements the architecture notes in [AGENTS.md](../AGENTS.md) and the user-facing intro in [README.md](../README.md).
 
+## Meter types
+
+`meter.type` selects which reading pipeline runs:
+
+| Value | When to use | Pipeline |
+|---|---|---|
+| `mechanical` (default) | Traditional meter with 5 odometer digits + 4 red-pointer dials. | Digit OCR + dial-angle reading → `compose_integer` → guards → publish. |
+| `digital` | Fully electronic LCD (e.g. Qalcosonic W1). Shows two text lines: total (m³) and instant flow (m³/h). | Line OCR (Apple Vision only) → regex parse → guards → publish. No dials, no composition. |
+
+Everything below that mentions **dials**, **rolling thresholds**, **auto-centering**, or **`compose_integer`** applies only to mechanical meters. See the [Digital meter](#digital-meter) section for the digital-specific keys and procedure.
+
+## Local development environment
+
+The deployed service lives at `~/watermeter/` and uses its own virtualenv at `~/watermeter/venv/` — that's where the Python dependencies (cv2, paho-mqtt, requests, yaml, numpy) actually are. Running `python3 calibrate.py` or `python3 watermeter.py` with your system Python will fail with `ModuleNotFoundError: No module named 'cv2'`.
+
+Three supported ways to run:
+
+```bash
+# Option A — point at the deployed venv (recommended; deps are already installed)
+~/watermeter/venv/bin/python3 calibrate.py
+~/watermeter/venv/bin/python3 watermeter.py --config ~/watermeter/config.yaml
+
+# Option B — activate the deployed venv, then run plainly
+source ~/watermeter/venv/bin/activate
+python3 calibrate.py
+
+# Option C — fresh local dev venv from the repo (for running pytest, reading code locally)
+python3 -m venv .venv && source .venv/bin/activate
+pip install -r requirements.txt -r requirements-dev.txt
+pytest -q
+```
+
+`install.sh` creates `~/watermeter/venv/` as a side effect the first time you run it; don't recreate it on each invocation.
+
 ## Where config lives
 
 Two copies of `config.yaml`:
@@ -34,12 +68,20 @@ Running [`calibrate.py`](../calibrate.py) edits `~/watermeter/config.yaml` direc
 | `overlay.camera_topic` | `{mqtt.topic}/debug/overlay` | Topic the overlay JPEG is published to. |
 | `overlay.font_scale`, `font_thickness`, `outline_thickness`, `line_thickness` | — | Overlay rendering. |
 | `overlay.jpeg_quality` | `85` | Re-encode quality before MQTT publish. |
-| `digits.count` | `5` | Number of odometer digits. MUST match the physical meter. |
-| `digits.per_digit_inset` | `0.10` | Fraction of each cell's width/height trimmed inward (avoids grabbing the plastic frame). |
-| `digits.rolling_threshold_up` | `0.92` | Progress level above which the rolling-digit resolver commits to the NEW digit. |
-| `digits.rolling_threshold_down` | `0.08` | Progress level below which it commits to the OLD digit. |
-| `rois.digits` | — | Single window enclosing all odometer digits. |
-| `rois.dials[]` | — | One entry per dial, ordered `×0.1 → ×0.0001`. **dials[0] must be the tenths wheel.** |
+| `digits.count` | `5` | *(mechanical)* Number of odometer digits. MUST match the physical meter. |
+| `digits.per_digit_inset` | `0.10` | *(mechanical)* Fraction of each cell's width/height trimmed inward (avoids grabbing the plastic frame). |
+| `digits.rolling_threshold_up` | `0.92` | *(mechanical)* Progress level above which the rolling-digit resolver commits to the NEW digit. |
+| `digits.rolling_threshold_down` | `0.08` | *(mechanical)* Progress level below which it commits to the OLD digit. |
+| `rois.digits` | — | *(mechanical)* Single window enclosing all odometer digits. |
+| `rois.dials[]` | — | *(mechanical)* One entry per dial, ordered `×0.1 → ×0.0001`. **dials[0] must be the tenths wheel.** |
+| `meter.type` | `mechanical` | Pipeline selector: `mechanical` or `digital`. |
+| `rois.digital.total` | — | *(digital)* ROI of the total-consumption LCD line. |
+| `rois.digital.flow` | — | *(digital)* ROI of the instant-flow LCD line. |
+| `digital.total_regex` | `^\d{6}\.?\d{3}$` | *(digital)* Regex that Vision's raw total output must match. |
+| `digital.flow_regex` | `^\d{1,3}\.\d{3}$` | *(digital)* Regex for Vision's flow output. |
+| `digital.max_retries` | `2` | *(digital)* Extra captures per cycle if the display is on a diagnostic view. |
+| `digital.retry_delay_sec` | `5.5` | *(digital)* Delay between retries. Must exceed longest diag-view dwell (5 s). |
+| `digital.min_digits` | `6` | *(digital)* Cheap-fail threshold that rejects diagnostic screens before regex. |
 | `postproc.monotonic_epsilon` | `0.0005` | Tolerated backward wobble; anything smaller than this is treated as noise, not a real regression. |
 | `postproc.big_jump_guard` | `2.0` | Maximum accepted forward jump in m³ between captures. Anything larger is blocked. |
 | `alignment.enabled` | `true` | Run ORB+RANSAC alignment to the reference frame. |
@@ -130,6 +172,81 @@ Rules of thumb:
 - 1–3 anchors is typical. More doesn't help if they're all over the same region.
 - If alignment regularly fails (logs show `aligned_ok=False`), widen the anchors or pick different anchor regions.
 
+## Digital meter
+
+For fully-digital LCD meters (e.g. the Qalcosonic W1). Set `meter.type: digital` and calibrate the two text-line ROIs — no dials.
+
+### Config keys
+
+```yaml
+meter:
+  type: digital                         # default "mechanical"
+
+processing:
+  interval_sec: 15                      # recommended — see "Retry budget" below
+
+rois:
+  digital:
+    total: [x, y, w, h]                 # line with the total consumption (m³)
+    flow:  [x, y, w, h]                 # line with the instantaneous flow (m³/h)
+
+digital:
+  # Regex the parser uses to validate Vision's raw output. Default accepts both
+  # "000100.000" (decimal detected) and "000100000" (decimal missed — parser
+  # injects it at position -3). Adjust if your meter shows a different layout.
+  total_regex: "^\\d{6}\\.?\\d{3}$"
+  flow_regex:  "^\\d{1,3}\\.\\d{3}$"
+  max_retries: 2                        # extra captures per cycle on a wrong view
+  retry_delay_sec: 5.5                  # must exceed longest diag-view dwell
+  min_digits: 6                         # cheap-fail bar for diagnostic screens
+```
+
+`alignment.*` still applies — ORB alignment of the whole frame helps keep the LCD ROIs stable under small camera drift, even without dials.
+
+### How the pipeline works
+
+1. Capture a JPEG from `/capture_with_flashlight`.
+2. Optionally align against `reference.jpg`.
+3. Run the Swift helper in `--mode line` over the two ROIs. It uses Apple Vision's text recognizer; on empty output it retries with `.accurate`. The returned string is digits plus optional `.`.
+4. Check `is_valid_digital_view` — cheap pre-validator that rejects frames with too few digit characters (diagnostic screens).
+5. Parse each line with the configured regex. `parse_digital_total` injects a decimal at position -3 if Vision didn't see one.
+6. Run `validate_digital_reading` — reject non-finite, negative flow, and jumps larger than `big_jump_guard`.
+7. If any step fails, retry up to `digital.max_retries` times with `digital.retry_delay_sec` between captures. After that, skip the cycle and hold the previous value.
+8. Apply the usual monotonic / big-jump guards to the total and publish.
+
+### The rotating display
+
+The Qalcosonic W1 auto-cycles between three views:
+
+| View | Dwell time |
+|---|---|
+| Numeric (total + flow) | ~10 s |
+| Diagnostic 1 | ~5 s |
+| Diagnostic 2 | ~4 s |
+
+Any single capture has a ~53 % chance of landing on the numeric view. `digital.retry_delay_sec = 5.5` guarantees that a retry crosses at least one dwell boundary (> longest diag-view of 5 s), so the retries don't phase-lock onto the same wrong view.
+
+**Retry budget**: 3 captures × ~0.5 s + 2 × 5.5 s delays ≈ 12 s worst case. That's why the recommended `processing.interval_sec: 15` for digital mode — it gives the loop headroom to finish even when the first two captures miss.
+
+### MQTT topics
+
+Digital mode publishes all the mechanical topics plus a new one:
+
+| Topic | Retained | Source |
+|---|---|---|
+| `{mqtt.topic}/main/value` | yes | Parsed total from the LCD (after guards). |
+| `{mqtt.topic}/main/rate` | no | Delta-computed m³/min (same formula as mechanical). |
+| `{mqtt.topic}/main/rate_lpm` | no | Delta-computed L/min. |
+| `{mqtt.topic}/main/flow_m3h` | no | **New.** Instantaneous flow read directly off the LCD (more responsive than the delta-based rate). |
+| `{overlay.camera_topic}` | yes | Debug overlay JPEG. |
+
+Home Assistant discovery payload for `water_flow_m3h` is published **only** when `meter.type: digital`. Mechanical installs don't see a dead sensor.
+
+### HA automations — which rate to use?
+
+- **`water_flow_m3h`** reflects what the meter itself reports right now. No quantization from `1/dt`, no jitter from OCR noise. Use this for leak detectors, shower timers, and anything that needs sub-minute response.
+- **`water_rate_lpm`** is the delta from the previous total, same as mechanical. Slightly lagged, but matches historical data from before the meter swap. Keep it if your existing automations depend on it.
+
 ## Meter-swap procedure
 
 When your water company replaces the physical meter, the ROIs won't match and the running total will reset to 0 on the new meter. Walk through:
@@ -150,19 +267,26 @@ The service will auto-capture a new reference from the first frame after restart
 
 ### 3. Calibrate ROIs against a live frame
 
-From the repo directory:
+From the repo directory (or anywhere, really — `calibrate.py` uses the deployed venv):
 
 ```bash
-.venv/bin/python3 calibrate.py
+~/watermeter/venv/bin/python3 calibrate.py
+# Or with activation:
+source ~/watermeter/venv/bin/activate && python3 calibrate.py
 ```
 
-A browser tab opens at `http://127.0.0.1:8765` showing the current meter image. For each ROI in the sidebar:
+A browser tab opens at `http://127.0.0.1:8765` showing the current meter image. The sidebar reflects the `meter.type` you have in config:
+
+- **Mechanical** → 1 digits window + 4 dial ROIs + 3 alignment anchors.
+- **Digital** → 2 line ROIs (total, flow) + 3 alignment anchors.
+
+For each ROI in the sidebar:
 
 1. Click the row (turns amber — "draw mode").
 2. Drag a rectangle on the image to place it.
-3. (Dials only) set `rotation` and `zero_angle_deg` in the sidebar.
+3. (Mechanical dials only) set `rotation` and `zero_angle_deg` in the sidebar.
 
-Iterate. Click **Test current config** whenever you want to verify a dial's reading. When everything looks right:
+Iterate. Click **Test current config** whenever you want to verify a dial's reading (mechanical only — digital mode's live OCR runs on the service itself, not in the calibrator). When everything looks right:
 
 4. Click **Save to config.yaml**. A toast confirms the backup filename.
 
@@ -198,6 +322,27 @@ tail -f ~/watermeter/watermeter.log
 ```
 
 Confirm that Home Assistant's `sensor.water_total` accepts the new reading. If HA is showing it as "unavailable" for longer than ~30 s, check `launch_stderr.log` and the broker.
+
+### Swapping from a mechanical meter to a digital one
+
+The procedure is the same as above, with three differences:
+
+1. **Set `meter.type: digital`** in `~/watermeter/config.yaml` *before* running `calibrate.py` (so the UI shows line ROIs instead of dials).
+2. **Recommended**: bump `processing.interval_sec` to `15` — see "Retry budget" under the [Digital meter](#digital-meter) section.
+3. **On first start**, `state.json` will contain `meter_type: mechanical` from the old install. The service detects this, logs `state.json meter_type='mechanical' != config meter_type='digital'; discarding prev_total`, and the next reading becomes the new baseline. No user action required — but running `--reset-total` explicitly is cleaner if you know the new meter's starting value.
+
+Example end-to-end after the new meter is installed:
+
+```bash
+launchctl unload ~/Library/LaunchAgents/com.watermeter.ocr.plist
+# Edit ~/watermeter/config.yaml: meter.type: digital, processing.interval_sec: 15
+rm ~/watermeter/reference.jpg                                  # fresh reference for the new face
+~/watermeter/venv/bin/python3 calibrate.py                     # draw two line ROIs + anchors
+~/watermeter/venv/bin/python3 watermeter.py \
+    --config ~/watermeter/config.yaml --reset-total 0          # or whatever the LCD shows
+launchctl load ~/Library/LaunchAgents/com.watermeter.ocr.plist
+tail -f ~/watermeter/watermeter.log
+```
 
 ## Manual ROI tuning (without the GUI)
 

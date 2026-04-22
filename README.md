@@ -1,10 +1,11 @@
 # Water Meter OCR (Mac + ESP32 PoE)
 
-Reads a **mechanical water meter** (odometer digits + 4 red-pointer dials) using an **ESP32-S3 AI-on-the-Edge Cam** for image capture and a **Mac** for fast, robust processing.
-- Uses Apple **Vision** for per-digit OCR (full/top/bottom) to resolve rolling digits.
-- Uses OpenCV for the 4 analog dials.
+Reads a water meter using an **ESP32-S3 AI-on-the-Edge Cam** for image capture and a **Mac** for fast, robust processing. Two pipelines are supported, selectable via `meter.type`:
 
-Publishes **total (m³)**, **flow rate (m³/min)**, **liters/min**, and an **overlay camera feed** to Home Assistant via **MQTT**.
+- **Mechanical** (default): odometer digits + 4 red-pointer dials. Apple **Vision** per-digit OCR (full/top/bottom) resolves rolling digits; OpenCV reads the analog dials.
+- **Digital**: fully electronic LCD (e.g. Qalcosonic W1) with total and instant-flow lines. Apple Vision line OCR only — no dials, no digit composition. Handles the display's rotating views (numeric + two diagnostic) by retrying within a single cycle until a numeric view is captured.
+
+Publishes **total (m³)**, **flow rate (m³/min)**, **liters/min**, and an **overlay camera feed** to Home Assistant via **MQTT**. Digital mode additionally publishes **`water_flow_m3h`** — the instant flow read straight off the LCD (more responsive than the delta-based rate).
 
 <p align="center">
   <img src="./overlay_example.jpg" alt="Water meter overlay example" width="520">
@@ -60,17 +61,20 @@ Publishes **total (m³)**, **flow rate (m³/min)**, **liters/min**, and an **ove
 
 ## Install
 
-The installer sets up a Python venv, dependencies, directories, LaunchAgent, builds the OCR helper from `ocr.swift`, and places starter config & state paths.
+The installer sets up a Python venv at `~/watermeter/venv/`, dependencies, directories, LaunchAgent, builds the OCR helper from `ocr.swift`, and places starter config & state paths.
 
 ```bash
 ./install.sh
-open -e ~/watermeter/config.yaml   # set ESP32 IP + MQTT + ROIs (see below)
-python3 save_reference.py          # (optional) take a clean reference shot
+open -e ~/watermeter/config.yaml                              # set ESP32 IP + MQTT + ROIs (see below)
+~/watermeter/venv/bin/python3 save_reference.py               # (optional) take a clean reference shot
+~/watermeter/venv/bin/python3 calibrate.py                    # interactive ROI calibration
 tail -f ~/watermeter/watermeter.log
 ```
 
 > The LaunchAgent will start the service at login/boot. Re-run `./install.sh` any time to update.
 > Uninstall: `launchctl unload ~/Library/LaunchAgents/com.watermeter.ocr.plist && rm -rf ~/watermeter`.
+
+> **Don't run `python3 calibrate.py` with the system Python** — it will fail with `ModuleNotFoundError: No module named 'cv2'`. Use the deployed venv (`~/watermeter/venv/bin/python3 ...`) or activate it first (`source ~/watermeter/venv/bin/activate`). See [docs/CONFIGURATION.md § Local development environment](./docs/CONFIGURATION.md#local-development-environment).
 
 ---
 
