@@ -1546,6 +1546,26 @@ def _ocr_digit_upscaled(ocr, img_path, sub_roi, factor, save_to=None):
     new_w = max(1, int(w * factor))
     new_h = max(1, int(h * factor))
     up = cv2.resize(crop, (new_w, new_h), interpolation=cv2.INTER_CUBIC)
+    # Pad with a neutral border roughly matching the LCD background. Apple
+    # Vision's text DETECTION stage (before recognition) treats a tight
+    # single-character image as "not text" and refuses to recognize even
+    # a clearly-visible glyph — padding turns the crop into "a glyph on a
+    # page", which Vision's detector accepts. Border size = 1x the glyph
+    # dimensions (empirically a comfortable margin). Background colour is
+    # sampled from the crop's own corners so the padding blends with the
+    # LCD rather than introducing a hard colour edge.
+    corners = np.vstack([
+        up[:5, :5].reshape(-1, up.shape[-1]) if up.ndim == 3 else up[:5, :5].reshape(-1, 1),
+        up[:5, -5:].reshape(-1, up.shape[-1]) if up.ndim == 3 else up[:5, -5:].reshape(-1, 1),
+        up[-5:, :5].reshape(-1, up.shape[-1]) if up.ndim == 3 else up[-5:, :5].reshape(-1, 1),
+        up[-5:, -5:].reshape(-1, up.shape[-1]) if up.ndim == 3 else up[-5:, -5:].reshape(-1, 1),
+    ])
+    bg = tuple(int(v) for v in corners.mean(axis=0))
+    if up.ndim == 2:
+        bg = bg[0]
+    pad_px = max(new_w, new_h)
+    up = cv2.copyMakeBorder(up, pad_px, pad_px, pad_px, pad_px,
+                            cv2.BORDER_CONSTANT, value=bg)
     temp_path = img_path + ".digit.jpg"
     cv2.imwrite(temp_path, up)
     if save_to is not None:

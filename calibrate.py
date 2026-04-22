@@ -732,6 +732,7 @@ HTML_PAGE = r"""<!doctype html>
   </div>
 
   <div class="actions">
+    <button id="clear-btn">Clear selected ROI</button>
     <button id="test-btn">Test current config</button>
     <button id="save-btn" class="primary">Save to config.yaml</button>
   </div>
@@ -768,17 +769,20 @@ function digitCellSlots(listKey, labelPrefix, count, color) {
 }
 
 const DIGITAL_SLOTS = [
-  // Single-ROI / split-ROI slots — legacy mode, keep supporting them.
-  { key: 'total', label: 'Total (single-ROI mode)', color: '#4aa3ff', kind: 'digital' },
-  { key: 'total_int',  label: 'Total integer (split mode)', color: '#5bb1ff', kind: 'digital' },
-  { key: 'total_frac', label: 'Total fractional (split mode)', color: '#ffb547', kind: 'digital' },
-  { key: 'flow',  label: 'Flow line (optional)', color: '#3ccf7b', kind: 'digital' },
-  // Per-digit slots — draw each rectangle tight around one digit. Unused
-  // slots (not drawn) are ignored. Mix and match with the single-ROI keys
-  // above; the runtime prefers per-digit lists when set.
+  // Per-digit slots — draw each rectangle tight around one digit, one per
+  // row. Runtime prefers these when set; skip the legacy section below
+  // entirely if you're using per-digit calibration.
   ...digitCellSlots('total_int_digits', 'Total int', 6, '#74b6ff'),
   ...digitCellSlots('total_frac_digits', 'Total frac', 4, '#ffc76e'),
   ...digitCellSlots('flow_digits', 'Flow', 6, '#6ee09a'),
+  // Legacy single-ROI / split-ROI slots. Still honoured by the runtime as
+  // fallbacks, but only if the per-digit lists above are empty. If you're
+  // using per-digit mode and legacy entries remain in config.yaml, use
+  // the "Clear selected ROI" button to drop them.
+  { key: 'total', label: '— legacy — Total (single-ROI)', color: '#4aa3ff', kind: 'digital' },
+  { key: 'total_int',  label: '— legacy — Total integer', color: '#5bb1ff', kind: 'digital' },
+  { key: 'total_frac', label: '— legacy — Total fractional', color: '#ffb547', kind: 'digital' },
+  { key: 'flow',  label: '— legacy — Flow line', color: '#3ccf7b', kind: 'digital' },
   { key: 'anchor_0', label: 'Anchor 0', color: '#6b7280', kind: 'anchor', idx: 0 },
   { key: 'anchor_1', label: 'Anchor 1', color: '#6b7280', kind: 'anchor', idx: 1 },
   { key: 'anchor_2', label: 'Anchor 2', color: '#6b7280', kind: 'anchor', idx: 2 },
@@ -1103,6 +1107,19 @@ document.getElementById('refresh-btn').addEventListener('click', async () => {
   await loadImage();
   draw();
   toast('Frame refreshed', 'ok');
+});
+
+document.getElementById('clear-btn').addEventListener('click', () => {
+  // Remove the drawn ROI from the currently-selected slot so save drops
+  // any stale entry (e.g. legacy single-ROI keys left over from an earlier
+  // calibration round). No-op if nothing's selected or drawn.
+  if (!state.selected) { toast('Select a slot row first', 'warn'); return; }
+  if (!(state.selected in state.rois)) { toast('That slot has no ROI drawn', 'warn'); return; }
+  delete state.rois[state.selected];
+  renderSidebar();
+  renderSelectedPanel();
+  draw();
+  toast('Cleared — remember to Save', 'ok');
 });
 
 document.getElementById('test-btn').addEventListener('click', async () => {
