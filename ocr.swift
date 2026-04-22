@@ -119,9 +119,19 @@ if mode == "line" {
     exit(0)
 }
 
-// Default: single-digit mode (backward-compatible).
-let full = recognize(roi, level: .fast)
-let digitsOnly = full.filter { $0.isNumber }
+// Default: single-digit mode. Used by both the mechanical odometer pipeline
+// (large digits, .fast is always enough) and the digital per-digit pipeline
+// (smaller digits where .fast sometimes returns nothing on a tight crop).
+// Try .fast first for speed; fall back to .accurate when fast couldn't find
+// any digit. Matches the "run both and keep the longer one" spirit of line
+// mode, but we only need a single character so first non-empty wins.
+func digitsOf(_ s: String) -> String {
+    return s.filter { $0.isNumber }
+}
+var digitsOnly = digitsOf(recognize(roi, level: .fast))
+if digitsOnly.isEmpty {
+    digitsOnly = digitsOf(recognize(roi, level: .accurate))
+}
 if digitsOnly.isEmpty {
     print("")
 } else {

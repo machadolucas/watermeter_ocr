@@ -1286,10 +1286,13 @@ def _auto_detect_digit_sub_rois(img_path, base_roi, expected_count, inset):
     equal subdivision).
 
     How it works: crop the ROI, Otsu-threshold to binary (digits = white),
-    sum "ink" per column, mark columns above 15% of the peak as "in a
-    digit". Contiguous ink runs → one digit each; runs below a minimum
-    width are discarded as noise. If we get exactly `expected_count` runs
-    we return them (with `inset` padding); otherwise None.
+    MORPHOLOGICALLY CLOSE horizontally to fill the hollow interior of
+    7-segment glyphs (a "0" would otherwise project as two separate runs —
+    its left and right vertical strokes — tripping the count check), sum
+    "ink" per column, mark columns above 15% of the peak as "in a digit".
+    Contiguous ink runs → one digit each; runs below a minimum width are
+    discarded as noise. If we get exactly `expected_count` runs we return
+    them (with `inset` padding); otherwise None.
     """
     img = cv2.imread(img_path)
     if img is None:
@@ -1309,25 +1312,44 @@ def _auto_detect_digit_sub_rois(img_path, base_roi, expected_count, inset):
     if cw == 0 or ch == 0:
         return None
 
-    profile = (thr > 0).sum(axis=0)
-    if profile.max() == 0:
+    expected_digit_w = max(1, cw // expected_count)
+    min_run_w = max(2, cw // (expected_count * 3))
+
+    def _runs_for(binary):
+        profile = (binary > 0).sum(axis=0)
+        if profile.max() == 0:
+            return None
+        ink = profile > profile.max() * 0.15
+        rs = []
+        s = None
+        for i, v in enumerate(ink):
+            if v and s is None:
+                s = i
+            elif not v and s is not None:
+                rs.append((s, i))
+                s = None
+        if s is not None:
+            rs.append((s, len(ink)))
+        return [r for r in rs if r[1] - r[0] >= min_run_w]
+
+    # Pass 1: raw binary. Works when digits are solid rectangles with clear
+    # gaps between them (mostly synthetic / cleanly-rendered fonts).
+    runs = _runs_for(thr)
+    if runs is None:
         return None
-    ink = profile > profile.max() * 0.15
-
-    runs = []
-    start = None
-    for i, v in enumerate(ink):
-        if v and start is None:
-            start = i
-        elif not v and start is not None:
-            runs.append((start, i))
-            start = None
-    if start is not None:
-        runs.append((start, len(ink)))
-
-    # Drop runs too narrow to be a real digit (< 1/(3N) of the crop width).
-    min_w = max(2, cw // (expected_count * 3))
-    runs = [r for r in runs if r[1] - r[0] >= min_w]
+    if len(runs) != expected_count:
+        # Pass 2: horizontally close the binary so each 7-segment glyph's
+        # hollow interior fills in. "0" has two vertical strokes per digit;
+        # without closing each "0" projects as TWO runs, inflating the count.
+        # Kernel width is 50% of the expected per-digit column — narrower
+        # than the gap between adjacent digits so we don't merge them, but
+        # wider than a glyph's internal gap.
+        kernel_w = max(3, int(expected_digit_w * 0.5))
+        kernel = cv2.getStructuringElement(cv2.MORPH_RECT, (kernel_w, 1))
+        closed = cv2.morphologyEx(thr, cv2.MORPH_CLOSE, kernel)
+        runs = _runs_for(closed)
+        if runs is None:
+            return None
     if len(runs) != expected_count:
         return None
 

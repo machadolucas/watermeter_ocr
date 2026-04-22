@@ -847,6 +847,42 @@ class TestBuildDigitSubRois:
                                     [0.1, 0.2, 0.6, 0.1], 6, auto_detect=True)
         assert len(subs) == 6
 
+    def test_auto_detect_handles_hollow_seven_segment_zero(self, tmp_path):
+        # 7-segment "0" is drawn as a hollow rectangle — left + right vertical
+        # strokes with no ink in the middle. Without morphological closing,
+        # vertical projection would see each "0" as TWO runs (one per stroke),
+        # tripping the count check. With closing, each "0" projects as ONE
+        # continuous run, matching the expected digit count.
+        import cv2
+        total_w, total_h = 360, 60
+        img = np.full((total_h, total_w, 3), 220, dtype=np.uint8)
+        # Draw six hollow "0"s: 50 px wide, gap of 10 px, with 4 px strokes.
+        pad_x, pad_y = 10, 10
+        digit_w = 50
+        gap = 10
+        stroke = 4
+        for i in range(6):
+            x = pad_x + i * (digit_w + gap)
+            # left stroke
+            img[pad_y:pad_y + 40, x:x + stroke] = 40
+            # right stroke
+            img[pad_y:pad_y + 40, x + digit_w - stroke:x + digit_w] = 40
+            # top + bottom strokes
+            img[pad_y:pad_y + stroke, x:x + digit_w] = 40
+            img[pad_y + 40 - stroke:pad_y + 40, x:x + digit_w] = 40
+        path = str(tmp_path / "hollow.jpg")
+        cv2.imwrite(path, img)
+        subs = build_digit_sub_rois(path, [0.0, 0.0, 1.0, 1.0], 6,
+                                    auto_detect=True)
+        assert len(subs) == 6
+        # Sub-ROIs should be roughly one digit-cell wide each (not half, which
+        # would indicate we'd detected 12 strokes instead of 6 digits).
+        widths = [s[2] * total_w for s in subs]
+        # Each detected digit width should be close to digit_w (+ 2*inset
+        # padding of the detected run itself).
+        for w in widths:
+            assert digit_w * 0.5 < w < digit_w * 1.4
+
 
 # ---------------------------------------------------------------------------
 # apply_ocr_preprocess (opt-in contrast enhancement before Vision)
