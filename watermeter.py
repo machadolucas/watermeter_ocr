@@ -1203,70 +1203,67 @@ def draw_overlays_digital(img, total_roi_abs, flow_roi_abs,
                           total_int_roi_abs=None, total_frac_roi_abs=None,
                           raw_total_int_str=None, raw_total_frac_str=None,
                           total_int_digits_abs=None, total_frac_digits_abs=None,
-                          flow_digits_abs=None):
-    """Overlay for digital LCD meters: rectangles for the total/flow ROIs,
-    each labelled with what Vision read raw and what the parser produced.
-    `raw_*_str` may be None/empty when the display was on a diag view at the
-    moment of capture — we still draw the rectangle so ROI placement is
-    visible in the debug image.
+                          flow_digits_abs=None,
+                          total_int_digits_chars=None,
+                          total_frac_digits_chars=None,
+                          flow_digits_chars=None):
+    """Overlay for digital LCD meters: one rectangle per configured digit
+    ROI, with the recognised digit drawn just outside the box — above for
+    total-line digits (int + frac), below for flow-line digits so the
+    labels don't collide with each other or with the box they belong to.
+    Legacy enclosing ROIs (single-ROI mode, split-ROI enclosing boxes)
+    are still drawn as faint outlines so calibration remains visible, but
+    without any labels.
 
-    Split-ROI mode: when both `total_int_roi_abs` and `total_frac_roi_abs`
-    are provided, those two rectangles are drawn (labelled INT/FRAC with
-    their individual raw OCR strings) and `total_roi_abs` is ignored. The
-    combined parsed value is still shown on the INT rect. This lets the
-    debug JPEG reflect the actual OCR geometry when the fractional digits
-    are captured from a separate, smaller ROI.
+    `total_int_digits_chars` / `total_frac_digits_chars` / `flow_digits_chars`
+    are per-digit lists of single-char recognition results, same length as
+    the corresponding `*_digits_abs` rect lists. A position that OCR
+    couldn't read is "" and rendered as a dim "?".
 
-    `reason` is an optional failure tag ("wrong_view" / "parse_failed" /
-    "validate_failed" / "no_frame"); when set (and not "ok"), a coloured
-    banner is drawn across the top of the image so the debug JPEG visibly
-    distinguishes a rejected cycle from a successful one. Callers pass
-    reason="ok" or None on success."""
+    `reason` is an optional failure tag; when set (and not "ok"), a
+    coloured banner is drawn across the top so a rejected cycle looks
+    visibly different from a successful one.
+    """
     ov, fs, th, o_th, box_th, status = _overlay_base(img, cfg, aligned_ok)
+    dim_gray = (140, 140, 140)
 
-    def _draw_line(roi_abs, raw_str, parsed_val, label):
+    def _faint_outline(roi_abs):
         if roi_abs is None or len(roi_abs) != 4:
             return
         x, y, w, h = roi_abs
-        cv2.rectangle(ov, (x, y), (x + w, y + h), status, box_th)
-        raw_disp = raw_str if raw_str else "(no read)"
-        parsed_disp = f"{parsed_val:.3f}" if parsed_val is not None else "—"
-        _draw_label(ov, f"{label}: {parsed_disp}",
-                    (x, max(12, y - 6)), fs * 0.7, status, th, o_th)
-        _draw_label(ov, f"raw: {raw_disp}",
-                    (x, y + h + int(18 * fs)), fs * 0.55, (220, 220, 220), th, o_th)
+        cv2.rectangle(ov, (x, y), (x + w, y + h), dim_gray, 1)
 
-    def _draw_digit_boxes(rects, label_prefix, color):
-        """Draw one small rectangle per per-digit ROI so the user can see
-        where each digit cell was placed."""
+    def _draw_digit_boxes(rects, chars, position):
+        """Draw boxes + per-digit labels. `position` is 'above' (label sits
+        just above the box, for total digits) or 'below' (for flow)."""
         if not rects:
             return
+        chars = chars or []
         for i, (x, y, w, h) in enumerate(rects):
-            cv2.rectangle(ov, (x, y), (x + w, y + h), color, max(1, box_th - 1))
-            _draw_label(ov, f"{label_prefix}{i}", (x, max(12, y - 4)),
-                        fs * 0.45, color, th, o_th)
+            cv2.rectangle(ov, (x, y), (x + w, y + h), status, box_th)
+            ch = chars[i] if i < len(chars) and chars[i] else ""
+            label = ch if ch else "?"
+            label_color = status if ch else (80, 80, 255)
+            tsz = cv2.getTextSize(label, cv2.FONT_HERSHEY_SIMPLEX,
+                                  fs * 0.9, th)[0]
+            tx = x + (w - tsz[0]) // 2
+            if position == "above":
+                ty = max(tsz[1] + 2, y - 6)
+            else:
+                ty = min(ov.shape[0] - 4, y + h + tsz[1] + 6)
+            _draw_label(ov, label, (tx, ty), fs * 0.9, label_color, th, o_th)
 
-    split_mode = (total_int_roi_abs is not None and len(total_int_roi_abs) == 4
-                  and total_frac_roi_abs is not None and len(total_frac_roi_abs) == 4)
-    # Per-digit individual ROIs (if configured) — drawn in addition to any
-    # enclosing ROI box so calibration is visible at both levels.
-    if split_mode:
-        _draw_line(total_int_roi_abs, raw_total_int_str, parsed_total, "TOTAL m³ (int)")
-        _draw_line(total_frac_roi_abs, raw_total_frac_str, None, "frac")
-    elif total_int_digits_abs or total_frac_digits_abs:
-        # No enclosing ROI but individual digits are configured — combine
-        # them into a synthetic TOTAL label at the first digit's location.
-        if total_int_digits_abs:
-            fx, fy, _, _ = total_int_digits_abs[0]
-            parsed_disp = f"{parsed_total:.3f}" if parsed_total is not None else "—"
-            _draw_label(ov, f"TOTAL m³: {parsed_disp}",
-                        (fx, max(12, fy - 6)), fs * 0.7, status, th, o_th)
-    else:
-        _draw_line(total_roi_abs, raw_total_str, parsed_total, "TOTAL m³")
-    _draw_digit_boxes(total_int_digits_abs, "i", status)
-    _draw_digit_boxes(total_frac_digits_abs, "f", status)
-    _draw_line(flow_roi_abs, raw_flow_str, parsed_flow, "FLOW m³/h")
-    _draw_digit_boxes(flow_digits_abs, "fl", status)
+    # Faint enclosing outlines so the user can still see what they
+    # calibrated, but without any labels cluttering the image.
+    _faint_outline(total_roi_abs)
+    _faint_outline(total_int_roi_abs)
+    _faint_outline(total_frac_roi_abs)
+    _faint_outline(flow_roi_abs)
+
+    # Per-digit boxes with the classified digit above (total) or below (flow).
+    _draw_digit_boxes(total_int_digits_abs, total_int_digits_chars, "above")
+    _draw_digit_boxes(total_frac_digits_abs, total_frac_digits_chars, "above")
+    _draw_digit_boxes(flow_digits_abs, flow_digits_chars, "below")
 
     if reason and reason != "ok":
         # BGR. Failure banner helps during debugging — e.g. "all cycles giving
@@ -1461,17 +1458,18 @@ def build_digit_sub_rois(img_path, base_roi, expected_count, inset=0.10,
                                                expected_count, inset)
         if detected is not None:
             if log is not None:
-                log.info("build_digit_sub_rois[%s]: auto-detect OK (%d digits)",
-                         label, expected_count)
+                log.debug("build_digit_sub_rois[%s]: auto-detect OK (%d digits)",
+                          label, expected_count)
             return detected
         if log is not None:
-            log.info("build_digit_sub_rois[%s]: auto-detect failed → "
-                     "equal subdivision", label)
+            log.debug("build_digit_sub_rois[%s]: auto-detect failed → "
+                      "equal subdivision", label)
     return _equal_subdivide_roi(base_roi, expected_count, inset)
 
 
 def read_region_individual_digits(ocr, img_path, digit_rois, upscale=1,
-                                  crops_dir=None, crops_prefix=None, log=None):
+                                  crops_dir=None, crops_prefix=None, log=None,
+                                  cached_img=None):
     """OCR each ROI in `digit_rois` independently and return the
     concatenation. Unlike `read_region_per_digit`, no subdivision or
     auto-detection happens — each ROI is treated as a user-placed
@@ -1487,7 +1485,7 @@ def read_region_individual_digits(ocr, img_path, digit_rois, upscale=1,
     subdivision path so calibration can be cross-referenced the same way.
     """
     if not digit_rois:
-        return ""
+        return "", []
     digits = []
     for i, sub in enumerate(digit_rois):
         save_to = None
@@ -1503,13 +1501,14 @@ def read_region_individual_digits(ocr, img_path, digit_rois, upscale=1,
         # through parsing and produced wrong totals. An empty read
         # failing the regex → retry → we get a clean frame eventually
         # is strictly better than a confidently-wrong digit going live.
-        digit = _classify_7seg_from_path(img_path, sub, save_to=save_to)
+        digit = _classify_7seg_from_path(img_path, sub, save_to=save_to,
+                                         img=cached_img)
         if log is not None:
-            log.info("individual[%s d%d] roi=[%.4f,%.4f,%.4f,%.4f] → %r",
-                     crops_prefix or "?", i,
-                     sub[0], sub[1], sub[2], sub[3], digit)
+            log.debug("individual[%s d%d] roi=[%.4f,%.4f,%.4f,%.4f] → %r",
+                      crops_prefix or "?", i,
+                      sub[0], sub[1], sub[2], sub[3], digit)
         digits.append(digit or "")
-    return "".join(digits)
+    return "".join(digits), list(digits)
 
 
 # Canonical 7-segment patterns. Segment order:
@@ -1655,13 +1654,22 @@ def classify_7seg(crop_bw, threshold=0.18):
     return _SEVEN_SEG_PATTERNS.get(bits, "")
 
 
-def _classify_7seg_from_path(img_path, sub_roi, save_to=None):
-    """Crop `sub_roi` out of the full image at `img_path`, binarize, and
-    run the 7-segment classifier. Returns a single-char digit or "".
+def _classify_7seg_from_path(img_path, sub_roi, save_to=None, img=None):
+    """Crop `sub_roi` out of the full image and run the 7-segment
+    classifier. `img` may be a pre-loaded BGR ndarray; when supplied we
+    skip the `cv2.imread` step entirely. Passing the image in is the
+    right move when classifying many digits from the same frame — a
+    typical cycle does ~14 classifications, and loading the JPEG once
+    per attempt instead of per-digit avoids ~40 redundant disk reads
+    and JPEG decodes per cycle.
+
+    Returns a single-char digit or "".
 
     If `save_to` is set, writes the binarized single-digit crop there so
-    the debug overlay can show what the classifier saw."""
-    img = cv2.imread(img_path)
+    the debug overlay can show what the classifier saw.
+    """
+    if img is None:
+        img = cv2.imread(img_path)
     if img is None:
         return ""
     H, W = img.shape[:2]
@@ -1840,8 +1848,8 @@ def read_region_per_digit(ocr, img_path, base_roi, digit_count, inset=0.10,
                             ensure_dir(os.path.dirname(save_to))
                             cv2.imwrite(save_to, crop)
         if log is not None:
-            log.info("per-digit[%s d%d] roi=[%.4f,%.4f,%.4f,%.4f] → %r",
-                     crops_prefix or "?", i, sub[0], sub[1], sub[2], sub[3], digit)
+            log.debug("per-digit[%s d%d] roi=[%.4f,%.4f,%.4f,%.4f] → %r",
+                      crops_prefix or "?", i, sub[0], sub[1], sub[2], sub[3], digit)
         digits.append(digit or "")
     return "".join(digits)
 
@@ -1946,6 +1954,9 @@ def run_digital_cycle(cfg, ocr, aligner, session, prev_total, log,
         "raw_total_int": None,
         "raw_total_frac": None,
         "raw_flow": None,
+        "total_int_digits_list": [],
+        "total_frac_digits_list": [],
+        "flow_digits_list": [],
         "total": None,
         "flow_m3h": None,
     }
@@ -1992,6 +2003,22 @@ def run_digital_cycle(cfg, ocr, aligner, session, prev_total, log,
             crops_dir = os.path.join(cfg.debug_dir, "ocr_crops")
             ensure_dir(crops_dir)
 
+        # Load the aligned/preprocessed frame ONCE per attempt and pass
+        # it through to every per-digit classifier call. Saves ~14
+        # redundant disk reads + JPEG decodes per attempt on a typical
+        # 6-int + 3-frac + 5-flow meter. Classical 7-seg classification
+        # is the only consumer that needs the pixels in-memory; line and
+        # subdivision modes still go through the Swift OCR binary by
+        # path.
+        cached_img = cv2.imread(ocr_path)
+
+        # Captured per-digit lists for each region, filled in by
+        # `_read_region` when the individual-digits path runs. Used by
+        # the overlay to label each box with the recognised digit; empty
+        # for line / subdivision paths since those don't expose per-box
+        # results.
+        per_digit_lists = {"total_int": [], "total_frac": [], "flow": []}
+
         def _read_region(roi, digit_count, region_label, digit_rois=None):
             # Priority order:
             #   1. explicit per-digit ROI list → user placed each cell
@@ -2000,11 +2027,14 @@ def run_digital_cycle(cfg, ocr, aligner, session, prev_total, log,
             # A region that's fully unconfigured returns None (caller skips).
             prefix = f"{region_label}_a{attempt + 1}"
             if digit_rois:
-                return read_region_individual_digits(
+                joined, digits_list = read_region_individual_digits(
                     ocr, ocr_path, digit_rois,
                     upscale=max(1, cfg.digital_ocr_upscale_factor),
                     crops_dir=crops_dir, crops_prefix=prefix, log=log,
+                    cached_img=cached_img,
                 )
+                per_digit_lists[region_label] = digits_list
+                return joined
             if not roi:
                 return None
             if digit_count > 0:
@@ -2017,9 +2047,9 @@ def run_digital_cycle(cfg, ocr, aligner, session, prev_total, log,
                     log=log,
                 )
             line_result = ocr.read_line(ocr_path, roi)
-            log.info("line[%s a%d] roi=[%.4f,%.4f,%.4f,%.4f] → %r",
-                     region_label, attempt + 1,
-                     roi[0], roi[1], roi[2], roi[3], line_result)
+            log.debug("line[%s a%d] roi=[%.4f,%.4f,%.4f,%.4f] → %r",
+                      region_label, attempt + 1,
+                      roi[0], roi[1], roi[2], roi[3], line_result)
             return line_result
 
         raw_total_int = None
@@ -2057,12 +2087,19 @@ def run_digital_cycle(cfg, ocr, aligner, session, prev_total, log,
             "raw_total_int": raw_total_int,
             "raw_total_frac": raw_total_frac,
             "raw_flow": raw_flow,
+            "total_int_digits_list": list(per_digit_lists.get("total_int") or []),
+            "total_frac_digits_list": list(per_digit_lists.get("total_frac") or []),
+            "flow_digits_list": list(per_digit_lists.get("flow") or []),
             "total": None,
             "flow_m3h": None,
         })
 
         if not is_valid_digital_view(raw_total, raw_flow, cfg):
-            log.info(
+            # Individual attempts on diag / partial views are routine —
+            # log at DEBUG so the normal-operation log stays quiet. Only
+            # the cycle-level "Giving up" message (when ALL attempts fail)
+            # is escalated to WARNING.
+            log.debug(
                 "Wrong display view (attempt %d/%d): total=%r flow=%r",
                 attempt + 1, attempts, raw_total, raw_flow,
             )
@@ -2083,7 +2120,7 @@ def run_digital_cycle(cfg, ocr, aligner, session, prev_total, log,
 
         parse_ok = total is not None and (flow is not None or not flow_active)
         if not parse_ok:
-            log.warning(
+            log.debug(
                 "Parse failed (attempt %d/%d): raw_total=%r raw_flow=%r parsed=(%s, %s)",
                 attempt + 1, attempts, raw_total, raw_flow, total, flow,
             )
@@ -2094,7 +2131,7 @@ def run_digital_cycle(cfg, ocr, aligner, session, prev_total, log,
             continue
 
         if not validate_digital_reading(total, flow, prev_total, cfg):
-            log.warning(
+            log.debug(
                 "Validate failed (attempt %d/%d): raw_total=%r raw_flow=%r "
                 "parsed=(%s, %s) prev=%s",
                 attempt + 1, attempts, raw_total, raw_flow, total, flow, prev_total,
@@ -2116,6 +2153,9 @@ def run_digital_cycle(cfg, ocr, aligner, session, prev_total, log,
             "raw_total_int": raw_total_int,
             "raw_total_frac": raw_total_frac,
             "raw_flow": raw_flow,
+            "total_int_digits_list": list(per_digit_lists.get("total_int") or []),
+            "total_frac_digits_list": list(per_digit_lists.get("total_frac") or []),
+            "flow_digits_list": list(per_digit_lists.get("flow") or []),
         }
         _notify(result)
         return result
@@ -2322,6 +2362,9 @@ def main():
                     total_int_digits_abs=ti_digs,
                     total_frac_digits_abs=tf_digs,
                     flow_digits_abs=fl_digs,
+                    total_int_digits_chars=state.get("total_int_digits_list"),
+                    total_frac_digits_chars=state.get("total_frac_digits_list"),
+                    flow_digits_chars=state.get("flow_digits_list"),
                 )
                 if should_publish:
                     topic = getattr(cfg, "overlay_camera_topic",
@@ -2377,6 +2420,22 @@ def main():
                 mqttc.publish(f"{base}/main/rate_lpm", f"{rate_lpm:.3f}", retain=False)
                 if flow_m3h is not None:
                     mqttc.publish(f"{base}/main/flow_m3h", f"{flow_m3h:.3f}", retain=False)
+
+                # Log at INFO only when the published total actually advanced
+                # (first reading, or value changed). Steady-state "nothing
+                # changed" cycles log at DEBUG so the normal-operation log
+                # stays quiet over long periods.
+                if prev_total is None or publish_total != prev_total:
+                    delta_str = ("baseline" if prev_total is None
+                                 else f"Δ{publish_total - prev_total:+.3f}")
+                    log.info("Publish: total=%.3f m³ flow=%s m³/h rate=%.3f L/min (%s)",
+                             publish_total,
+                             f"{flow_m3h:.3f}" if flow_m3h is not None else "—",
+                             rate_lpm, delta_str)
+                else:
+                    log.debug("Publish (steady): total=%.3f m³ flow=%s",
+                              publish_total,
+                              f"{flow_m3h:.3f}" if flow_m3h is not None else "—")
 
                 prev_total = publish_total
                 prev_ts = now
