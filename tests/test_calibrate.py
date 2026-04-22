@@ -328,6 +328,84 @@ class TestValidateDigitalSplitRois:
         assert err and "total_int" in err
 
 
+class TestValidateDigitalPerDigitLists:
+    def test_per_digit_lists_accepted_without_enclosing_roi(self):
+        # Per-digit lists alone satisfy the "where is the total?" requirement.
+        p = _valid_digital_payload()
+        p["total"] = None
+        p["total_int_digits"]  = [[0.10 + i*0.07, 0.25, 0.05, 0.10] for i in range(6)]
+        p["total_frac_digits"] = [[0.56 + i*0.06, 0.31, 0.04, 0.08] for i in range(3)]
+        assert validate_digital_payload(p) is None
+
+    def test_per_digit_bad_shape_rejected(self):
+        # Each rect in the list is geometry-validated independently.
+        p = _valid_digital_payload()
+        p["total_int_digits"] = [[0.9, 0.9, 0.5, 0.5]]  # out of bounds
+        err = validate_digital_payload(p)
+        assert err and "total_int_digits" in err
+
+    def test_empty_per_digit_lists_are_ignored(self):
+        # Empty lists don't count as "configured" — if the only config is
+        # empty lists (no enclosing ROI either), validation must still fail
+        # for a missing total.
+        p = _valid_digital_payload()
+        p["total"] = None
+        p["total_int_digits"] = []
+        p["total_frac_digits"] = []
+        err = validate_digital_payload(p)
+        assert err and "missing total" in err.lower()
+
+
+class TestMergeDigitalPerDigit:
+    def test_merge_writes_per_digit_lists(self):
+        doc = {}
+        payload = {
+            "total": [0.1, 0.2, 0.6, 0.2],
+            "total_int_digits":  [[0.10, 0.25, 0.05, 0.10], [0.17, 0.25, 0.05, 0.10]],
+            "total_frac_digits": [[0.56, 0.31, 0.04, 0.08]],
+            "flow_digits": [],
+            "anchors": [],
+        }
+        merged = merge_digital_rois(doc, payload)
+        dig = merged["rois"]["digital"]
+        assert dig["total_int_digits"] == [[0.10, 0.25, 0.05, 0.10], [0.17, 0.25, 0.05, 0.10]]
+        assert dig["total_frac_digits"] == [[0.56, 0.31, 0.04, 0.08]]
+        # Empty flow_digits → key should not be present so the runtime
+        # doesn't see a stale empty list.
+        assert "flow_digits" not in dig
+
+    def test_merge_drops_stale_per_digit_lists(self):
+        # User previously had a per-digit list; now they cleared it in the UI.
+        # The save must remove the key so the runtime doesn't re-use stale
+        # coords from a prior calibration.
+        doc = {"rois": {"digital": {
+            "total": [0.1, 0.1, 0.8, 0.2],
+            "total_int_digits": [[0.1, 0.25, 0.05, 0.1]],
+        }}}
+        payload = {
+            "total": [0.15, 0.20, 0.70, 0.20],
+            "total_int_digits": [],
+            "total_frac_digits": [],
+            "flow_digits": [],
+            "anchors": [],
+        }
+        merged = merge_digital_rois(doc, payload)
+        assert "total_int_digits" not in merged["rois"]["digital"]
+
+
+class TestExtractDigitalPerDigit:
+    def test_extract_surfaces_per_digit_lists(self):
+        doc = {"rois": {"digital": {
+            "total": [0.1, 0.2, 0.8, 0.2],
+            "total_int_digits": [[0.1, 0.25, 0.05, 0.1]],
+            "flow_digits": [[0.5, 0.5, 0.05, 0.1], [0.6, 0.5, 0.05, 0.1]],
+        }}}
+        r = extract_digital_rois(doc)
+        assert r["total_int_digits"] == [[0.1, 0.25, 0.05, 0.1]]
+        assert r["total_frac_digits"] == []
+        assert r["flow_digits"] == [[0.5, 0.5, 0.05, 0.1], [0.6, 0.5, 0.05, 0.1]]
+
+
 # ---------------------------------------------------------------------------
 # extract_rois
 # ---------------------------------------------------------------------------

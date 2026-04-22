@@ -147,6 +147,16 @@ class Config:
     digital_total_frac_digit_count: int = 0
     digital_flow_digit_count: int = 0
     digital_per_digit_inset: float = 0.10
+    # Per-digit ROI lists — an alternative to digit_count-based subdivision.
+    # When a *_digits list is non-empty, the pipeline OCRs each ROI
+    # independently and concatenates, bypassing auto-detect and equal
+    # subdivision entirely. Use when digits aren't evenly spaced in the
+    # base ROI (e.g. "118" where the leading "1" is far-left and the "8"
+    # is tight against the right margin) and the single-ROI approach
+    # can't express the required per-digit padding.
+    digital_total_int_digits: List[List[float]] = field(default_factory=list)
+    digital_total_frac_digits: List[List[float]] = field(default_factory=list)
+    digital_flow_digits: List[List[float]] = field(default_factory=list)
     # When True (default) per-digit mode tries to auto-detect each digit's
     # bounding box via vertical projection before falling back to equal
     # subdivision. This self-corrects minor calibration offsets in the
@@ -248,6 +258,9 @@ def load_config(path)->Config:
         digital_per_digit_auto_detect = bool(dig.get("per_digit_auto_detect", True)),
         digital_ocr_upscale_factor = int(dig.get("ocr_upscale_factor", 1)),
         digital_save_ocr_crops = bool(dig.get("save_ocr_crops", False)),
+        digital_total_int_digits = [list(r) for r in (dig_rois.get("total_int_digits") or [])],
+        digital_total_frac_digits = [list(r) for r in (dig_rois.get("total_frac_digits") or [])],
+        digital_flow_digits = [list(r) for r in (dig_rois.get("flow_digits") or [])],
     )
 
 class VisionOCR:
@@ -1181,7 +1194,9 @@ def draw_overlays_digital(img, total_roi_abs, flow_roi_abs,
                           aligned_ok, cfg, reason=None,
                           out_path=None, log=None,
                           total_int_roi_abs=None, total_frac_roi_abs=None,
-                          raw_total_int_str=None, raw_total_frac_str=None):
+                          raw_total_int_str=None, raw_total_frac_str=None,
+                          total_int_digits_abs=None, total_frac_digits_abs=None,
+                          flow_digits_abs=None):
     """Overlay for digital LCD meters: rectangles for the total/flow ROIs,
     each labelled with what Vision read raw and what the parser produced.
     `raw_*_str` may be None/empty when the display was on a diag view at the
@@ -1214,14 +1229,37 @@ def draw_overlays_digital(img, total_roi_abs, flow_roi_abs,
         _draw_label(ov, f"raw: {raw_disp}",
                     (x, y + h + int(18 * fs)), fs * 0.55, (220, 220, 220), th, o_th)
 
+    def _draw_digit_boxes(rects, label_prefix, color):
+        """Draw one small rectangle per per-digit ROI so the user can see
+        where each digit cell was placed."""
+        if not rects:
+            return
+        for i, (x, y, w, h) in enumerate(rects):
+            cv2.rectangle(ov, (x, y), (x + w, y + h), color, max(1, box_th - 1))
+            _draw_label(ov, f"{label_prefix}{i}", (x, max(12, y - 4)),
+                        fs * 0.45, color, th, o_th)
+
     split_mode = (total_int_roi_abs is not None and len(total_int_roi_abs) == 4
                   and total_frac_roi_abs is not None and len(total_frac_roi_abs) == 4)
+    # Per-digit individual ROIs (if configured) — drawn in addition to any
+    # enclosing ROI box so calibration is visible at both levels.
     if split_mode:
         _draw_line(total_int_roi_abs, raw_total_int_str, parsed_total, "TOTAL m³ (int)")
         _draw_line(total_frac_roi_abs, raw_total_frac_str, None, "frac")
+    elif total_int_digits_abs or total_frac_digits_abs:
+        # No enclosing ROI but individual digits are configured — combine
+        # them into a synthetic TOTAL label at the first digit's location.
+        if total_int_digits_abs:
+            fx, fy, _, _ = total_int_digits_abs[0]
+            parsed_disp = f"{parsed_total:.3f}" if parsed_total is not None else "—"
+            _draw_label(ov, f"TOTAL m³: {parsed_disp}",
+                        (fx, max(12, fy - 6)), fs * 0.7, status, th, o_th)
     else:
         _draw_line(total_roi_abs, raw_total_str, parsed_total, "TOTAL m³")
+    _draw_digit_boxes(total_int_digits_abs, "i", status)
+    _draw_digit_boxes(total_frac_digits_abs, "f", status)
     _draw_line(flow_roi_abs, raw_flow_str, parsed_flow, "FLOW m³/h")
+    _draw_digit_boxes(flow_digits_abs, "fl", status)
 
     if reason and reason != "ok":
         # BGR. Failure banner helps during debugging — e.g. "all cycles giving
@@ -1423,6 +1461,57 @@ def build_digit_sub_rois(img_path, base_roi, expected_count, inset=0.10,
             log.info("build_digit_sub_rois[%s]: auto-detect failed → "
                      "equal subdivision", label)
     return _equal_subdivide_roi(base_roi, expected_count, inset)
+
+
+def read_region_individual_digits(ocr, img_path, digit_rois, upscale=1,
+                                  crops_dir=None, crops_prefix=None, log=None):
+    """OCR each ROI in `digit_rois` independently and return the
+    concatenation. Unlike `read_region_per_digit`, no subdivision or
+    auto-detection happens — each ROI is treated as a user-placed
+    single-digit cell with whatever padding the user chose. This is the
+    right mode when digits aren't evenly spaced in a base ROI (e.g. a
+    mix of wide "8" and narrow "1" glyphs on a 7-segment display where
+    any single enclosing box necessarily distributes the spacing
+    wrongly).
+
+    Each ROI is OCR'd via `_ocr_digit_upscaled` when `upscale > 1`
+    (which also has the line-mode fallback) or `ocr._run` directly
+    otherwise. Per-digit logging + debug-crop saving mirror the
+    subdivision path so calibration can be cross-referenced the same way.
+    """
+    if not digit_rois:
+        return ""
+    digits = []
+    for i, sub in enumerate(digit_rois):
+        save_to = None
+        if crops_dir is not None and crops_prefix is not None:
+            save_to = os.path.join(crops_dir, f"{crops_prefix}_d{i}.jpg")
+        if upscale > 1:
+            digit = _ocr_digit_upscaled(ocr, img_path, sub, upscale,
+                                        save_to=save_to)
+        else:
+            digit = ocr._run(img_path, sub, "full") or ""
+            if not digit:
+                line = ocr.read_line(img_path, sub) or ""
+                digits_only = "".join(c for c in line if c.isdigit())
+                if digits_only:
+                    digit = digits_only[0]
+            if save_to is not None:
+                img = cv2.imread(img_path)
+                if img is not None:
+                    H, W = img.shape[:2]
+                    x, y, w, h = norm_to_abs(sub, W, H)
+                    if w > 0 and h > 0:
+                        crop = img[y:y + h, x:x + w]
+                        if crop.size > 0:
+                            ensure_dir(os.path.dirname(save_to))
+                            cv2.imwrite(save_to, crop)
+        if log is not None:
+            log.info("individual[%s d%d] roi=[%.4f,%.4f,%.4f,%.4f] → %r",
+                     crops_prefix or "?", i,
+                     sub[0], sub[1], sub[2], sub[3], digit)
+        digits.append(digit or "")
+    return "".join(digits)
 
 
 def _ocr_digit_upscaled(ocr, img_path, sub_roi, factor, save_to=None):
@@ -1683,11 +1772,22 @@ def run_digital_cycle(cfg, ocr, aligner, session, prev_total, log,
             crops_dir = os.path.join(cfg.debug_dir, "ocr_crops")
             ensure_dir(crops_dir)
 
-        def _read_region(roi, digit_count, region_label):
+        def _read_region(roi, digit_count, region_label, digit_rois=None):
+            # Priority order:
+            #   1. explicit per-digit ROI list → user placed each cell
+            #   2. single ROI + digit_count > 0 → subdivide / auto-detect
+            #   3. single ROI + digit_count == 0 → line mode
+            # A region that's fully unconfigured returns None (caller skips).
+            prefix = f"{region_label}_a{attempt + 1}"
+            if digit_rois:
+                return read_region_individual_digits(
+                    ocr, ocr_path, digit_rois,
+                    upscale=max(1, cfg.digital_ocr_upscale_factor),
+                    crops_dir=crops_dir, crops_prefix=prefix, log=log,
+                )
             if not roi:
                 return None
             if digit_count > 0:
-                prefix = f"{region_label}_a{attempt + 1}"
                 return read_region_per_digit(
                     ocr, ocr_path, roi, digit_count,
                     cfg.digital_per_digit_inset,
@@ -1704,22 +1804,31 @@ def run_digital_cycle(cfg, ocr, aligner, session, prev_total, log,
 
         raw_total_int = None
         raw_total_frac = None
-        if cfg.digital_total_int_roi and cfg.digital_total_frac_roi:
+        # Split mode is active when ANY of these are configured on either side:
+        #   - explicit per-digit list for int/frac
+        #   - or the single-ROI + digit_count pair for int/frac
+        split_int_active = bool(cfg.digital_total_int_digits) or bool(cfg.digital_total_int_roi)
+        split_frac_active = bool(cfg.digital_total_frac_digits) or bool(cfg.digital_total_frac_roi)
+        if split_int_active and split_frac_active:
             raw_total_int = _read_region(cfg.digital_total_int_roi,
                                          cfg.digital_total_int_digit_count,
-                                         "total_int") or ""
+                                         "total_int",
+                                         digit_rois=cfg.digital_total_int_digits) or ""
             raw_total_frac = _read_region(cfg.digital_total_frac_roi,
                                           cfg.digital_total_frac_digit_count,
-                                          "total_frac") or ""
+                                          "total_frac",
+                                          digit_rois=cfg.digital_total_frac_digits) or ""
             raw_total = f"{raw_total_int}.{raw_total_frac}"
         else:
             raw_total = _read_region(cfg.digital_total_roi, 0, "total")
         # Flow line is optional. If the user configured only rois.digital.total
         # (typical when flash glare forces alignment to favour the total line),
         # skip the flow OCR call entirely and publish only the delta-based rate.
+        flow_active = bool(cfg.digital_flow_digits) or bool(cfg.digital_flow_roi)
         raw_flow = _read_region(cfg.digital_flow_roi,
                                 cfg.digital_flow_digit_count,
-                                "flow") if cfg.digital_flow_roi else None
+                                "flow",
+                                digit_rois=cfg.digital_flow_digits) if flow_active else None
 
         last.update({
             "frame": aligned_img,
@@ -1874,6 +1983,7 @@ def main():
             "Digital config: total_int_roi=%s total_frac_roi=%s total_roi=%s "
             "flow_roi=%s total_regex=%r flow_regex=%r "
             "total_int_digit_count=%d total_frac_digit_count=%d flow_digit_count=%d "
+            "total_int_digits=%d total_frac_digits=%d flow_digits=%d "
             "per_digit_inset=%.2f per_digit_auto_detect=%s "
             "ocr_upscale_factor=%d save_ocr_crops=%s ocr_preprocess=%r "
             "max_retries=%d retry_delay_sec=%.1f min_digits=%d",
@@ -1882,6 +1992,8 @@ def main():
             cfg.digital_total_regex.pattern, cfg.digital_flow_regex.pattern,
             cfg.digital_total_int_digit_count, cfg.digital_total_frac_digit_count,
             cfg.digital_flow_digit_count,
+            len(cfg.digital_total_int_digits), len(cfg.digital_total_frac_digits),
+            len(cfg.digital_flow_digits),
             cfg.digital_per_digit_inset, cfg.digital_per_digit_auto_detect,
             cfg.digital_ocr_upscale_factor, cfg.digital_save_ocr_crops,
             cfg.digital_ocr_preprocess,
@@ -1967,6 +2079,13 @@ def main():
                 split = bool(cfg.digital_total_int_roi) and bool(cfg.digital_total_frac_roi)
                 ti_abs = norm_to_abs(cfg.digital_total_int_roi, Wi, Hi) if split else None
                 tf_abs = norm_to_abs(cfg.digital_total_frac_roi, Wi, Hi) if split else None
+                # Per-digit ROI lists translated to absolute pixel rects for
+                # the overlay. Each is optional — empty list → None.
+                def _abs_list(rois):
+                    return [norm_to_abs(r, Wi, Hi) for r in rois] if rois else None
+                ti_digs = _abs_list(cfg.digital_total_int_digits)
+                tf_digs = _abs_list(cfg.digital_total_frac_digits)
+                fl_digs = _abs_list(cfg.digital_flow_digits)
                 ov_img = draw_overlays_digital(
                     sub_img, t_abs, f_abs,
                     state.get("raw_total"), state.get("raw_flow"),
@@ -1977,6 +2096,9 @@ def main():
                     total_int_roi_abs=ti_abs, total_frac_roi_abs=tf_abs,
                     raw_total_int_str=state.get("raw_total_int"),
                     raw_total_frac_str=state.get("raw_total_frac"),
+                    total_int_digits_abs=ti_digs,
+                    total_frac_digits_abs=tf_digs,
+                    flow_digits_abs=fl_digs,
                 )
                 if should_publish:
                     topic = getattr(cfg, "overlay_camera_topic",

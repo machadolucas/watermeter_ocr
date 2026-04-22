@@ -136,9 +136,11 @@ def merge_rois(doc: dict, new_rois: dict) -> dict:
 def extract_digital_rois(doc: dict) -> dict:
     """Like extract_rois but for a digital LCD meter.
 
-    Surfaces three total-line ROIs: the single-ROI `total` plus the optional
-    `total_int` / `total_frac` pair used in split-ROI mode (LCDs whose
-    fractional digits are a different size from the integer digits).
+    Surfaces the single-ROI keys (`total`, `total_int`, `total_frac`,
+    `flow`) plus the per-digit lists (`total_int_digits`,
+    `total_frac_digits`, `flow_digits`) that let the user calibrate each
+    digit's bounding box independently — necessary when digits aren't
+    evenly spaced in an enclosing ROI.
     """
     rois = doc.get("rois", {}) or {}
     digital = rois.get("digital", {}) or {}
@@ -151,6 +153,9 @@ def extract_digital_rois(doc: dict) -> dict:
         "total_int": digital.get("total_int"),
         "total_frac": digital.get("total_frac"),
         "flow": digital.get("flow"),
+        "total_int_digits": digital.get("total_int_digits") or [],
+        "total_frac_digits": digital.get("total_frac_digits") or [],
+        "flow_digits": digital.get("flow_digits") or [],
         "anchors": anchors_out,
     }
 
@@ -169,14 +174,22 @@ def merge_digital_rois(doc: dict, new_rois: dict) -> dict:
     out = copy.deepcopy(doc)
     out.setdefault("rois", {})
     out["rois"].setdefault("digital", {})
-    # All four keys follow the same draw-or-drop contract: drawn → write,
-    # null/missing → remove any stale entry so the runtime sees a clean state.
+    # Single-ROI keys: drawn → write, null/missing → remove any stale
+    # entry so the runtime sees a clean state.
     for key in ("total", "total_int", "total_frac", "flow"):
         val = new_rois.get(key)
         if val:
             out["rois"]["digital"][key] = list(val)
         else:
             out["rois"]["digital"].pop(key, None)
+    # Per-digit list keys: non-empty list → write, empty/missing → remove.
+    for list_key in ("total_int_digits", "total_frac_digits", "flow_digits"):
+        val = new_rois.get(list_key) or []
+        cleaned = [list(r) for r in val if r]
+        if cleaned:
+            out["rois"]["digital"][list_key] = cleaned
+        else:
+            out["rois"]["digital"].pop(list_key, None)
     anchors = [list(a) for a in new_rois["anchors"] if a is not None]
     out.setdefault("alignment", {})
     out["alignment"]["anchor_rois"] = anchors
@@ -272,11 +285,16 @@ def validate_digital_payload(payload: dict) -> Optional[str]:
     total = payload.get("total")
     total_int = payload.get("total_int")
     total_frac = payload.get("total_frac")
+    total_int_digits = payload.get("total_int_digits") or []
+    total_frac_digits = payload.get("total_frac_digits") or []
     has_split = bool(total_int) and bool(total_frac)
-    # Need either single-ROI total or the split-ROI pair.
-    if total is None and not has_split:
-        return ("missing total ROI — configure either `total` (single-ROI mode) "
-                "or both `total_int` + `total_frac` (split-ROI mode)")
+    has_per_digit = bool(total_int_digits) and bool(total_frac_digits)
+    # Need either single-ROI total, the split-ROI pair, or per-digit lists
+    # covering both integer and fractional parts.
+    if total is None and not has_split and not has_per_digit:
+        return ("missing total ROI — configure either `total` (single-ROI "
+                "mode), both `total_int` + `total_frac` (split-ROI mode), "
+                "or both `total_int_digits` + `total_frac_digits` (per-digit mode)")
     # total is optional; validate shape only if drawn
     if total is not None:
         err = _valid_roi(total)
@@ -296,6 +314,17 @@ def validate_digital_payload(payload: dict) -> Optional[str]:
         err = _valid_roi(flow)
         if err:
             return f"flow: {err}"
+    # Per-digit ROI lists: each drawn rectangle is geometry-validated.
+    for list_key in ("total_int_digits", "total_frac_digits", "flow_digits"):
+        rois = payload.get(list_key) or []
+        if not isinstance(rois, list):
+            return f"{list_key} must be a list"
+        for i, r in enumerate(rois):
+            if r is None:
+                continue
+            err = _valid_roi(r)
+            if err:
+                return f"{list_key}[{i}]: {err}"
     anchors = payload.get("anchors", [])
     if not isinstance(anchors, list) or len(anchors) > ANCHOR_COUNT:
         return f"anchors must be a list of at most {ANCHOR_COUNT} entries"
@@ -724,11 +753,32 @@ const MECHANICAL_SLOTS = [
   { key: 'anchor_1', label: 'Anchor 1', color: '#6b7280', kind: 'anchor', idx: 1 },
   { key: 'anchor_2', label: 'Anchor 2', color: '#6b7280', kind: 'anchor', idx: 2 },
 ];
+// Per-digit slot generator — emits one `digit_cell` slot per expected digit
+// in a region. Slots stay visible even if the user doesn't draw them; unset
+// slots are simply excluded from the saved list.
+function digitCellSlots(listKey, labelPrefix, count, color) {
+  return Array.from({length: count}, (_, i) => ({
+    key: `${listKey}_${i}`,
+    label: `${labelPrefix} digit ${i + 1}`,
+    color,
+    kind: 'digit_cell',
+    list_key: listKey,
+    idx: i,
+  }));
+}
+
 const DIGITAL_SLOTS = [
+  // Single-ROI / split-ROI slots — legacy mode, keep supporting them.
   { key: 'total', label: 'Total (single-ROI mode)', color: '#4aa3ff', kind: 'digital' },
   { key: 'total_int',  label: 'Total integer (split mode)', color: '#5bb1ff', kind: 'digital' },
   { key: 'total_frac', label: 'Total fractional (split mode)', color: '#ffb547', kind: 'digital' },
   { key: 'flow',  label: 'Flow line (optional)', color: '#3ccf7b', kind: 'digital' },
+  // Per-digit slots — draw each rectangle tight around one digit. Unused
+  // slots (not drawn) are ignored. Mix and match with the single-ROI keys
+  // above; the runtime prefers per-digit lists when set.
+  ...digitCellSlots('total_int_digits', 'Total int', 6, '#74b6ff'),
+  ...digitCellSlots('total_frac_digits', 'Total frac', 4, '#ffc76e'),
+  ...digitCellSlots('flow_digits', 'Flow', 6, '#6ee09a'),
   { key: 'anchor_0', label: 'Anchor 0', color: '#6b7280', kind: 'anchor', idx: 0 },
   { key: 'anchor_1', label: 'Anchor 1', color: '#6b7280', kind: 'anchor', idx: 1 },
   { key: 'anchor_2', label: 'Anchor 2', color: '#6b7280', kind: 'anchor', idx: 2 },
@@ -777,6 +827,15 @@ async function loadConfig() {
     if (rois.total_int)  state.rois.total_int  = roiArrToObj(rois.total_int);
     if (rois.total_frac) state.rois.total_frac = roiArrToObj(rois.total_frac);
     if (rois.flow)  state.rois.flow  = roiArrToObj(rois.flow);
+    // Per-digit lists: hydrate each saved ROI into its numbered slot
+    // (`total_int_digits_0`, `_1`, ...). Slots beyond the saved list length
+    // stay empty so the user can see where they'd draw more if needed.
+    for (const listKey of ['total_int_digits', 'total_frac_digits', 'flow_digits']) {
+      const saved = rois[listKey] || [];
+      saved.forEach((r, i) => {
+        if (r) state.rois[`${listKey}_${i}`] = roiArrToObj(r);
+      });
+    }
   } else {
     if (rois.digits) state.rois.digits = roiArrToObj(rois.digits);
     rois.dials.forEach((d, i) => {
@@ -1000,11 +1059,24 @@ function buildPayload() {
     return r ? roiObjToArr(r) : null;
   });
   if (METER_TYPE === 'digital') {
+    // Collect per-digit lists by iterating DIGITAL_SLOTS in order (so the
+    // saved list preserves left-to-right ordering). Unset slots are
+    // skipped, so an unused slot just leaves the list shorter than the
+    // maximum — exactly what the runtime expects.
+    const lists = { total_int_digits: [], total_frac_digits: [], flow_digits: [] };
+    for (const s of SLOTS) {
+      if (s.kind !== 'digit_cell') continue;
+      const roi = state.rois[s.key];
+      if (roi) lists[s.list_key].push(roiObjToArr(roi));
+    }
     return {
       total:      state.rois.total      ? roiObjToArr(state.rois.total)      : null,
       total_int:  state.rois.total_int  ? roiObjToArr(state.rois.total_int)  : null,
       total_frac: state.rois.total_frac ? roiObjToArr(state.rois.total_frac) : null,
       flow:       state.rois.flow       ? roiObjToArr(state.rois.flow)       : null,
+      total_int_digits: lists.total_int_digits,
+      total_frac_digits: lists.total_frac_digits,
+      flow_digits: lists.flow_digits,
       anchors,
     };
   }

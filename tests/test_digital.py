@@ -30,6 +30,7 @@ from watermeter import (
     load_config,
     parse_digital_flow,
     parse_digital_total,
+    read_region_individual_digits,
     read_region_per_digit,
     run_digital_cycle,
     validate_digital_reading,
@@ -69,6 +70,9 @@ def _cfg_stub(**over):
         digital_per_digit_auto_detect=False,  # default tests use equal subdivision
         digital_ocr_upscale_factor=1,
         digital_save_ocr_crops=False,
+        digital_total_int_digits=[],
+        digital_total_frac_digits=[],
+        digital_flow_digits=[],
         debug_dir="/tmp",
         esp32_base_url="http://unused",
         image_timeout=1.0,
@@ -490,6 +494,67 @@ class TestRunDigitalCycle:
         assert result["success"] is False
         assert result["reason"] == "parse_failed"
         assert result["raw_total_int"] == "00000"
+
+    def test_individual_digits_mode_bypasses_subdivision(self, monkeypatch):
+        # When per-digit ROI lists are configured, the pipeline OCRs each
+        # ROI directly — no subdivision, no auto-detect. Gives the user
+        # pixel-perfect control over each digit's bounding box, useful for
+        # LCDs where digits aren't evenly spaced in a single enclosing ROI.
+        self._patch_capture(monkeypatch)
+        cfg = _cfg_stub(
+            digital_total_int_digits=[
+                [0.10, 0.25, 0.05, 0.10],
+                [0.17, 0.25, 0.05, 0.10],
+                [0.24, 0.25, 0.05, 0.10],
+                [0.31, 0.25, 0.05, 0.10],
+                [0.38, 0.25, 0.05, 0.10],
+                [0.45, 0.25, 0.05, 0.10],
+            ],
+            digital_total_frac_digits=[
+                [0.56, 0.31, 0.04, 0.08],
+                [0.62, 0.31, 0.04, 0.08],
+                [0.70, 0.31, 0.04, 0.08],  # extra gap before this one
+            ],
+            # digital_total_*_roi intentionally empty — individual-digits
+            # mode must still detect split mode is active.
+            digital_total_int_roi=[],
+            digital_total_frac_roi=[],
+        )
+        # 6 int + 3 frac + 1 flow-line-mode = 10 calls per attempt. All digits
+        # come back non-empty on first attempt → no line-mode fallback needed.
+        ocr = _FakeOCR([
+            "0", "0", "0", "0", "0", "0",
+            "1", "1", "8",
+            "00.000",
+        ])
+        result = run_digital_cycle(cfg, ocr, aligner=None, session=None,
+                                   prev_total=None, log=_StubLog(), sleep=_noop)
+        assert result["success"] is True
+        assert result["total"] == pytest.approx(0.118)
+        assert result["raw_total_int"] == "000000"
+        assert result["raw_total_frac"] == "118"
+
+    def test_individual_digits_missed_triggers_line_fallback(self, monkeypatch):
+        # When digit mode returns empty for one cell, the line-mode
+        # fallback inside the individual-digits path consumes the next
+        # script entry and tries to extract a digit from it.
+        self._patch_capture(monkeypatch)
+        cfg = _cfg_stub(
+            digital_total_int_digits=[[0.10 + i*0.07, 0.25, 0.05, 0.10] for i in range(6)],
+            digital_total_frac_digits=[[0.56 + i*0.06, 0.31, 0.04, 0.08] for i in range(3)],
+            digital_total_int_roi=[], digital_total_frac_roi=[],
+        )
+        # First frac digit: _run empty, read_line returns "1" → "1" survives.
+        ocr = _FakeOCR([
+            "0", "0", "0", "0", "0", "0",
+            "", "1",           # frac d0 empty + line fallback returns "1"
+            "1", "8",          # frac d1, d2
+            "00.000",
+        ])
+        result = run_digital_cycle(cfg, ocr, aligner=None, session=None,
+                                   prev_total=None, log=_StubLog(), sleep=_noop)
+        assert result["success"] is True
+        assert result["raw_total_frac"] == "118"
 
     def test_split_mode_wrong_view_when_both_empty(self, monkeypatch):
         # Both split reads come back empty — concat ".", digit count < 6.

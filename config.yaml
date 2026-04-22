@@ -133,6 +133,25 @@ rois:
 #     # becomes optional and can be removed.
 #     # total_int:  [0.10, 0.25, 0.48, 0.18]
 #     # total_frac: [0.58, 0.30, 0.22, 0.14]
+#     #
+#     # Per-digit mode — list ONE rect per digit, left-to-right. Use when
+#     # digits aren't evenly spaced in any single enclosing ROI, so no
+#     # subdivision can frame all of them correctly. Each rect is OCR'd
+#     # independently via the Swift digit helper, concatenated. Overrides
+#     # the subdivision-based `digital.total_*_digit_count` knobs when
+#     # set. Calibrate each rect tight around its digit with comfortable
+#     # padding on all sides (30% of digit width is a good default).
+#     # total_int_digits:
+#     #   - [0.100, 0.250, 0.060, 0.140]
+#     #   - [0.170, 0.250, 0.060, 0.140]
+#     #   # ... one entry per int digit
+#     # total_frac_digits:
+#     #   - [0.580, 0.305, 0.050, 0.090]
+#     #   - [0.640, 0.305, 0.050, 0.090]
+#     #   - [0.700, 0.305, 0.050, 0.090]
+#     # flow_digits:
+#     #   - [0.250, 0.500, 0.045, 0.150]
+#     #   # ...
 #     flow:  [0.25, 0.50, 0.55, 0.15]   # optional — line with "XX.YYY m³/h"; omit if flash glare hides it
 #
 # digital:
