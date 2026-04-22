@@ -16,7 +16,7 @@ import numpy as np
 import paho.mqtt.client as mqtt
 
 _DEFAULT_DIGITAL_TOTAL_REGEX = r"^\d{6}\.?\d{3}$"
-_DEFAULT_DIGITAL_FLOW_REGEX = r"^\d{1,3}\.\d{3}$"
+_DEFAULT_DIGITAL_FLOW_REGEX = r"^\d{2,5}\.?\d{3}$"
 
 def load_yaml(path): return yaml.safe_load(open(path,"r"))
 def save_json(path,obj):
@@ -709,12 +709,21 @@ def parse_digital_total(raw, regex):
 
 
 def parse_digital_flow(raw, regex):
-    """Parse the instantaneous-flow line (m³/h), e.g. "00.125"."""
+    """Parse the instantaneous-flow line (m³/h).
+
+    Accepts both dotted (`"00.125"`) and dotless (`"00125"`) forms — mirrors
+    parse_digital_total because Vision routinely drops the small baseline
+    decimal dot on 7-segment LCDs. When the regex matches but no "." is
+    present, the decimal is injected three places from the right (the meter's
+    fractional-digit count is a physical property, same as the total line).
+    """
     if raw is None:
         return None
     s = raw.strip()
     if not regex.match(s):
         return None
+    if "." not in s:
+        s = s[:-3] + "." + s[-3:]
     try:
         return float(s)
     except ValueError:
@@ -1112,12 +1121,19 @@ def draw_overlays(img, digits_rois_abs, per_digit_vals, dials_abs, dial_vals, di
 def draw_overlays_digital(img, total_roi_abs, flow_roi_abs,
                           raw_total_str, raw_flow_str,
                           parsed_total, parsed_flow,
-                          aligned_ok, cfg, out_path=None):
+                          aligned_ok, cfg, reason=None,
+                          out_path=None, log=None):
     """Overlay for digital LCD meters: two rectangles (total + flow), each
     labelled with what Vision read raw and what the parser produced.
     `raw_*_str` may be None/empty when the display was on a diag view at the
     moment of capture — we still draw the rectangle so ROI placement is
-    visible in the debug image."""
+    visible in the debug image.
+
+    `reason` is an optional failure tag ("wrong_view" / "parse_failed" /
+    "validate_failed" / "no_frame"); when set (and not "ok"), a coloured
+    banner is drawn across the top of the image so the debug JPEG visibly
+    distinguishes a rejected cycle from a successful one. Callers pass
+    reason="ok" or None on success."""
     ov, fs, th, o_th, box_th, status = _overlay_base(img, cfg, aligned_ok)
 
     def _draw_line(roi_abs, raw_str, parsed_val, label):
@@ -1135,8 +1151,26 @@ def draw_overlays_digital(img, total_roi_abs, flow_roi_abs,
     _draw_line(total_roi_abs, raw_total_str, parsed_total, "TOTAL m³")
     _draw_line(flow_roi_abs, raw_flow_str, parsed_flow, "FLOW m³/h")
 
+    if reason and reason != "ok":
+        # BGR. Failure banner helps during debugging — e.g. "all cycles giving
+        # up" is visually distinct from "service is up and reading normally".
+        banner_color = {
+            "wrong_view":      (30, 30, 200),    # red
+            "parse_failed":    (30, 140, 230),   # orange
+            "validate_failed": (30, 180, 230),   # yellow-orange
+            "no_frame":        (100, 100, 100),  # gray
+        }.get(reason, (30, 30, 200))
+        banner_h = max(20, int(28 * fs))
+        cv2.rectangle(ov, (0, 0), (ov.shape[1], banner_h), banner_color, -1)
+        _draw_label(ov, f"REJECTED: {reason}", (8, int(20 * fs)),
+                    fs * 0.85, (255, 255, 255), th, o_th)
+
     if out_path:
-        cv2.imwrite(out_path, ov)
+        try:
+            cv2.imwrite(out_path, ov)
+        except Exception as e:
+            if log is not None:
+                log.warning("Failed to save overlay to %s: %s", out_path, e)
     return ov
 
 
@@ -1205,16 +1239,33 @@ def run_digital_cycle(cfg, ocr, aligner, session, prev_total, log, sleep=time.sl
     cfg.digital_retry_delay_sec (which must exceed the longest diag-view dwell
     so successive captures don't phase-lock onto the same wrong view).
 
-    Returns a dict on first valid read:
-        {"frame": ndarray, "aligned_ok": bool,
-         "total": float, "flow_m3h": float,
-         "raw_total": str, "raw_flow": str}
-    Returns None if every attempt failed — caller should hold the previous
-    value, log, and try again next main-loop iteration.
+    Always returns a result dict, never None. The dict has the shape:
+        {"success": bool,
+         "reason":  "ok" | "wrong_view" | "parse_failed" | "validate_failed" | "no_frame",
+         "frame":   ndarray | None,           # None only when every capture failed
+         "aligned_ok": bool,
+         "raw_total": str | None,
+         "raw_flow":  str | None,
+         "total":     float | None,
+         "flow_m3h":  float | None}
+    On failure the dict mirrors the LAST attempt's state so the caller can
+    still draw a debug overlay (showing the ROI box + raw OCR + reject reason)
+    — previously the function returned None on failure and the overlay path
+    was skipped entirely, which left users without visual diagnostics.
 
     `sleep` is injected so tests can run this loop without real sleeps.
     """
     attempts = cfg.digital_max_retries + 1
+    last = {
+        "success": False,
+        "reason": "no_frame",
+        "frame": None,
+        "aligned_ok": False,
+        "raw_total": None,
+        "raw_flow": None,
+        "total": None,
+        "flow_m3h": None,
+    }
     for attempt in range(attempts):
         frame = capture_frame(cfg, session, log)
         if frame is None:
@@ -1242,11 +1293,21 @@ def run_digital_cycle(cfg, ocr, aligner, session, prev_total, log, sleep=time.sl
         raw_flow = (ocr.read_line(ocr_path, cfg.digital_flow_roi)
                     if cfg.digital_flow_roi else None)
 
+        last.update({
+            "frame": aligned_img,
+            "aligned_ok": aligned_ok,
+            "raw_total": raw_total,
+            "raw_flow": raw_flow,
+            "total": None,
+            "flow_m3h": None,
+        })
+
         if not is_valid_digital_view(raw_total, raw_flow, cfg):
             log.info(
                 "Wrong display view (attempt %d/%d): total=%r flow=%r",
                 attempt + 1, attempts, raw_total, raw_flow,
             )
+            last["reason"] = "wrong_view"
             if attempt < attempts - 1:
                 sleep(cfg.digital_retry_delay_sec)
             continue
@@ -1254,17 +1315,34 @@ def run_digital_cycle(cfg, ocr, aligner, session, prev_total, log, sleep=time.sl
         total = parse_digital_total(raw_total, cfg.digital_total_regex)
         flow = (parse_digital_flow(raw_flow, cfg.digital_flow_regex)
                 if cfg.digital_flow_roi else None)
+        last["total"] = total
+        last["flow_m3h"] = flow
+
+        parse_ok = total is not None and (flow is not None or not cfg.digital_flow_roi)
+        if not parse_ok:
+            log.warning(
+                "Parse failed (attempt %d/%d): raw_total=%r raw_flow=%r parsed=(%s, %s)",
+                attempt + 1, attempts, raw_total, raw_flow, total, flow,
+            )
+            last["reason"] = "parse_failed"
+            if attempt < attempts - 1:
+                sleep(cfg.digital_retry_delay_sec)
+            continue
+
         if not validate_digital_reading(total, flow, prev_total, cfg):
             log.warning(
-                "Parse/validate failed (attempt %d/%d): raw_total=%r raw_flow=%r "
+                "Validate failed (attempt %d/%d): raw_total=%r raw_flow=%r "
                 "parsed=(%s, %s) prev=%s",
                 attempt + 1, attempts, raw_total, raw_flow, total, flow, prev_total,
             )
+            last["reason"] = "validate_failed"
             if attempt < attempts - 1:
                 sleep(cfg.digital_retry_delay_sec)
             continue
 
         return {
+            "success": True,
+            "reason": "ok",
             "frame": aligned_img,
             "aligned_ok": aligned_ok,
             "total": total,
@@ -1273,7 +1351,7 @@ def run_digital_cycle(cfg, ocr, aligner, session, prev_total, log, sleep=time.sl
             "raw_flow": raw_flow,
         }
 
-    return None
+    return last
 
 def _hhmm_to_min(s: str) -> int:
     h, m = map(int, s.split(":"))
@@ -1407,11 +1485,6 @@ def main():
 
         if cfg.meter_type == "digital":
             result = run_digital_cycle(cfg, ocr, aligner, session, prev_total, log)
-            if result is None:
-                log.warning("Giving up this cycle — no valid numeric view within retry budget")
-                elapsed = time.time() - t0
-                time.sleep(max(0.0, target_interval - elapsed))
-                continue
 
             img = result["frame"]
             aligned_ok = result["aligned_ok"]
@@ -1419,71 +1492,84 @@ def main():
             flow_m3h = result["flow_m3h"]
             raw_total_str = result["raw_total"]
             raw_flow_str = result["raw_flow"]
+            success = result["success"]
+            reason = result["reason"]
 
-            # Guards mirror the mechanical clamp so HA always sees a monotonic total.
-            publish_total = total
             now = time.time()
-            if prev_total is not None:
-                if total + cfg.monotonic_epsilon < prev_total:
-                    log.warning(
-                        f"CLAMP: negative step detected "
-                        f"(total={total:.6f} < prev={prev_total:.6f} - eps). Holding previous."
+            publish_total = None
+
+            if success:
+                # Guards mirror the mechanical clamp so HA always sees a monotonic total.
+                publish_total = total
+                if prev_total is not None:
+                    if total + cfg.monotonic_epsilon < prev_total:
+                        log.warning(
+                            f"CLAMP: negative step detected "
+                            f"(total={total:.6f} < prev={prev_total:.6f} - eps). Holding previous."
+                        )
+                        publish_total = prev_total
+                    elif total - prev_total > cfg.big_jump_guard:
+                        log.warning(
+                            f"CLAMP: big jump detected "
+                            f"(Δ={total - prev_total:.6f} > guard={cfg.big_jump_guard}). Holding previous."
+                        )
+                        publish_total = prev_total
+
+                rate = 0.0
+                if prev_total is not None and prev_ts is not None and now > prev_ts:
+                    dv = max(0.0, publish_total - prev_total)
+                    dt = (now - prev_ts) / 60.0
+                    rate = dv / dt if dt > 1e-6 else 0.0
+                rate_lpm = rate * 1000.0
+
+                base = cfg.mqtt_main_topic
+                mqttc.publish(f"{base}/main/value", f"{publish_total:.6f}", retain=True)
+                mqttc.publish(f"{base}/main/rate", f"{rate:.6f}", retain=False)
+                mqttc.publish(f"{base}/main/rate_lpm", f"{rate_lpm:.3f}", retain=False)
+                if flow_m3h is not None:
+                    mqttc.publish(f"{base}/main/flow_m3h", f"{flow_m3h:.3f}", retain=False)
+
+                prev_total = publish_total
+                prev_ts = now
+                save_json(cfg.state_path, {
+                    "total": prev_total,
+                    "ts": prev_ts,
+                    "meter_type": cfg.meter_type,
+                    "dial_histories": {},
+                })
+            else:
+                log.warning("Giving up this cycle (reason=%s) — holding previous total", reason)
+
+            # Always draw the overlay (when we have a frame), even on failure —
+            # the debug JPEG is how the user tunes ROIs and diagnoses wrong-view
+            # or parse issues. Gated on having a captured frame; "no_frame" means
+            # every capture failed and we have nothing to annotate.
+            if img is not None:
+                should_save_overlay = cfg.save_debug_overlays
+                should_publish_overlay = getattr(cfg, "overlay_publish_mqtt", True)
+                if should_save_overlay or should_publish_overlay:
+                    out = None
+                    if should_save_overlay:
+                        ensure_dir(cfg.debug_dir)
+                        out = (os.path.join(cfg.debug_dir, "overlay_latest.jpg")
+                               if getattr(cfg, "debug_keep_latest_only", True)
+                               else os.path.join(cfg.debug_dir, f"overlay_{int(now)}.jpg"))
+                    Hi, Wi = img.shape[:2]
+                    total_abs = norm_to_abs(cfg.digital_total_roi, Wi, Hi) if cfg.digital_total_roi else None
+                    flow_abs = norm_to_abs(cfg.digital_flow_roi, Wi, Hi) if cfg.digital_flow_roi else None
+                    overlay_total = publish_total if success else total
+                    ov_img = draw_overlays_digital(
+                        img, total_abs, flow_abs,
+                        raw_total_str, raw_flow_str,
+                        overlay_total, flow_m3h,
+                        aligned_ok, cfg, reason=reason, out_path=out, log=log,
                     )
-                    publish_total = prev_total
-                elif total - prev_total > cfg.big_jump_guard:
-                    log.warning(
-                        f"CLAMP: big jump detected "
-                        f"(Δ={total - prev_total:.6f} > guard={cfg.big_jump_guard}). Holding previous."
-                    )
-                    publish_total = prev_total
-
-            rate = 0.0
-            if prev_total is not None and prev_ts is not None and now > prev_ts:
-                dv = max(0.0, publish_total - prev_total)
-                dt = (now - prev_ts) / 60.0
-                rate = dv / dt if dt > 1e-6 else 0.0
-            rate_lpm = rate * 1000.0
-
-            base = cfg.mqtt_main_topic
-            mqttc.publish(f"{base}/main/value", f"{publish_total:.6f}", retain=True)
-            mqttc.publish(f"{base}/main/rate", f"{rate:.6f}", retain=False)
-            mqttc.publish(f"{base}/main/rate_lpm", f"{rate_lpm:.3f}", retain=False)
-            if flow_m3h is not None:
-                mqttc.publish(f"{base}/main/flow_m3h", f"{flow_m3h:.3f}", retain=False)
-
-            should_save_overlay = cfg.save_debug_overlays
-            should_publish_overlay = getattr(cfg, "overlay_publish_mqtt", True)
-            if should_save_overlay or should_publish_overlay:
-                out = None
-                if should_save_overlay:
-                    ensure_dir(cfg.debug_dir)
-                    out = (os.path.join(cfg.debug_dir, "overlay_latest.jpg")
-                           if getattr(cfg, "debug_keep_latest_only", True)
-                           else os.path.join(cfg.debug_dir, f"overlay_{int(now)}.jpg"))
-                Hi, Wi = img.shape[:2]
-                total_abs = norm_to_abs(cfg.digital_total_roi, Wi, Hi) if cfg.digital_total_roi else None
-                flow_abs = norm_to_abs(cfg.digital_flow_roi, Wi, Hi) if cfg.digital_flow_roi else None
-                ov_img = draw_overlays_digital(
-                    img, total_abs, flow_abs,
-                    raw_total_str, raw_flow_str,
-                    publish_total, flow_m3h,
-                    aligned_ok, cfg, out_path=out,
-                )
-                if should_publish_overlay:
-                    topic = getattr(cfg, "overlay_camera_topic", f"{cfg.mqtt_main_topic}/debug/overlay")
-                    jpeg_q = int(getattr(cfg, "overlay_jpeg_quality", 85))
-                    ok, buf = cv2.imencode(".jpg", ov_img, [int(cv2.IMWRITE_JPEG_QUALITY), jpeg_q])
-                    if ok:
-                        mqttc.publish(topic, buf.tobytes(), retain=True)
-
-            prev_total = publish_total
-            prev_ts = now
-            save_json(cfg.state_path, {
-                "total": prev_total,
-                "ts": prev_ts,
-                "meter_type": cfg.meter_type,
-                "dial_histories": {},
-            })
+                    if should_publish_overlay:
+                        topic = getattr(cfg, "overlay_camera_topic", f"{cfg.mqtt_main_topic}/debug/overlay")
+                        jpeg_q = int(getattr(cfg, "overlay_jpeg_quality", 85))
+                        ok, buf = cv2.imencode(".jpg", ov_img, [int(cv2.IMWRITE_JPEG_QUALITY), jpeg_q])
+                        if ok:
+                            mqttc.publish(topic, buf.tobytes(), retain=True)
 
             elapsed = time.time() - t0
             time.sleep(max(0.0, target_interval - elapsed))

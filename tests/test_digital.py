@@ -38,7 +38,7 @@ from watermeter import (
 # ---------------------------------------------------------------------------
 
 TOTAL_RE = re.compile(r"^\d{6}\.?\d{3}$")
-FLOW_RE = re.compile(r"^\d{1,3}\.\d{3}$")
+FLOW_RE = re.compile(r"^\d{2,5}\.?\d{3}$")
 
 
 def _cfg_stub(**over):
@@ -104,8 +104,17 @@ class TestParseDigitalFlow:
     def test_rejects_negative_sign(self):
         assert parse_digital_flow("-0.100", FLOW_RE) is None
 
-    def test_rejects_missing_decimal(self):
-        assert parse_digital_flow("12345", FLOW_RE) is None
+    def test_dotless_form_injects_decimal(self):
+        # Vision routinely drops the small baseline dot on 7-segment LCDs —
+        # the parser must accept dotless forms and inject "." at position -3
+        # (symmetric with parse_digital_total's behaviour).
+        assert parse_digital_flow("00000", FLOW_RE) == pytest.approx(0.0)
+        assert parse_digital_flow("12345", FLOW_RE) == pytest.approx(12.345)
+
+    def test_rejects_too_short(self):
+        # Below the minimum number of expected integer digits.
+        assert parse_digital_flow("1234", FLOW_RE) is None
+        assert parse_digital_flow("0", FLOW_RE) is None
 
     def test_none_returns_none(self):
         assert parse_digital_flow(None, FLOW_RE) is None
@@ -248,7 +257,8 @@ class TestRunDigitalCycle:
         ocr = _FakeOCR(_flatten([("000100.000", "00.125")]))
         result = run_digital_cycle(cfg, ocr, aligner=None, session=None,
                                    prev_total=None, log=_StubLog(), sleep=_noop)
-        assert result is not None
+        assert result["success"] is True
+        assert result["reason"] == "ok"
         assert result["total"] == pytest.approx(100.0)
         assert result["flow_m3h"] == pytest.approx(0.125)
         assert result["raw_total"] == "000100.000"
@@ -264,19 +274,51 @@ class TestRunDigitalCycle:
         ]))
         result = run_digital_cycle(cfg, ocr, aligner=None, session=None,
                                    prev_total=None, log=_StubLog(), sleep=_noop)
-        assert result is not None
+        assert result["success"] is True
         assert result["total"] == pytest.approx(1234.567)
         assert calls["n"] == 3
 
-    def test_returns_none_when_all_attempts_fail(self, monkeypatch):
+    def test_returns_failure_dict_when_all_attempts_wrong_view(self, monkeypatch):
         calls = self._patch_capture(monkeypatch)
         cfg = _cfg_stub(digital_max_retries=2)
-        # All three captures see diag screens — caller should skip the cycle.
+        # All three captures see diag screens — returns a failure dict with
+        # the last-attempt state so callers can still draw a debug overlay.
         ocr = _FakeOCR(_flatten([("", ""), ("", ""), ("", "")]))
         result = run_digital_cycle(cfg, ocr, aligner=None, session=None,
                                    prev_total=None, log=_StubLog(), sleep=_noop)
-        assert result is None
+        assert result["success"] is False
+        assert result["reason"] == "wrong_view"
+        assert result["frame"] is not None   # last attempt's frame kept
+        assert result["total"] is None
+        assert result["flow_m3h"] is None
         assert calls["n"] == 3  # max_retries + 1 attempts
+
+    def test_failure_dict_preserves_last_raw_strings(self, monkeypatch):
+        # When attempts fail, the last attempt's raw OCR output is preserved
+        # so draw_overlays_digital can render it in the debug JPEG.
+        self._patch_capture(monkeypatch)
+        cfg = _cfg_stub(digital_max_retries=2)
+        ocr = _FakeOCR(_flatten([
+            ("first", "x"),
+            ("second", "y"),
+            ("last-attempt", "z"),
+        ]))
+        result = run_digital_cycle(cfg, ocr, aligner=None, session=None,
+                                   prev_total=None, log=_StubLog(), sleep=_noop)
+        assert result["success"] is False
+        assert result["raw_total"] == "last-attempt"
+        assert result["raw_flow"] == "z"
+
+    def test_no_frame_reason_when_every_capture_fails(self, monkeypatch):
+        # Every capture returns None → no frame to overlay, reason="no_frame".
+        self._patch_capture(monkeypatch, returns_seq=[None, None, None])
+        cfg = _cfg_stub(digital_max_retries=2)
+        ocr = _FakeOCR([])  # OCR never called
+        result = run_digital_cycle(cfg, ocr, aligner=None, session=None,
+                                   prev_total=None, log=_StubLog(), sleep=_noop)
+        assert result["success"] is False
+        assert result["reason"] == "no_frame"
+        assert result["frame"] is None
 
     def test_capture_failure_still_retries(self, monkeypatch):
         # Mix HTTP/decode failures with successful captures; the cycle must
@@ -286,19 +328,34 @@ class TestRunDigitalCycle:
         ocr = _FakeOCR(_flatten([("000100.000", "00.125")]))
         result = run_digital_cycle(cfg, ocr, aligner=None, session=None,
                                    prev_total=None, log=_StubLog(), sleep=_noop)
-        assert result is not None
+        assert result["success"] is True
         assert result["total"] == pytest.approx(100.0)
 
     def test_rejects_when_parsed_value_violates_big_jump(self, monkeypatch):
         # Valid view with valid digits, but total jumped by more than big_jump_guard.
-        # Even though the cheap view-check passes, the parsed reading is invalid
-        # against prev_total and we bail out.
+        # The cycle returns success=False with reason="validate_failed".
         self._patch_capture(monkeypatch)
         cfg = _cfg_stub(digital_max_retries=0, big_jump_guard=1.0)
         ocr = _FakeOCR(_flatten([("000200.000", "00.100")]))
         result = run_digital_cycle(cfg, ocr, aligner=None, session=None,
                                    prev_total=100.0, log=_StubLog(), sleep=_noop)
-        assert result is None
+        assert result["success"] is False
+        assert result["reason"] == "validate_failed"
+        # Parsed values are preserved so the overlay can annotate them.
+        assert result["total"] == pytest.approx(200.0)
+        assert result["flow_m3h"] == pytest.approx(0.1)
+
+    def test_parse_failure_reason_on_garbage_digits(self, monkeypatch):
+        # Cheap view-check accepts (≥6 digits) but the strict total regex fails.
+        # Returns success=False reason="parse_failed".
+        self._patch_capture(monkeypatch)
+        cfg = _cfg_stub(digital_max_retries=0)
+        ocr = _FakeOCR(_flatten([("1234567", "00000")]))  # total: 7 digits — regex rejects
+        result = run_digital_cycle(cfg, ocr, aligner=None, session=None,
+                                   prev_total=None, log=_StubLog(), sleep=_noop)
+        assert result["success"] is False
+        assert result["reason"] == "parse_failed"
+        assert result["raw_total"] == "1234567"
 
     def test_flow_disabled_only_reads_total(self, monkeypatch):
         # When digital_flow_roi is empty, run_digital_cycle must NOT call
@@ -308,7 +365,7 @@ class TestRunDigitalCycle:
         ocr = _FakeOCR(["000100.000"])  # exactly one read expected, not two
         result = run_digital_cycle(cfg, ocr, aligner=None, session=None,
                                    prev_total=None, log=_StubLog(), sleep=_noop)
-        assert result is not None
+        assert result["success"] is True
         assert result["total"] == pytest.approx(100.0)
         assert result["flow_m3h"] is None
         assert result["raw_flow"] is None
@@ -437,3 +494,39 @@ class TestDrawOverlaysDigital:
             aligned_ok=False, cfg=self._cfg(),
         )
         assert ov.shape == img.shape
+
+    def test_failure_banner_rendered_when_reason_set(self):
+        # On failure, a coloured banner is drawn across the top of the image
+        # so the debug JPEG visibly distinguishes rejected cycles. We don't
+        # assert exact pixels — just that the top strip changed from the
+        # baseline grey we painted.
+        img = np.full((240, 640, 3), 30, dtype=np.uint8)
+        ov = draw_overlays_digital(
+            img,
+            total_roi_abs=(40, 50, 400, 40),
+            flow_roi_abs=(40, 120, 400, 40),
+            raw_total_str="F6A 1d426", raw_flow_str="CrC",
+            parsed_total=None, parsed_flow=None,
+            aligned_ok=True, cfg=self._cfg(),
+            reason="wrong_view",
+        )
+        top_strip = ov[0:8, :, :]
+        # Banner is red-ish (BGR (30, 30, 200)); at minimum, the red channel
+        # should dominate the top strip's mean, unlike the baseline grey.
+        assert top_strip[:, :, 2].mean() > top_strip[:, :, 0].mean() + 50
+
+    def test_ok_reason_does_not_render_banner(self):
+        # When reason is "ok" (or None), no banner is drawn.
+        img = np.full((240, 640, 3), 30, dtype=np.uint8)
+        ov = draw_overlays_digital(
+            img,
+            total_roi_abs=(40, 50, 400, 40),
+            flow_roi_abs=(40, 120, 400, 40),
+            raw_total_str="000100.000", raw_flow_str="00.125",
+            parsed_total=100.0, parsed_flow=0.125,
+            aligned_ok=True, cfg=self._cfg(),
+            reason="ok",
+        )
+        top_strip = ov[0:8, :, :]
+        # Baseline grey stays roughly equal across channels.
+        assert abs(top_strip[:, :, 2].mean() - top_strip[:, :, 0].mean()) < 20

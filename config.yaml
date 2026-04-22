@@ -124,9 +124,12 @@ rois:
 #     flow:  [0.25, 0.50, 0.55, 0.15]   # optional — line with "XX.YYY m³/h"; omit if flash glare hides it
 #
 # digital:
-#   # Regex must match Vision's output with or without an auto-detected decimal:
+#   # Regex must match Vision's output with or without an auto-detected decimal —
+#   # the small baseline dot on many 7-segment LCDs is routinely dropped by OCR.
+#   # Both parsers inject "." at position -3 when the regex matches but no dot
+#   # is present, so a dotless read like "00000" is accepted as "00.000".
 #   total_regex: "^\\d{6}\\.?\\d{3}$"
-#   flow_regex:  "^\\d{1,3}\\.\\d{3}$"
+#   flow_regex:  "^\\d{2,5}\\.?\\d{3}$"
 #   max_retries: 2               # extra captures per cycle if wrong view detected
 #   retry_delay_sec: 5.5         # > longest diag-view dwell (5s) so retries phase-cross
 #   min_digits: 6                # cheap-fail bar for diagnostic screens
