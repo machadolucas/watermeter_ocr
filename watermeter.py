@@ -147,6 +147,12 @@ class Config:
     digital_total_frac_digit_count: int = 0
     digital_flow_digit_count: int = 0
     digital_per_digit_inset: float = 0.10
+    # When True (default) per-digit mode tries to auto-detect each digit's
+    # bounding box via vertical projection before falling back to equal
+    # subdivision. This self-corrects minor calibration offsets in the
+    # outer ROI. Set False to always use equal subdivision — useful when
+    # projection is confused by a busy background.
+    digital_per_digit_auto_detect: bool = True
 
 def load_config(path)->Config:
     raw=load_yaml(path)
@@ -228,6 +234,7 @@ def load_config(path)->Config:
         digital_total_frac_digit_count = int(dig.get("total_frac_digit_count", 0)),
         digital_flow_digit_count = int(dig.get("flow_digit_count", 0)),
         digital_per_digit_inset = float(dig.get("per_digit_inset", 0.10)),
+        digital_per_digit_auto_detect = bool(dig.get("per_digit_auto_detect", True)),
     )
 
 class VisionOCR:
@@ -1259,31 +1266,133 @@ def build_digit_rois(cfg,W,H):
     return rois
 
 
-def read_region_per_digit(ocr, img_path, base_roi, digit_count, inset=0.10):
+def _equal_subdivide_roi(base_roi, count, inset):
+    """Split base_roi into `count` equal-width horizontal cells, shrunk
+    inward by `inset` fraction. Returns normalized [x,y,w,h] sub-ROIs."""
+    x, y, w, h = base_roi
+    dw = w / count
+    return [[x + i * dw + dw * inset,
+             y + h * inset,
+             dw * (1 - 2 * inset),
+             h * (1 - 2 * inset)]
+            for i in range(count)]
+
+
+def _auto_detect_digit_sub_rois(img_path, base_roi, expected_count, inset):
+    """Detect digit bounding rects inside `base_roi` using a vertical-pixel
+    projection of the binarized crop. Returns a list of `expected_count`
+    normalized sub-ROIs sorted left-to-right, or None if detection can't
+    reliably identify exactly that many digits (caller should fall back to
+    equal subdivision).
+
+    How it works: crop the ROI, Otsu-threshold to binary (digits = white),
+    sum "ink" per column, mark columns above 15% of the peak as "in a
+    digit". Contiguous ink runs → one digit each; runs below a minimum
+    width are discarded as noise. If we get exactly `expected_count` runs
+    we return them (with `inset` padding); otherwise None.
+    """
+    img = cv2.imread(img_path)
+    if img is None:
+        return None
+    Hf, Wf = img.shape[:2]
+    ax, ay, aw, ah = norm_to_abs(base_roi, Wf, Hf)
+    if aw <= 0 or ah <= 0:
+        return None
+    crop = img[ay:ay + ah, ax:ax + aw]
+    if crop.size == 0:
+        return None
+
+    gray = cv2.cvtColor(crop, cv2.COLOR_BGR2GRAY) if crop.ndim == 3 else crop
+    _, thr = cv2.threshold(gray, 0, 255,
+                           cv2.THRESH_BINARY_INV | cv2.THRESH_OTSU)
+    ch, cw = thr.shape
+    if cw == 0 or ch == 0:
+        return None
+
+    profile = (thr > 0).sum(axis=0)
+    if profile.max() == 0:
+        return None
+    ink = profile > profile.max() * 0.15
+
+    runs = []
+    start = None
+    for i, v in enumerate(ink):
+        if v and start is None:
+            start = i
+        elif not v and start is not None:
+            runs.append((start, i))
+            start = None
+    if start is not None:
+        runs.append((start, len(ink)))
+
+    # Drop runs too narrow to be a real digit (< 1/(3N) of the crop width).
+    min_w = max(2, cw // (expected_count * 3))
+    runs = [r for r in runs if r[1] - r[0] >= min_w]
+    if len(runs) != expected_count:
+        return None
+
+    # Convert crop-pixel rects → full-image normalized sub-ROIs, padded by
+    # `inset` on each side to keep some whitespace around each glyph.
+    subs = []
+    for (x0, x1) in runs:
+        w_px = x1 - x0
+        pad_x = max(1, int(w_px * inset))
+        pad_y = max(1, int(ch * inset))
+        px0 = max(0, x0 - pad_x)
+        px1 = min(cw, x1 + pad_x)
+        py0 = pad_y
+        py1 = ch - pad_y
+        subs.append([
+            (ax + px0) / Wf,
+            (ay + py0) / Hf,
+            (px1 - px0) / Wf,
+            (py1 - py0) / Hf,
+        ])
+    return subs
+
+
+def build_digit_sub_rois(img_path, base_roi, expected_count, inset=0.10,
+                         auto_detect=True):
+    """Build normalized sub-ROIs for per-digit OCR.
+
+    When `auto_detect` is True (default), tries to locate each digit's
+    bounding box inside `base_roi` via vertical projection so small
+    miscalibrations of the outer ROI are self-corrected. Falls back to
+    equal subdivision when detection fails or finds the wrong number of
+    runs. Returns exactly `expected_count` sub-ROIs either way.
+    """
+    if not base_roi or expected_count <= 0:
+        return []
+    if auto_detect:
+        detected = _auto_detect_digit_sub_rois(img_path, base_roi,
+                                               expected_count, inset)
+        if detected is not None:
+            return detected
+    return _equal_subdivide_roi(base_roi, expected_count, inset)
+
+
+def read_region_per_digit(ocr, img_path, base_roi, digit_count, inset=0.10,
+                          auto_detect=True):
     """OCR a line region digit-by-digit and return the concatenated string.
 
-    Splits `base_roi` into `digit_count` equal-width sub-ROIs (each shrunk
-    inward by `inset` to avoid the neighbour's edge leaking in), calls the
-    single-digit OCR mode on each, and joins the outputs. More robust than
-    line OCR for LCDs where Vision's line recognizer drops narrow glyphs or
-    flips rotation-ambiguous small digits — every sub-ROI is a one-character
-    classification with no line-segmentation involved.
+    Builds sub-ROIs (auto-detected when possible, else equal subdivision),
+    calls the single-digit OCR mode on each, and joins the outputs. More
+    robust than line OCR for LCDs where Vision's line recognizer drops
+    narrow glyphs or flips rotation-ambiguous small digits — every sub-ROI
+    is a one-character classification with no line-segmentation involved.
 
     Returns "" (not None) if the ROI is empty or digit_count <= 0, so the
-    downstream concat / regex match treats it as a failed read rather than a
-    crash. Each digit that OCR couldn't read contributes an empty string to
-    the join, which naturally shortens the output and fails the strict
+    downstream concat / regex match treats it as a failed read rather than
+    a crash. Each digit that OCR couldn't read contributes an empty string
+    to the join, which naturally shortens the output and fails the strict
     regex on the total/flow parsers.
     """
     if not base_roi or digit_count <= 0:
         return ""
-    x, y, w, h = base_roi
-    dw = w / digit_count
+    subs = build_digit_sub_rois(img_path, base_roi, digit_count, inset,
+                                auto_detect)
     digits = []
-    for i in range(digit_count):
-        sx = x + i * dw
-        sub = [sx + dw * inset, y + h * inset,
-               dw * (1 - 2 * inset), h * (1 - 2 * inset)]
+    for sub in subs:
         digits.append(ocr._run(img_path, sub, "full") or "")
     return "".join(digits)
 
@@ -1336,7 +1445,8 @@ def capture_frame(cfg, session, log):
     return raw
 
 
-def run_digital_cycle(cfg, ocr, aligner, session, prev_total, log, sleep=time.sleep):
+def run_digital_cycle(cfg, ocr, aligner, session, prev_total, log,
+                      sleep=time.sleep, on_attempt=None):
     """Capture + OCR one digital-meter reading, retrying on wrong-view frames.
 
     The LCD auto-cycles between a numeric view and two diagnostic views. A
@@ -1359,8 +1469,24 @@ def run_digital_cycle(cfg, ocr, aligner, session, prev_total, log, sleep=time.sl
     — previously the function returned None on failure and the overlay path
     was skipped entirely, which left users without visual diagnostics.
 
+    `on_attempt` is an optional callable invoked after each attempt with the
+    current state dict (same shape as the final return, but mutated per
+    attempt). The main loop uses it to write the debug overlay every
+    attempt rather than once per cycle — so users diagnosing wrong-view /
+    parse-failed cycles see the overlay JPEG refreshed every ~retry_delay
+    seconds instead of every ~interval seconds. Callback exceptions are
+    logged and swallowed to keep the cycle running.
+
     `sleep` is injected so tests can run this loop without real sleeps.
     """
+    def _notify(state):
+        if on_attempt is None:
+            return
+        try:
+            on_attempt(dict(state))
+        except Exception as e:
+            log.warning("on_attempt callback failed: %s", e)
+
     attempts = cfg.digital_max_retries + 1
     last = {
         "success": False,
@@ -1416,8 +1542,11 @@ def run_digital_cycle(cfg, ocr, aligner, session, prev_total, log, sleep=time.sl
             if not roi:
                 return None
             if digit_count > 0:
-                return read_region_per_digit(ocr, ocr_path, roi, digit_count,
-                                             cfg.digital_per_digit_inset)
+                return read_region_per_digit(
+                    ocr, ocr_path, roi, digit_count,
+                    cfg.digital_per_digit_inset,
+                    auto_detect=cfg.digital_per_digit_auto_detect,
+                )
             return ocr.read_line(ocr_path, roi)
 
         raw_total_int = None
@@ -1453,6 +1582,7 @@ def run_digital_cycle(cfg, ocr, aligner, session, prev_total, log, sleep=time.sl
                 attempt + 1, attempts, raw_total, raw_flow,
             )
             last["reason"] = "wrong_view"
+            _notify(last)
             if attempt < attempts - 1:
                 sleep(cfg.digital_retry_delay_sec)
             continue
@@ -1470,6 +1600,7 @@ def run_digital_cycle(cfg, ocr, aligner, session, prev_total, log, sleep=time.sl
                 attempt + 1, attempts, raw_total, raw_flow, total, flow,
             )
             last["reason"] = "parse_failed"
+            _notify(last)
             if attempt < attempts - 1:
                 sleep(cfg.digital_retry_delay_sec)
             continue
@@ -1481,11 +1612,12 @@ def run_digital_cycle(cfg, ocr, aligner, session, prev_total, log, sleep=time.sl
                 attempt + 1, attempts, raw_total, raw_flow, total, flow, prev_total,
             )
             last["reason"] = "validate_failed"
+            _notify(last)
             if attempt < attempts - 1:
                 sleep(cfg.digital_retry_delay_sec)
             continue
 
-        return {
+        result = {
             "success": True,
             "reason": "ok",
             "frame": aligned_img,
@@ -1497,6 +1629,8 @@ def run_digital_cycle(cfg, ocr, aligner, session, prev_total, log, sleep=time.sl
             "raw_total_frac": raw_total_frac,
             "raw_flow": raw_flow,
         }
+        _notify(result)
+        return result
 
     return last
 
@@ -1631,7 +1765,55 @@ def main():
         mqttc.ensure_connection()
 
         if cfg.meter_type == "digital":
-            result = run_digital_cycle(cfg, ocr, aligner, session, prev_total, log)
+            # Per-attempt overlay callback — called inside run_digital_cycle
+            # after every OCR attempt (success or failure). We redraw +
+            # overwrite ~/watermeter/debug/overlay_latest.jpg every attempt
+            # so the debug image reflects the most recent capture instead of
+            # only the final attempt of the cycle. Also re-publishes the
+            # overlay on MQTT so HA's camera entity updates in near-real-time.
+            def _overlay_for_attempt(state):
+                sub_img = state.get("frame")
+                if sub_img is None:
+                    return
+                should_save = cfg.save_debug_overlays
+                should_publish = getattr(cfg, "overlay_publish_mqtt", True)
+                if not (should_save or should_publish):
+                    return
+                out_path = None
+                if should_save:
+                    ensure_dir(cfg.debug_dir)
+                    out_path = (os.path.join(cfg.debug_dir, "overlay_latest.jpg")
+                                if getattr(cfg, "debug_keep_latest_only", True)
+                                else os.path.join(cfg.debug_dir,
+                                                  f"overlay_{int(time.time())}.jpg"))
+                Hi, Wi = sub_img.shape[:2]
+                t_abs = norm_to_abs(cfg.digital_total_roi, Wi, Hi) if cfg.digital_total_roi else None
+                f_abs = norm_to_abs(cfg.digital_flow_roi, Wi, Hi) if cfg.digital_flow_roi else None
+                split = bool(cfg.digital_total_int_roi) and bool(cfg.digital_total_frac_roi)
+                ti_abs = norm_to_abs(cfg.digital_total_int_roi, Wi, Hi) if split else None
+                tf_abs = norm_to_abs(cfg.digital_total_frac_roi, Wi, Hi) if split else None
+                ov_img = draw_overlays_digital(
+                    sub_img, t_abs, f_abs,
+                    state.get("raw_total"), state.get("raw_flow"),
+                    state.get("total"), state.get("flow_m3h"),
+                    state.get("aligned_ok", False), cfg,
+                    reason=state.get("reason"),
+                    out_path=out_path, log=log,
+                    total_int_roi_abs=ti_abs, total_frac_roi_abs=tf_abs,
+                    raw_total_int_str=state.get("raw_total_int"),
+                    raw_total_frac_str=state.get("raw_total_frac"),
+                )
+                if should_publish:
+                    topic = getattr(cfg, "overlay_camera_topic",
+                                    f"{cfg.mqtt_main_topic}/debug/overlay")
+                    jpeg_q = int(getattr(cfg, "overlay_jpeg_quality", 85))
+                    ok, buf = cv2.imencode(".jpg", ov_img,
+                                           [int(cv2.IMWRITE_JPEG_QUALITY), jpeg_q])
+                    if ok:
+                        mqttc.publish(topic, buf.tobytes(), retain=True)
+
+            result = run_digital_cycle(cfg, ocr, aligner, session, prev_total, log,
+                                       on_attempt=_overlay_for_attempt)
 
             img = result["frame"]
             aligned_ok = result["aligned_ok"]
@@ -1687,45 +1869,8 @@ def main():
             else:
                 log.warning("Giving up this cycle (reason=%s) — holding previous total", reason)
 
-            # Always draw the overlay (when we have a frame), even on failure —
-            # the debug JPEG is how the user tunes ROIs and diagnoses wrong-view
-            # or parse issues. Gated on having a captured frame; "no_frame" means
-            # every capture failed and we have nothing to annotate.
-            if img is not None:
-                should_save_overlay = cfg.save_debug_overlays
-                should_publish_overlay = getattr(cfg, "overlay_publish_mqtt", True)
-                if should_save_overlay or should_publish_overlay:
-                    out = None
-                    if should_save_overlay:
-                        ensure_dir(cfg.debug_dir)
-                        out = (os.path.join(cfg.debug_dir, "overlay_latest.jpg")
-                               if getattr(cfg, "debug_keep_latest_only", True)
-                               else os.path.join(cfg.debug_dir, f"overlay_{int(now)}.jpg"))
-                    Hi, Wi = img.shape[:2]
-                    total_abs = norm_to_abs(cfg.digital_total_roi, Wi, Hi) if cfg.digital_total_roi else None
-                    flow_abs = norm_to_abs(cfg.digital_flow_roi, Wi, Hi) if cfg.digital_flow_roi else None
-                    split_mode = bool(cfg.digital_total_int_roi) and bool(cfg.digital_total_frac_roi)
-                    total_int_abs = norm_to_abs(cfg.digital_total_int_roi, Wi, Hi) if split_mode else None
-                    total_frac_abs = norm_to_abs(cfg.digital_total_frac_roi, Wi, Hi) if split_mode else None
-                    raw_total_int_str = result.get("raw_total_int")
-                    raw_total_frac_str = result.get("raw_total_frac")
-                    overlay_total = publish_total if success else total
-                    ov_img = draw_overlays_digital(
-                        img, total_abs, flow_abs,
-                        raw_total_str, raw_flow_str,
-                        overlay_total, flow_m3h,
-                        aligned_ok, cfg, reason=reason, out_path=out, log=log,
-                        total_int_roi_abs=total_int_abs,
-                        total_frac_roi_abs=total_frac_abs,
-                        raw_total_int_str=raw_total_int_str,
-                        raw_total_frac_str=raw_total_frac_str,
-                    )
-                    if should_publish_overlay:
-                        topic = getattr(cfg, "overlay_camera_topic", f"{cfg.mqtt_main_topic}/debug/overlay")
-                        jpeg_q = int(getattr(cfg, "overlay_jpeg_quality", 85))
-                        ok, buf = cv2.imencode(".jpg", ov_img, [int(cv2.IMWRITE_JPEG_QUALITY), jpeg_q])
-                        if ok:
-                            mqttc.publish(topic, buf.tobytes(), retain=True)
+            # Overlay drawing moved into the _overlay_for_attempt callback so
+            # each retry attempt refreshes overlay_latest.jpg + MQTT camera.
 
             elapsed = time.time() - t0
             time.sleep(max(0.0, target_interval - elapsed))

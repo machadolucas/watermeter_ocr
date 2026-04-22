@@ -24,6 +24,7 @@ import pytest
 from watermeter import (
     MqttClient,
     apply_ocr_preprocess,
+    build_digit_sub_rois,
     draw_overlays_digital,
     is_valid_digital_view,
     load_config,
@@ -65,6 +66,7 @@ def _cfg_stub(**over):
         digital_total_frac_digit_count=0,
         digital_flow_digit_count=0,
         digital_per_digit_inset=0.10,
+        digital_per_digit_auto_detect=False,  # default tests use equal subdivision
         esp32_base_url="http://unused",
         image_timeout=1.0,
     )
@@ -495,6 +497,50 @@ class TestRunDigitalCycle:
         assert result["success"] is False
         assert result["reason"] == "wrong_view"
 
+    def test_on_attempt_called_once_per_attempt(self, monkeypatch):
+        # Callback fires every attempt (wrong_view and success), giving the
+        # main loop a chance to refresh the debug overlay between retries.
+        self._patch_capture(monkeypatch)
+        cfg = _cfg_stub(digital_max_retries=2)
+        ocr = _FakeOCR(_flatten([
+            ("", ""),                    # attempt 1 — wrong_view
+            ("meter info", "serial"),    # attempt 2 — wrong_view
+            ("001234.567", "12.345"),    # attempt 3 — ok
+        ]))
+        seen = []
+        run_digital_cycle(cfg, ocr, aligner=None, session=None,
+                          prev_total=None, log=_StubLog(), sleep=_noop,
+                          on_attempt=lambda s: seen.append(s["reason"]))
+        assert seen == ["wrong_view", "wrong_view", "ok"]
+
+    def test_on_attempt_gets_frame_for_overlay(self, monkeypatch):
+        # The callback state must include the frame so the overlay can be
+        # drawn — that's the whole point of per-attempt notification.
+        self._patch_capture(monkeypatch)
+        cfg = _cfg_stub(digital_max_retries=0)
+        ocr = _FakeOCR(_flatten([("", "")]))  # one attempt, wrong_view
+        seen = []
+        run_digital_cycle(cfg, ocr, aligner=None, session=None,
+                          prev_total=None, log=_StubLog(), sleep=_noop,
+                          on_attempt=lambda s: seen.append(s))
+        assert len(seen) == 1
+        assert seen[0]["frame"] is not None
+        assert seen[0]["reason"] == "wrong_view"
+
+    def test_on_attempt_callback_exception_does_not_abort_cycle(self, monkeypatch):
+        # Callback raising shouldn't kill the cycle — main-loop logic must
+        # still see a valid result even if overlay drawing explodes.
+        self._patch_capture(monkeypatch)
+        cfg = _cfg_stub(digital_max_retries=0)
+        ocr = _FakeOCR(_flatten([("000100.000", "00.125")]))
+        def bad(state):
+            raise RuntimeError("overlay render failed")
+        result = run_digital_cycle(cfg, ocr, aligner=None, session=None,
+                                   prev_total=None, log=_StubLog(), sleep=_noop,
+                                   on_attempt=bad)
+        assert result["success"] is True
+        assert result["total"] == pytest.approx(100.0)
+
     def test_flow_disabled_only_reads_total(self, monkeypatch):
         # When digital_flow_roi is empty, run_digital_cycle must NOT call
         # ocr.read_line for flow — the fake only yields one string per attempt.
@@ -716,8 +762,10 @@ class TestReadRegionPerDigit:
         # Sub-ROIs should collectively cover the base ROI with inset-respecting
         # gaps. Specifically: x-coords are monotonic; first starts after the
         # inset; last ends before the ROI's right edge minus the inset.
+        # auto_detect=False to force equal-subdivision path in this test.
         ocr = self._CollectingOCR(["0"] * 6)
-        read_region_per_digit(ocr, "p", [0.10, 0.20, 0.60, 0.10], 6, inset=0.10)
+        read_region_per_digit(ocr, "p", [0.10, 0.20, 0.60, 0.10], 6, inset=0.10,
+                              auto_detect=False)
         xs = [c[0] for c in ocr.calls]
         assert xs == sorted(xs)  # monotonic left-to-right
         # First sub-ROI's x is at least inset into the first cell.
@@ -725,6 +773,79 @@ class TestReadRegionPerDigit:
         # Last sub-ROI's right edge (x + w) is within the base ROI.
         last_x, _, last_w, _ = ocr.calls[-1]
         assert last_x + last_w <= 0.10 + 0.60 + 1e-9
+
+
+# ---------------------------------------------------------------------------
+# build_digit_sub_rois — auto-detection vs equal subdivision
+# ---------------------------------------------------------------------------
+
+class TestBuildDigitSubRois:
+    def _synth_digits_image(self, tmp_path, count, gap_px=6, digit_w=14, digit_h=40):
+        """Create a synthetic LCD-ish crop: `count` dark rectangular 'digits'
+        on a light background, separated by clear gaps. Returns the saved
+        path and the ROI in normalized coords."""
+        import cv2
+        pad_x = 10
+        pad_y = 10
+        total_w = pad_x * 2 + count * digit_w + (count - 1) * gap_px
+        total_h = pad_y * 2 + digit_h
+        img = np.full((total_h, total_w, 3), 220, dtype=np.uint8)  # light bg
+        for i in range(count):
+            x0 = pad_x + i * (digit_w + gap_px)
+            img[pad_y:pad_y + digit_h, x0:x0 + digit_w] = 40  # dark digit
+        path = str(tmp_path / "synth.jpg")
+        cv2.imwrite(path, img)
+        # Base ROI covers the whole synthetic image.
+        return path, [0.0, 0.0, 1.0, 1.0]
+
+    def test_auto_detect_finds_correct_count(self, tmp_path):
+        # Synthetic 6-digit image with clear gaps — projection should find
+        # exactly 6 runs and return 6 sub-ROIs in left-to-right order.
+        path, base = self._synth_digits_image(tmp_path, count=6)
+        subs = build_digit_sub_rois(path, base, expected_count=6, inset=0.10,
+                                    auto_detect=True)
+        assert len(subs) == 6
+        xs = [s[0] for s in subs]
+        assert xs == sorted(xs)
+        # Sub-ROIs stay within the base ROI.
+        for (x, y, w, h) in subs:
+            assert 0.0 <= x <= 1.0
+            assert 0.0 <= y <= 1.0
+            assert x + w <= 1.0 + 1e-9
+            assert y + h <= 1.0 + 1e-9
+
+    def test_auto_detect_falls_back_when_wrong_count(self, tmp_path):
+        # Synthetic image has 4 digits, but we ask for 6 → projection returns
+        # 4 runs → detection declines to return → fallback to equal
+        # subdivision of the base ROI. Should still return 6 sub-ROIs.
+        path, base = self._synth_digits_image(tmp_path, count=4)
+        subs = build_digit_sub_rois(path, base, expected_count=6, inset=0.10,
+                                    auto_detect=True)
+        assert len(subs) == 6
+        # Equal subdivision: each cell is (base_w/6) wide minus inset padding
+        cell_w = (1.0 / 6) * (1 - 2 * 0.10)
+        for sub in subs:
+            assert abs(sub[2] - cell_w) < 1e-6
+
+    def test_auto_detect_disabled_uses_equal_subdivision(self, tmp_path):
+        path, base = self._synth_digits_image(tmp_path, count=6)
+        auto = build_digit_sub_rois(path, base, 6, auto_detect=True)
+        equal = build_digit_sub_rois(path, base, 6, auto_detect=False)
+        # When disabled, sub-ROIs are uniform — all widths identical.
+        widths = [s[2] for s in equal]
+        assert max(widths) - min(widths) < 1e-6
+        # Auto-detected widths depend on the synthesized digit bounds and
+        # will differ from the uniform equal-subdivision case.
+        auto_widths = [s[2] for s in auto]
+        # At least one width should differ noticeably between the two modes.
+        assert any(abs(a - e) > 1e-4 for a, e in zip(auto_widths, widths))
+
+    def test_auto_detect_missing_file_falls_back(self, tmp_path):
+        # Non-existent image → imread returns None → fallback to equal
+        # subdivision.
+        subs = build_digit_sub_rois(str(tmp_path / "missing.jpg"),
+                                    [0.1, 0.2, 0.6, 0.1], 6, auto_detect=True)
+        assert len(subs) == 6
 
 
 # ---------------------------------------------------------------------------

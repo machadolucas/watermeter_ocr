@@ -157,6 +157,13 @@ rois:
 #   total_frac_digit_count: 0    # e.g. 3 for a 3-digit fractional segment
 #   flow_digit_count: 0          # e.g. 5 for "XX.YYY"
 #   per_digit_inset: 0.10        # shrink each sub-ROI inward to avoid bleed
+#   # When true (default), per-digit mode first tries to auto-detect each
+#   # digit's bounding box inside the outer ROI via vertical projection of
+#   # the binarized crop. Self-corrects minor calibration offsets. Falls
+#   # back to equal subdivision if detection finds the wrong digit count
+#   # (busy background, merged digits, etc.). Set false to always use
+#   # equal subdivision.
+#   per_digit_auto_detect: true
 #   max_retries: 2               # extra captures per cycle if wrong view detected
 #   retry_delay_sec: 5.5         # > longest diag-view dwell (5s) so retries phase-cross
 #   min_digits: 6                # cheap-fail bar for diagnostic screens
