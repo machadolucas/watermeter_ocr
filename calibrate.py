@@ -408,7 +408,7 @@ def make_handler_class(config_path: Path, esp32_url: str, frame_cache: FrameCach
                 self._send_text(HTML_PAGE, 200, "text/html; charset=utf-8")
                 return
 
-            if self.path == "/frame.jpg":
+            if self.path == "/frame.jpg" or self.path.startswith("/frame.jpg?"):
                 try:
                     data = fetch_frame(esp32_url)
                     frame_cache.set(data)
