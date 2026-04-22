@@ -1280,15 +1280,24 @@ def build_digit_rois(cfg,W,H):
 
 
 def _equal_subdivide_roi(base_roi, count, inset):
-    """Split base_roi into `count` equal-width horizontal cells, shrunk
-    inward by `inset` fraction. Returns normalized [x,y,w,h] sub-ROIs."""
+    """Split base_roi into `count` equal-width horizontal cells with `inset`
+    fraction shrinkage on edges SHARED with a neighbour cell (inner edges).
+    Outer edges — the base ROI's left edge for cell 0, right edge for cell
+    N-1, and both the top + bottom edges for every cell — are NOT shrunk,
+    so edge glyphs aren't accidentally clipped when the base ROI hugs the
+    first/last digit tightly. Returns normalized [x,y,w,h] sub-ROIs.
+    """
     x, y, w, h = base_roi
     dw = w / count
-    return [[x + i * dw + dw * inset,
-             y + h * inset,
-             dw * (1 - 2 * inset),
-             h * (1 - 2 * inset)]
-            for i in range(count)]
+    pad_y = h * inset
+    subs = []
+    for i in range(count):
+        left_inset = dw * inset if i > 0 else 0.0
+        right_inset = dw * inset if i < count - 1 else 0.0
+        sx = x + i * dw + left_inset
+        sw = dw - left_inset - right_inset
+        subs.append([sx, y + pad_y, sw, h - 2 * pad_y])
+    return subs
 
 
 def _auto_detect_digit_sub_rois(img_path, base_roi, expected_count, inset):
@@ -1427,6 +1436,13 @@ def _ocr_digit_upscaled(ocr, img_path, sub_roi, factor, save_to=None):
     enlarging 2–4× with smooth interpolation gives Vision a bigger glyph
     on similarly-blurred edges, which it handles far better than the
     pixel-hinted original.
+
+    When digit mode (single-character) returns nothing, a line-mode
+    fallback reruns OCR on the same upscaled crop via Vision's line
+    recognizer (which uses both .fast AND .accurate and is more tolerant
+    of isolated glyphs) and takes the first digit of the result. This
+    catches cases where Vision refuses to emit anything for a lone
+    character in digit mode but happily reads it in line mode.
     """
     img = cv2.imread(img_path)
     if img is None:
@@ -1446,7 +1462,13 @@ def _ocr_digit_upscaled(ocr, img_path, sub_roi, factor, save_to=None):
     if save_to is not None:
         ensure_dir(os.path.dirname(save_to))
         cv2.imwrite(save_to, up)
-    return ocr._run(temp_path, [0.0, 0.0, 1.0, 1.0], "full")
+    result = ocr._run(temp_path, [0.0, 0.0, 1.0, 1.0], "full")
+    if not result:
+        line = ocr.read_line(temp_path, [0.0, 0.0, 1.0, 1.0]) or ""
+        digits = "".join(c for c in line if c.isdigit())
+        if digits:
+            result = digits[0]
+    return result
 
 
 def read_region_per_digit(ocr, img_path, base_roi, digit_count, inset=0.10,
@@ -1489,6 +1511,13 @@ def read_region_per_digit(ocr, img_path, base_roi, digit_count, inset=0.10,
                                         save_to=save_to)
         else:
             digit = ocr._run(img_path, sub, "full") or ""
+            if not digit:
+                # Line-mode fallback: Vision's line recognizer sometimes
+                # finds glyphs the single-digit recognizer refuses to emit.
+                line = ocr.read_line(img_path, sub) or ""
+                digits_only = "".join(c for c in line if c.isdigit())
+                if digits_only:
+                    digit = digits_only[0]
             # Save the raw (un-upscaled) crop when requested, so crops on
             # disk always reflect what Vision saw regardless of upscale.
             if save_to is not None:

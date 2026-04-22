@@ -465,8 +465,11 @@ class TestRunDigitalCycle:
         assert result["flow_m3h"] == pytest.approx(0.125)
 
     def test_per_digit_missed_digit_fails_parse(self, monkeypatch):
-        # One digit reads empty → concatenated int shortens from 6 to 5
-        # chars → combined "00000.118" fails the 6-digit regex → parse_failed.
+        # One digit reads empty in both digit mode AND the line-mode
+        # fallback → concatenated int shortens from 6 to 5 chars →
+        # combined "00000.118" fails the 6-digit regex → parse_failed.
+        # Script includes an extra "" entry for the line-mode fallback
+        # on the missed digit (index 1 of int).
         self._patch_capture(monkeypatch)
         cfg = _cfg_stub(
             digital_max_retries=0,
@@ -476,9 +479,11 @@ class TestRunDigitalCycle:
             digital_total_frac_digit_count=3,
         )
         ocr = _FakeOCR([
-            "0", "", "0", "0", "0", "0",  # 2nd digit missed
-            "1", "1", "8",
-            "00.000",
+            "0",          # int d0: _run
+            "", "",       # int d1: _run empty, then read_line fallback also empty
+            "0", "0", "0", "0",  # int d2..d5: _run
+            "1", "1", "8",       # frac d0..d2: _run (all non-empty, no fallback)
+            "00.000",            # flow: line mode
         ])
         result = run_digital_cycle(cfg, ocr, aligner=None, session=None,
                                    prev_total=None, log=_StubLog(), sleep=_noop)
@@ -727,7 +732,9 @@ class TestReadRegionPerDigit:
     class _CollectingOCR:
         """Minimal VisionOCR stand-in — records each sub-ROI it's asked to
         recognize and returns a scripted digit per call so tests can assert
-        both the concatenation and the geometric subdivision."""
+        both the concatenation and the geometric subdivision. read_line
+        always returns "" so read_region_per_digit's line-mode fallback
+        doesn't interfere with the digit-mode assertions."""
         def __init__(self, script):
             self.script = list(script)
             self.calls = []
@@ -735,6 +742,9 @@ class TestReadRegionPerDigit:
         def _run(self, img, roi, half="full"):
             self.calls.append(list(roi))
             return self.script.pop(0) if self.script else ""
+
+        def read_line(self, img, roi):
+            return ""
 
     def test_empty_roi_returns_empty(self):
         ocr = self._CollectingOCR(["9"])
@@ -821,26 +831,39 @@ class TestBuildDigitSubRois:
         # Synthetic image has 4 digits, but we ask for 6 → projection returns
         # 4 runs → detection declines to return → fallback to equal
         # subdivision of the base ROI. Should still return 6 sub-ROIs.
+        # Outer cells (0 and N-1) retain full base-ROI edges (no inset on
+        # the outward side); middle cells are inset on both sides — they
+        # therefore end up slightly narrower than outer cells.
         path, base = self._synth_digits_image(tmp_path, count=4)
         subs = build_digit_sub_rois(path, base, expected_count=6, inset=0.10,
                                     auto_detect=True)
         assert len(subs) == 6
-        # Equal subdivision: each cell is (base_w/6) wide minus inset padding
-        cell_w = (1.0 / 6) * (1 - 2 * 0.10)
-        for sub in subs:
-            assert abs(sub[2] - cell_w) < 1e-6
+        dw = 1.0 / 6
+        # Middle cells (1..N-2): inset on both sides → (1 - 2*inset)*dw
+        middle_w = dw * (1 - 2 * 0.10)
+        for sub in subs[1:-1]:
+            assert abs(sub[2] - middle_w) < 1e-6
+        # Outer cells: only one inset → (1 - inset)*dw
+        outer_w = dw * (1 - 0.10)
+        assert abs(subs[0][2] - outer_w) < 1e-6
+        assert abs(subs[-1][2] - outer_w) < 1e-6
 
     def test_auto_detect_disabled_uses_equal_subdivision(self, tmp_path):
+        # Equal-subdivision mode now has wider outer cells (inset applied
+        # only on inner edges) so widths are not all uniform.
         path, base = self._synth_digits_image(tmp_path, count=6)
         auto = build_digit_sub_rois(path, base, 6, auto_detect=True)
         equal = build_digit_sub_rois(path, base, 6, auto_detect=False)
-        # When disabled, sub-ROIs are uniform — all widths identical.
         widths = [s[2] for s in equal]
-        assert max(widths) - min(widths) < 1e-6
+        # Outer cells should be wider than middle cells by one inset unit.
+        assert widths[0] > widths[1] + 1e-6
+        assert widths[-1] > widths[-2] + 1e-6
+        # Middle cells are still uniform among themselves.
+        middle = widths[1:-1]
+        assert max(middle) - min(middle) < 1e-6
         # Auto-detected widths depend on the synthesized digit bounds and
-        # will differ from the uniform equal-subdivision case.
+        # will differ from the equal-subdivision case somewhere.
         auto_widths = [s[2] for s in auto]
-        # At least one width should differ noticeably between the two modes.
         assert any(abs(a - e) > 1e-4 for a, e in zip(auto_widths, widths))
 
     def test_auto_detect_missing_file_falls_back(self, tmp_path):
