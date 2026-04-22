@@ -999,12 +999,69 @@ def _in_window_local(now: datetime, start_hhmm: str, end_hhmm: str) -> bool:
     end   = _hhmm_to_min(end_hhmm)
     return (start <= cur < end) if start < end else (cur >= start or cur < end)
 
+
+def reset_state(cfg, new_total, log=None):
+    """Overwrite state.json with a fresh starting total, preserving a timestamped
+    backup of the previous state. Used after a physical meter swap where the new
+    meter's counter reads below the old running total and would otherwise trip
+    the monotonic / big_jump_guard protections.
+
+    Returns (backup_path_or_None, new_state_dict). Raises ValueError on invalid input.
+    """
+    if not math.isfinite(new_total):
+        raise ValueError(f"reset total must be finite, got {new_total!r}")
+    if new_total < 0:
+        raise ValueError(f"reset total must be >= 0, got {new_total!r}")
+
+    ensure_dir(os.path.dirname(cfg.state_path))
+
+    backup_path = None
+    if os.path.exists(cfg.state_path):
+        ts = datetime.now().strftime("%Y%m%dT%H%M%S")
+        backup_path = f"{cfg.state_path}.bak.{ts}"
+        # Atomic enough for our purposes — state.json is ~200 bytes.
+        with open(cfg.state_path, "rb") as src, open(backup_path, "wb") as dst:
+            dst.write(src.read())
+
+    new_state = {"total": float(new_total), "ts": time.time(), "dial_histories": {}}
+    save_json(cfg.state_path, new_state)
+
+    msg = (
+        f"Reset state.json: total={new_total} at ts={new_state['ts']}. "
+        f"Previous state backed up to {backup_path}." if backup_path
+        else f"Reset state.json: total={new_total} at ts={new_state['ts']}. "
+             f"No previous state to back up."
+    )
+    if log is not None:
+        log.info(msg)
+    print(msg, file=sys.stderr)
+    return backup_path, new_state
+
+
 def main():
-    parser=argparse.ArgumentParser(); parser.add_argument("--config",required=True); parser.add_argument("--log")
-    a=parser.parse_args(); cfg=load_config(a.config)
+    parser = argparse.ArgumentParser()
+    parser.add_argument("--config", required=True)
+    parser.add_argument("--log")
+    parser.add_argument(
+        "--reset-total", type=float, nargs="?", const=0.0, default=None,
+        metavar="VALUE",
+        help="Reset state.json total to VALUE (default 0.0) and exit. "
+             "Use after physical meter replacement; pair with a restart of the LaunchAgent.",
+    )
+    a = parser.parse_args(); cfg = load_config(a.config)
     ensure_dir(os.path.dirname(cfg.log_path))
     logging.basicConfig(filename=a.log or cfg.log_path, level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
-    log=logging.getLogger("watermeter")
+    log = logging.getLogger("watermeter")
+
+    # Reset branch — runs before any network/MQTT/image processing setup.
+    if a.reset_total is not None:
+        try:
+            reset_state(cfg, a.reset_total, log)
+        except ValueError as e:
+            print(f"error: {e}", file=sys.stderr)
+            sys.exit(2)
+        sys.exit(0)
+
     log.info("Starting watermeter (alignment)")
     state=read_json(cfg.state_path,{"total":None,"ts":None,"dial_histories":{}})
     prev_total=state.get("total"); prev_ts=state.get("ts")

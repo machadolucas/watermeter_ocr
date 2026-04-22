@@ -78,6 +78,8 @@ tail -f ~/watermeter/watermeter.log
 
 Your config lives at `~/watermeter/config.yaml`. The defaults work for a 640×480-ish frame; adjust ROIs to your meter.
 
+> **For step-by-step configuration, meter-swap, and troubleshooting see [docs/CONFIGURATION.md](./docs/CONFIGURATION.md).** The easiest way to (re)align ROIs to a meter is to run `python3 calibrate.py` — it opens a browser page with your live ESP32 frame where you drag rectangles and save. When the physical meter is replaced, run `python3 watermeter.py --config ~/watermeter/config.yaml --reset-total 0` to clear the running total so the new meter's reading is accepted.
+
 > The YAML below is an **illustrative example** for a different physical meter — the exact ROI coordinates and dial rotations it uses will not match your hardware. The installer seeds `~/watermeter/config.yaml` from [`config.yaml`](./config.yaml) in the repo, which reflects the author's actual meter. Use either as a starting point and tune with the debug overlay.
 
 ```yaml

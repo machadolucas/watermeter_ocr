@@ -1,6 +1,6 @@
 # AGENTS.md
 
-Guide for AI agents (and humans) working on `watermeter_ocr`. Complements [README.md](README.md) (user/install) and [VISUAL_GUIDE.md](VISUAL_GUIDE.md) (dial algorithm).
+Guide for AI agents (and humans) working on `watermeter_ocr`. Complements [README.md](README.md) (user/install), [docs/CONFIGURATION.md](docs/CONFIGURATION.md) (config reference + meter-swap procedure), and [VISUAL_GUIDE.md](VISUAL_GUIDE.md) (dial algorithm).
 
 ## Orientation
 
@@ -17,8 +17,10 @@ Entry point: `main()` at [watermeter.py:961](watermeter.py:961). Main capture lo
 | [config.yaml](config.yaml) | Default config; deploy copy lives at `~/watermeter/config.yaml` |
 | [install.sh](install.sh) | Bash installer: venv, Swift build, LaunchAgent, starter config |
 | [save_reference.py](save_reference.py) | One-shot: capture a clean ESP32 frame and save as the alignment reference |
+| [calibrate.py](calibrate.py) | Browser-based ROI calibration tool. Run `python3 calibrate.py`; see [docs/CONFIGURATION.md](docs/CONFIGURATION.md). |
 | [tests/](tests) | pytest suite (fixtures, unit + synthetic-image tests) |
 | [overlay_example.jpg](overlay_example.jpg) | Sample debug overlay for tuning ROIs visually |
+| [docs/CONFIGURATION.md](docs/CONFIGURATION.md) | Full config reference, meter-swap procedure, troubleshooting |
 
 ## Runtime layout (NOT the repo)
 
@@ -56,6 +58,12 @@ swiftc -O ocr.swift -o ~/watermeter/bin/ocr
 pip install -r requirements-dev.txt
 pytest -q
 pytest -q tests/test_digit_logic.py -k rollover   # selective run
+
+# Interactive ROI calibration (after a meter swap, or first-time setup)
+python3 calibrate.py                               # browser opens at 127.0.0.1:8765
+
+# Reset the running total (e.g. new physical meter starts at 0)
+python3 watermeter.py --config ~/watermeter/config.yaml --reset-total 0
 
 # Service control
 launchctl unload ~/Library/LaunchAgents/com.watermeter.ocr.plist
@@ -142,6 +150,8 @@ Break these and things go silently wrong.
 - **Additional sanity check on total**: either extend `estimate_total_from_dials` or add inline logic around [watermeter.py:1111](watermeter.py:1111) where `big_jump_guard` is consulted.
 - **New Home Assistant sensor**: add a discovery payload in `MqttClient.discovery` at [watermeter.py:709](watermeter.py:709) and publish its value in the main loop.
 - **New guard/clamp**: the publish branch at [watermeter.py:1122-1131](watermeter.py:1122) is where `publish_total` is decided separately from the raw `total` — add behavior there if you want the raw reading logged but not published.
+- **Changing ROIs**: prefer `python3 calibrate.py` over hand-editing `config.yaml`. The tool validates (ROI bounds, dial ordering, round-trip through `load_config`) before writing and creates a timestamped backup. Hand-editing is the fallback for headless boxes — see [docs/CONFIGURATION.md](docs/CONFIGURATION.md) § "Manual ROI tuning".
+- **Physical meter replacement**: the full procedure lives in [docs/CONFIGURATION.md](docs/CONFIGURATION.md) § "Meter-swap procedure". Short version: stop LaunchAgent → delete `reference.jpg` → run `calibrate.py` → `watermeter.py --reset-total 0` → restart LaunchAgent.
 
 ## Testing strategy
 
