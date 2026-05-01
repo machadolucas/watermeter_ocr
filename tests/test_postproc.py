@@ -5,6 +5,7 @@ import pytest
 
 from watermeter import (
     Config,
+    effective_big_jump_guard,
     estimate_total_from_dials,
     predict_expected_reading,
     validate_reading_with_history,
@@ -16,6 +17,35 @@ def _cfg(rolling_threshold_down=0.08):
         esp32_base_url="http://localhost",
         rolling_threshold_down=rolling_threshold_down,
     )
+
+
+# ---- effective_big_jump_guard ----------------------------------------------
+
+class TestEffectiveBigJumpGuardHelper:
+    def test_no_prev_ts_returns_base(self):
+        cfg = Config(esp32_base_url="x", big_jump_guard=2.0,
+                     big_jump_rate_per_day=1.0)
+        assert effective_big_jump_guard(cfg, None, 1000.0) == pytest.approx(2.0)
+
+    def test_one_day_elapsed_adds_full_rate(self):
+        cfg = Config(esp32_base_url="x", big_jump_guard=2.0,
+                     big_jump_rate_per_day=0.5)
+        now = 1_000_000.0
+        assert effective_big_jump_guard(cfg, now - 86400, now) == pytest.approx(2.5)
+
+    def test_capped_at_max_elapsed(self):
+        cfg = Config(esp32_base_url="x", big_jump_guard=2.0,
+                     big_jump_rate_per_day=1.0,
+                     big_jump_elapsed_cap_days=7.0)
+        now = 1_000_000.0
+        # 30 days elapsed → should still cap at 7 days * 1.0 = 7.0 above base.
+        assert effective_big_jump_guard(cfg, now - 30 * 86400, now) == pytest.approx(9.0)
+
+    def test_zero_rate_keeps_guard_fixed(self):
+        cfg = Config(esp32_base_url="x", big_jump_guard=2.0,
+                     big_jump_rate_per_day=0.0)
+        now = 1_000_000.0
+        assert effective_big_jump_guard(cfg, now - 100 * 86400, now) == pytest.approx(2.0)
 
 
 # ---- estimate_total_from_dials --------------------------------------------

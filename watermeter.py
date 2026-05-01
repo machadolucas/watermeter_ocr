@@ -83,6 +83,7 @@ class Config:
     per_digit_inset:float=0.10; rolling_threshold_up:float=0.92; rolling_threshold_down:float=0.08
     state_path:str=os.path.expanduser("~/watermeter/state.json")
     monotonic_epsilon:float=0.0005; big_jump_guard:float=2.0
+    big_jump_rate_per_day:float=1.0; big_jump_elapsed_cap_days:float=7.0
     mqtt_host:str="127.0.0.1"; mqtt_port:int=1883
     mqtt_username:Optional[str]=None; mqtt_password:Optional[str]=None
     mqtt_main_topic:str="home/watermeter"; mqtt_client_id:str="water-ocr-mac"
@@ -212,6 +213,8 @@ def load_config(path)->Config:
         state_path=os.path.expanduser(raw.get("paths",{}).get("state_path","~/watermeter/state.json")),
         monotonic_epsilon=raw.get("postproc",{}).get("monotonic_epsilon",0.0005),
         big_jump_guard=raw.get("postproc",{}).get("big_jump_guard",2.0),
+        big_jump_rate_per_day=raw.get("postproc",{}).get("big_jump_rate_per_day",1.0),
+        big_jump_elapsed_cap_days=raw.get("postproc",{}).get("big_jump_elapsed_cap_days",7.0),
         mqtt_host=raw.get("mqtt",{}).get("host","127.0.0.1"),
         mqtt_port=raw.get("mqtt",{}).get("port",1883),
         mqtt_username=raw.get("mqtt",{}).get("username",None),
@@ -825,16 +828,37 @@ def is_valid_digital_view(raw_total, raw_flow, cfg):
     return True
 
 
-def validate_digital_reading(total, flow, prev_total, cfg):
+def effective_big_jump_guard(cfg, prev_ts, now):
+    """Forward-jump allowance, scaled by elapsed time since last successful publish.
+
+    Returns `big_jump_guard + min(elapsed_days, cap_days) * rate_per_day`.
+    When `prev_ts` is None (cold start, no prior reading) elapsed is treated
+    as zero. The cap prevents the guard from growing unboundedly after long
+    outages so a wildly bogus OCR reading still gets rejected.
+    """
+    if prev_ts is None or now is None:
+        elapsed_sec = 0.0
+    else:
+        elapsed_sec = max(0.0, now - prev_ts)
+    elapsed_days = elapsed_sec / 86400.0
+    capped = min(elapsed_days, max(0.0, cfg.big_jump_elapsed_cap_days))
+    return cfg.big_jump_guard + capped * cfg.big_jump_rate_per_day
+
+
+def validate_digital_reading(total, flow, prev_total, cfg, prev_ts=None, now=None):
     """Post-parse sanity check.
 
-    Rejects None/NaN/inf totals, negative/non-finite flow (when flow
-    tracking is enabled), and totals that drift more than `big_jump_guard`
-    from the previous reading. The first read (prev_total is None) is
-    always accepted so the service has a baseline on a cold start. Flow
-    is evaluated when EITHER `digital_flow_roi` or `digital_flow_digits`
-    is configured; when both are empty, `flow` is expected to be None
-    and is not evaluated.
+    Rejects None/NaN/inf totals and negative/non-finite flow (when flow
+    tracking is enabled). The forward-jump guard scales with elapsed time
+    since the last successful publish (see `effective_big_jump_guard`) so
+    a long stretch of failed cycles doesn't trap us behind a stale
+    `prev_total`. Backward jumps are still strict — bounded by
+    `monotonic_epsilon` — because a digital LCD can't physically run
+    backward; any backward read is OCR error. The first read
+    (`prev_total is None`) is always accepted so the service has a
+    baseline on a cold start. Flow is evaluated when EITHER
+    `digital_flow_roi` or `digital_flow_digits` is configured; when both
+    are empty, `flow` is expected to be None and is not evaluated.
     """
     if total is None or not math.isfinite(total):
         return False
@@ -842,8 +866,12 @@ def validate_digital_reading(total, flow, prev_total, cfg):
     if flow_tracked:
         if flow is None or not math.isfinite(flow) or flow < 0:
             return False
-    if prev_total is not None and abs(total - prev_total) > cfg.big_jump_guard:
-        return False
+    if prev_total is not None:
+        delta = total - prev_total
+        if delta < -cfg.monotonic_epsilon:
+            return False
+        if delta > effective_big_jump_guard(cfg, prev_ts, now):
+            return False
     return True
 
 
@@ -1903,7 +1931,7 @@ def capture_frame(cfg, session, log):
 
 
 def run_digital_cycle(cfg, ocr, aligner, session, prev_total, log,
-                      sleep=time.sleep, on_attempt=None):
+                      sleep=time.sleep, on_attempt=None, prev_ts=None):
     """Capture + OCR one digital-meter reading, retrying on wrong-view frames.
 
     The LCD auto-cycles between a numeric view and two diagnostic views. A
@@ -2130,7 +2158,8 @@ def run_digital_cycle(cfg, ocr, aligner, session, prev_total, log,
                 sleep(cfg.digital_retry_delay_sec)
             continue
 
-        if not validate_digital_reading(total, flow, prev_total, cfg):
+        if not validate_digital_reading(total, flow, prev_total, cfg,
+                                        prev_ts=prev_ts, now=time.time()):
             log.debug(
                 "Validate failed (attempt %d/%d): raw_total=%r raw_flow=%r "
                 "parsed=(%s, %s) prev=%s",
@@ -2376,7 +2405,8 @@ def main():
                         mqttc.publish(topic, buf.tobytes(), retain=True)
 
             result = run_digital_cycle(cfg, ocr, aligner, session, prev_total, log,
-                                       on_attempt=_overlay_for_attempt)
+                                       on_attempt=_overlay_for_attempt,
+                                       prev_ts=prev_ts)
 
             img = result["frame"]
             aligned_ok = result["aligned_ok"]
@@ -2394,16 +2424,17 @@ def main():
                 # Guards mirror the mechanical clamp so HA always sees a monotonic total.
                 publish_total = total
                 if prev_total is not None:
+                    eff_guard = effective_big_jump_guard(cfg, prev_ts, now)
                     if total + cfg.monotonic_epsilon < prev_total:
                         log.warning(
                             f"CLAMP: negative step detected "
                             f"(total={total:.6f} < prev={prev_total:.6f} - eps). Holding previous."
                         )
                         publish_total = prev_total
-                    elif total - prev_total > cfg.big_jump_guard:
+                    elif total - prev_total > eff_guard:
                         log.warning(
                             f"CLAMP: big jump detected "
-                            f"(Δ={total - prev_total:.6f} > guard={cfg.big_jump_guard}). Holding previous."
+                            f"(Δ={total - prev_total:.6f} > guard={eff_guard:.6f}). Holding previous."
                         )
                         publish_total = prev_total
 
@@ -2562,26 +2593,28 @@ def main():
             integer = int(prev_int_str) if prev_int_str else 0
         total = float(integer) + float(frac_pub)
 
+        now=time.time()
+        eff_guard = effective_big_jump_guard(cfg, prev_ts, now) if prev_total is not None else cfg.big_jump_guard
         if prev_total is not None:
             diff_candidate = total - prev_total
-            if abs(diff_candidate) > cfg.big_jump_guard:
+            if abs(diff_candidate) > eff_guard:
                 fallback_total = estimate_total_from_dials(prev_total, frac_pub, cfg)
-                if fallback_total is not None and abs(fallback_total - prev_total) <= cfg.big_jump_guard:
+                if fallback_total is not None and abs(fallback_total - prev_total) <= eff_guard:
                     log.warning(
                         "OCR integer jump (Δ=%.3f) exceeds guard; trusting dial fractions",
                         diff_candidate,
                     )
                     total = fallback_total
 
-        publish_total=total; now=time.time()
+        publish_total=total
         if prev_total is not None:
             if total + cfg.monotonic_epsilon < prev_total:
                 log.warning(f"CLAMP: negative step detected "
                             f"(total={total:.6f} < prev={prev_total:.6f} - eps). Holding previous.")
                 publish_total = prev_total
-            elif total - prev_total > cfg.big_jump_guard:
+            elif total - prev_total > eff_guard:
                 log.warning(f"CLAMP: big jump detected "
-                            f"(Δ={total - prev_total:.6f} > guard={cfg.big_jump_guard}). Holding previous.")
+                            f"(Δ={total - prev_total:.6f} > guard={eff_guard:.6f}). Holding previous.")
                 publish_total = prev_total
 
         rate=0.0

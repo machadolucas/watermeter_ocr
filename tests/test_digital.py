@@ -28,6 +28,7 @@ from watermeter import (
     build_digit_sub_rois,
     classify_7seg,
     draw_overlays_digital,
+    effective_big_jump_guard,
     is_valid_digital_view,
     load_config,
     parse_digital_flow,
@@ -56,6 +57,8 @@ def _cfg_stub(**over):
         digital_max_retries=2,
         digital_retry_delay_sec=0.01,
         big_jump_guard=2.0,
+        big_jump_rate_per_day=1.0,
+        big_jump_elapsed_cap_days=7.0,
         retry_backoff_sec=0.01,
         monotonic_epsilon=0.0,
         image_path="/tmp/watermeter_test_raw.jpg",
@@ -216,6 +219,92 @@ class TestValidateDigitalReading:
         assert validate_digital_reading(100.0, None, 99.5, cfg) is True
         # Big-jump guard still applies on the total even without flow.
         assert validate_digital_reading(200.0, None, 99.5, cfg) is False
+
+    def test_long_gap_allows_larger_jump(self):
+        # Tight base guard (matches user's digital config) plus 1.0 m³/day rate.
+        # After ~22 h of failed cycles, real consumption of 0.2 m³ must pass.
+        cfg = _cfg_stub(big_jump_guard=0.07, big_jump_rate_per_day=1.0,
+                        digital_flow_roi=[])
+        now = 1000000.0
+        prev_ts = now - 22 * 3600  # 22 hours ago
+        assert validate_digital_reading(2.206, None, 2.006, cfg,
+                                        prev_ts=prev_ts, now=now) is True
+
+    def test_short_gap_keeps_strict_guard(self):
+        # Same tight config, but only 30 s elapsed: guard ≈ 0.07 m³ (effectively
+        # unchanged). A 0.2 m³ jump must still be rejected.
+        cfg = _cfg_stub(big_jump_guard=0.07, big_jump_rate_per_day=1.0,
+                        digital_flow_roi=[])
+        now = 1000000.0
+        prev_ts = now - 30
+        assert validate_digital_reading(2.206, None, 2.006, cfg,
+                                        prev_ts=prev_ts, now=now) is False
+
+    def test_backward_jump_still_strict_after_long_gap(self):
+        # Even with a huge time-scaled forward allowance, a backward jump
+        # is still rejected (digital LCD can't physically run backward).
+        cfg = _cfg_stub(big_jump_guard=0.07, big_jump_rate_per_day=1.0,
+                        monotonic_epsilon=0.001, digital_flow_roi=[])
+        now = 1000000.0
+        prev_ts = now - 7 * 86400  # 7 days, hits the cap
+        assert validate_digital_reading(1.0, None, 2.0, cfg,
+                                        prev_ts=prev_ts, now=now) is False
+
+    def test_elapsed_cap_bounds_the_guard(self):
+        # 30 days elapsed but cap is 7 days: max guard = 0.07 + 7*1.0 = 7.07.
+        # A 10 m³ jump must still be rejected.
+        cfg = _cfg_stub(big_jump_guard=0.07, big_jump_rate_per_day=1.0,
+                        big_jump_elapsed_cap_days=7.0, digital_flow_roi=[])
+        now = 1000000.0
+        prev_ts = now - 30 * 86400
+        assert validate_digital_reading(12.0, None, 2.0, cfg,
+                                        prev_ts=prev_ts, now=now) is False
+        # But a jump within the capped allowance (e.g. 6 m³) passes.
+        assert validate_digital_reading(8.0, None, 2.0, cfg,
+                                        prev_ts=prev_ts, now=now) is True
+
+    def test_no_prev_ts_falls_back_to_base_guard(self):
+        # First run after restart: prev_ts unknown → elapsed treated as 0.
+        cfg = _cfg_stub(big_jump_guard=0.5, big_jump_rate_per_day=1.0,
+                        digital_flow_roi=[])
+        # Within base guard
+        assert validate_digital_reading(100.4, None, 100.0, cfg,
+                                        prev_ts=None, now=1000000.0) is True
+        # Exceeds base guard, no time scaling
+        assert validate_digital_reading(101.0, None, 100.0, cfg,
+                                        prev_ts=None, now=1000000.0) is False
+
+
+class TestEffectiveBigJumpGuard:
+    def test_no_prev_ts_returns_base(self):
+        cfg = _cfg_stub(big_jump_guard=0.5, big_jump_rate_per_day=1.0)
+        assert effective_big_jump_guard(cfg, None, 1000000.0) == pytest.approx(0.5)
+
+    def test_zero_elapsed_returns_base(self):
+        cfg = _cfg_stub(big_jump_guard=0.5, big_jump_rate_per_day=1.0)
+        now = 1000000.0
+        assert effective_big_jump_guard(cfg, now, now) == pytest.approx(0.5)
+
+    def test_one_day_elapsed_adds_full_rate(self):
+        cfg = _cfg_stub(big_jump_guard=0.07, big_jump_rate_per_day=1.0)
+        now = 1000000.0
+        prev_ts = now - 86400
+        assert effective_big_jump_guard(cfg, prev_ts, now) == pytest.approx(1.07)
+
+    def test_capped_at_max_elapsed(self):
+        cfg = _cfg_stub(big_jump_guard=0.07, big_jump_rate_per_day=1.0,
+                        big_jump_elapsed_cap_days=7.0)
+        now = 1000000.0
+        prev_ts = now - 30 * 86400
+        assert effective_big_jump_guard(cfg, prev_ts, now) == pytest.approx(7.07)
+
+    def test_negative_elapsed_clamped_to_zero(self):
+        # Clock skew or a synthetic future prev_ts must not produce a smaller
+        # guard than the base.
+        cfg = _cfg_stub(big_jump_guard=0.5, big_jump_rate_per_day=1.0)
+        now = 1000000.0
+        prev_ts = now + 100  # "future"
+        assert effective_big_jump_guard(cfg, prev_ts, now) == pytest.approx(0.5)
 
 
 # ---------------------------------------------------------------------------

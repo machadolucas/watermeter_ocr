@@ -35,7 +35,19 @@ digits:
 
 postproc:
   monotonic_epsilon: 0.0
+  # Base allowance (m³) for forward jumps between consecutive successful
+  # readings. The effective allowance grows with elapsed time since the last
+  # accepted publish so the service can self-heal after long OCR outages
+  # (e.g. the LCD stuck in a diagnostic view for hours).
   big_jump_guard: 2.0
+  # Per-day catch-up rate (m³/day) added on top of `big_jump_guard`. With
+  # rate=1.0 and guard=2.0, an outage of 6 h adds 0.25 m³ to the allowance.
+  # Set to 0 to keep the guard fixed.
+  big_jump_rate_per_day: 1.0
+  # Cap on the elapsed-time component (in days). Prevents the guard from
+  # growing without bound after multi-week outages so a wildly bogus OCR
+  # reading is still rejected.
+  big_jump_elapsed_cap_days: 7.0
 
 mqtt:
   host: "192.168.1.23"

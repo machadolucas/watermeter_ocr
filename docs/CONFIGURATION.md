@@ -83,7 +83,9 @@ Running [`calibrate.py`](../calibrate.py) edits `~/watermeter/config.yaml` direc
 | `digital.retry_delay_sec` | `5.5` | *(digital)* Delay between retries. Must exceed longest diag-view dwell (5 s). |
 | `digital.min_digits` | `6` | *(digital)* Cheap-fail threshold that rejects diagnostic screens before regex. |
 | `postproc.monotonic_epsilon` | `0.0005` | Tolerated backward wobble; anything smaller than this is treated as noise, not a real regression. |
-| `postproc.big_jump_guard` | `2.0` | Maximum accepted forward jump in m³ between captures. Anything larger is blocked. |
+| `postproc.big_jump_guard` | `2.0` | Base allowance (m³) for forward jumps between captures. The effective allowance is this PLUS `big_jump_rate_per_day` × elapsed-days-since-last-publish. |
+| `postproc.big_jump_rate_per_day` | `1.0` | Per-day catch-up rate (m³/day) added to the base guard, scaled by elapsed time since the last accepted publish. Lets the service self-heal after long outages instead of getting stuck. Set to `0` for a fixed guard. |
+| `postproc.big_jump_elapsed_cap_days` | `7.0` | Cap on the elapsed-time component (in days). After this many days offline the rate-per-day stops adding more allowance. Prevents a wildly bogus OCR read from being accepted after a multi-week outage. |
 | `alignment.enabled` | `true` | Run ORB+RANSAC alignment to the reference frame. |
 | `alignment.reference_path` | `~/watermeter/reference.jpg` | Reference image for alignment. Auto-captured on first run if missing. |
 | `alignment.anchor_rois` | — | Normalized rectangles where ORB is allowed to look for features. Keep over stable printed areas. |
@@ -155,12 +157,13 @@ Defaults (0.92 / 0.08) work for most meters. Tighten (e.g. 0.85 / 0.15) if digit
 
 ## Guards
 
-Two postprocessing guards in `postproc`:
+Postprocessing guards in `postproc`:
 
 - **`monotonic_epsilon`**: a backward step of up to this many m³ is treated as noise and the published total is held at the previous value. Keeps tiny jitter from making the Home Assistant total_increasing sensor reset.
-- **`big_jump_guard`**: a forward jump of more than this many m³ between captures is blocked. The dial-based `estimate_total_from_dials` fallback kicks in; if it also doesn't fit, the reading is discarded. Prevents an OCR misread ("9" → "8" misread as "9" → "0" at a higher place value) from inflating the total by 100 m³.
+- **`big_jump_guard`** + **`big_jump_rate_per_day`** + **`big_jump_elapsed_cap_days`**: the **effective** forward-jump allowance is `big_jump_guard + min(elapsed_days, big_jump_elapsed_cap_days) × big_jump_rate_per_day`. Where `elapsed_days` is the time between the last successful publish and the current cycle. In normal operation (cycles seconds apart) the effective guard is essentially the base `big_jump_guard`. After long stretches of failed cycles (LCD stuck on a diagnostic view, network outage, etc.) the allowance grows so the service can resume publishing once OCR works again, instead of staying trapped behind a stale `prev_total`. The cap prevents a wildly bogus OCR read from being accepted after a multi-week outage.
+- For mechanical meters, when the OCR-integer jumps too far, `estimate_total_from_dials` is consulted as a fallback. If neither fits within the effective guard, the reading is held.
 
-Both guards are relative to `prev_total` in `state.json`. After a physical meter swap the new meter's reading will almost certainly trip `big_jump_guard` (the running total drops from ~12k m³ to 0). Use `--reset-total` to clear state — see below.
+All guards are relative to `prev_total` in `state.json`. After a physical meter swap the new meter's reading will almost certainly trip `big_jump_guard` (the running total drops from ~12k m³ to 0). Use `--reset-total` to clear state — see below.
 
 ## Alignment (`anchor_rois`)
 
@@ -222,7 +225,7 @@ Calibrating both ROIs is strictly better when you can manage the reflections; ca
 3. Run the Swift helper in `--mode line` over the two ROIs. It uses Apple Vision's text recognizer; on empty output it retries with `.accurate`. The returned string is digits plus optional `.`.
 4. Check `is_valid_digital_view` — cheap pre-validator that rejects frames with too few digit characters (diagnostic screens).
 5. Parse each line with the configured regex. `parse_digital_total` injects a decimal at position -3 if Vision didn't see one.
-6. Run `validate_digital_reading` — reject non-finite, negative flow, and jumps larger than `big_jump_guard`.
+6. Run `validate_digital_reading` — reject non-finite, negative flow, and forward jumps larger than the effective big-jump guard (base + per-day catch-up; see "Guards"). Backward jumps are still rejected strictly under `monotonic_epsilon`.
 7. If any step fails, retry up to `digital.max_retries` times with `digital.retry_delay_sec` between captures. After that, skip the cycle and hold the previous value.
 8. Apply the usual monotonic / big-jump guards to the total and publish.
 
@@ -413,6 +416,9 @@ Safety on `--reset-total`:
 
 **Readings lag way behind the physical meter.**
 - Usually `big_jump_guard` is clamping every new reading. Check the log for `CLAMP: big jump detected`. After a meter swap, run `--reset-total`. If you legitimately see > 2 m³ per 10 s of flow, raise `big_jump_guard` — rare for residential use.
+
+**Long stretches of `validate_failed` and the service won't recover.**
+- Pre-`big_jump_rate_per_day` (or with `big_jump_rate_per_day: 0`), if `validate_digital_reading` rejected one cycle, every subsequent successful OCR was compared against the same stale `prev_total` and rejected for the same reason — a permanent trap that required deleting `state.json`. The default `big_jump_rate_per_day: 1.0` self-heals: after `Δt` of failure, the allowance grows by `Δt × 1.0` m³/day. If you've kept it at `0`, raise it (e.g. `1.0` for residential, higher for commercial). If self-healing isn't kicking in, check that `state.json`'s `ts` field is not being refreshed when validation fails (it shouldn't be; only successful publishes update it).
 
 **Alignment keeps failing (`aligned_ok=False` in logs).**
 - Rebuild the reference: `rm ~/watermeter/reference.jpg`. The next capture becomes the new reference.
