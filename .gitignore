@@ -3,3 +3,9 @@ __pycache__/
 .pytest_cache/
 .venv/
 .DS_Store
+
+# PyInstaller build artifacts (install.sh cleans these up, but a manual
+# `pyinstaller` invocation would leave them behind)
+build/
+dist/
+*.spec

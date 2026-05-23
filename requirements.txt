@@ -1,0 +1,8 @@
+# Runtime dependencies. install.sh pip-installs these into the build venv
+# alongside pyinstaller, so the resulting bundled binary contains the
+# versions pinned here. Bump deliberately — every change requires a rebuild.
+opencv-python-headless==4.12.0.88
+numpy==2.2.6
+paho-mqtt==2.1.0
+requests==2.32.5
+PyYAML==6.0.3
