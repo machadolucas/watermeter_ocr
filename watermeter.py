@@ -1021,7 +1021,7 @@ class MqttClient:
                 "state_topic": f"{base}/main/flow_m3h",
                 "unit_of_measurement": "m³/h",
                 "state_class": "measurement",
-                "device_class": "water",
+                "device_class": "volume_flow_rate",
                 "unique_id": "water_flow_m3h_macocr",
                 "icon": "mdi:water-pump",
                 "device": {"identifiers": ["water_cam_mac"], "name": "Water Meter (Mac OCR)"},
