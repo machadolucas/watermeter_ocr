@@ -63,6 +63,7 @@ def test_esphome_mode_flashes_around_snapshot(tmp_path):
     assert frame is not None and frame.shape[:2] == (48, 64)
     assert s.calls == [
         ("POST", "http://192.0.2.1/light/Flash/turn_on?r=255&g=255&b=255"),
+        ("GET", "http://192.0.2.1:8080/"),  # discarded: may predate the flash
         ("GET", "http://192.0.2.1:8080/"),
         ("POST", "http://192.0.2.1/light/Flash/turn_off"),
     ]

@@ -85,6 +85,9 @@ class Config:
     esp32_flash_on_path:str="/light/Flash/turn_on?r=255&g=255&b=255"
     esp32_flash_off_path:str="/light/Flash/turn_off"
     esp32_flash_settle_sec:float=1.0
+    # esp32_camera_web_server can answer the first snapshot with a frame buffered
+    # before the flash came on (dark, returned in <0.1 s); throw this many away.
+    esp32_discard_frames:int=1
     interval_sec:int=10; retry_backoff_sec:int=5
     image_path:str="/tmp/water_raw.jpg"; image_timeout:float=8.0
     save_debug_overlays:bool=True; debug_dir:str=os.path.expanduser("~/watermeter/debug")
@@ -213,6 +216,7 @@ def load_config(path)->Config:
         esp32_flash_on_path=raw.get("esp32",{}).get("flash_on_path","/light/Flash/turn_on?r=255&g=255&b=255"),
         esp32_flash_off_path=raw.get("esp32",{}).get("flash_off_path","/light/Flash/turn_off"),
         esp32_flash_settle_sec=float(raw.get("esp32",{}).get("flash_settle_sec",1.0)),
+        esp32_discard_frames=int(raw.get("esp32",{}).get("discard_frames",1)),
         interval_sec=raw.get("processing",{}).get("interval_sec",10),
         retry_backoff_sec=raw.get("processing",{}).get("retry_backoff_sec",5),
         image_path=raw.get("processing",{}).get("image_path","/tmp/water_raw.jpg"),
@@ -1932,6 +1936,8 @@ def _fetch_jpeg(cfg, session, log):
     try:
         session.post(base + cfg.esp32_flash_on_path, timeout=cfg.image_timeout).raise_for_status()
         time.sleep(cfg.esp32_flash_settle_sec)
+        for _ in range(cfg.esp32_discard_frames):
+            session.get(snapshot_url, timeout=cfg.image_timeout).raise_for_status()
         r = session.get(snapshot_url, timeout=cfg.image_timeout)
         r.raise_for_status()
         return r.content
