@@ -81,7 +81,8 @@ class Config:
     # sensor's auto-exposure to settle, GET the esp32_camera_web_server snapshot, flash off.
     esp32_capture_mode:str="ai_on_the_edge"
     esp32_snapshot_url:str=""
-    esp32_flash_on_path:str="/light/Flash/turn_on?brightness=102&r=255&g=255&b=255"
+    # No brightness param: the board applies its "Flash brightness" number on every turn-on.
+    esp32_flash_on_path:str="/light/Flash/turn_on?r=255&g=255&b=255"
     esp32_flash_off_path:str="/light/Flash/turn_off"
     esp32_flash_settle_sec:float=1.0
     interval_sec:int=10; retry_backoff_sec:int=5
@@ -209,7 +210,7 @@ def load_config(path)->Config:
         esp32_base_url=raw.get("esp32",{}).get("base_url","http://192.168.101.190"),
         esp32_capture_mode=str(raw.get("esp32",{}).get("capture_mode","ai_on_the_edge")).lower(),
         esp32_snapshot_url=raw.get("esp32",{}).get("snapshot_url",""),
-        esp32_flash_on_path=raw.get("esp32",{}).get("flash_on_path","/light/Flash/turn_on?brightness=102&r=255&g=255&b=255"),
+        esp32_flash_on_path=raw.get("esp32",{}).get("flash_on_path","/light/Flash/turn_on?r=255&g=255&b=255"),
         esp32_flash_off_path=raw.get("esp32",{}).get("flash_off_path","/light/Flash/turn_off"),
         esp32_flash_settle_sec=float(raw.get("esp32",{}).get("flash_settle_sec",1.0)),
         interval_sec=raw.get("processing",{}).get("interval_sec",10),

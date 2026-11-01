@@ -62,7 +62,7 @@ def test_esphome_mode_flashes_around_snapshot(tmp_path):
     frame = capture_frame(_cfg(tmp_path, esp32_capture_mode="esphome"), s, logging.getLogger("t"))
     assert frame is not None and frame.shape[:2] == (48, 64)
     assert s.calls == [
-        ("POST", "http://192.0.2.1/light/Flash/turn_on?brightness=102&r=255&g=255&b=255"),
+        ("POST", "http://192.0.2.1/light/Flash/turn_on?r=255&g=255&b=255"),
         ("GET", "http://192.0.2.1:8080/"),
         ("POST", "http://192.0.2.1/light/Flash/turn_off"),
     ]
