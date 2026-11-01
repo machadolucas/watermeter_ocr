@@ -7,13 +7,19 @@ ROIs, then save the result back to ~/watermeter/config.yaml. See
 docs/CONFIGURATION.md for the end-to-end meter-swap procedure.
 
 Usage:
-    python3 calibrate.py [--config PATH] [--port N] [--no-browser]
+    python3 calibrate.py [--config PATH] [--host ADDR] [--port N] [--no-browser]
+
+"Live" mode (for aiming the camera) keeps the flash on and re-fetches a frame
+every couple of seconds. Pass --host 0.0.0.0 to reach the page from a phone
+on the LAN while standing at the meter; the page can rewrite config.yaml, so
+only do that for the duration of a calibration session.
 
 No new dependencies — uses only the existing venv (yaml, requests, cv2, numpy).
 """
 from __future__ import annotations
 
 import argparse
+import logging
 import copy
 import http.server
 import json
@@ -386,11 +392,30 @@ class FrameCache:
             return self._bytes
 
 
-def fetch_frame(base_url: str, timeout: float = 8.0) -> bytes:
-    url = base_url.rstrip("/") + "/capture_with_flashlight"
-    r = requests.get(url, timeout=timeout)
-    r.raise_for_status()
-    return r.content
+_log = logging.getLogger("calibrate")
+
+
+def fetch_frame(cfg: "watermeter.Config", live: bool = False) -> bytes:
+    """One frame the same way the service captures it (honours esp32.capture_mode).
+
+    live=True skips the per-frame flash on/off on ESPHome boards: live mode
+    switches the flash on once (set_flash) and only pulls snapshots.
+    """
+    with requests.Session() as session:
+        if live and cfg.esp32_capture_mode == "esphome":
+            base = cfg.esp32_base_url.rstrip("/")
+            r = session.get(cfg.esp32_snapshot_url or (base + ":8080/"), timeout=cfg.image_timeout)
+            r.raise_for_status()
+            return r.content
+        return watermeter._fetch_jpeg(cfg, session, _log)
+
+
+def set_flash(cfg: "watermeter.Config", on: bool) -> None:
+    """Switch the ESPHome flash LEDs; a no-op for AI-on-the-edge (it flashes per capture)."""
+    if cfg.esp32_capture_mode != "esphome":
+        return
+    path = cfg.esp32_flash_on_path if on else cfg.esp32_flash_off_path
+    requests.post(cfg.esp32_base_url.rstrip("/") + path, timeout=cfg.image_timeout).raise_for_status()
 
 
 def run_dial_tests(frame_bytes: bytes, dials: list[dict]) -> list[dict]:
@@ -437,7 +462,7 @@ def _current_meter_type(config_path: Path) -> str:
     return detect_meter_type(doc)
 
 
-def make_handler_class(config_path: Path, esp32_url: str, frame_cache: FrameCache):
+def make_handler_class(config_path: Path, cfg: "watermeter.Config", frame_cache: FrameCache):
 
     class Handler(http.server.BaseHTTPRequestHandler):
         # Quiet default access logs; we only want failures.
@@ -472,7 +497,7 @@ def make_handler_class(config_path: Path, esp32_url: str, frame_cache: FrameCach
 
             if self.path == "/frame.jpg" or self.path.startswith("/frame.jpg?"):
                 try:
-                    data = fetch_frame(esp32_url)
+                    data = fetch_frame(cfg, live="live=1" in self.path)
                     frame_cache.set(data)
                 except requests.RequestException as e:
                     self._send_text(f"ESP32 fetch failed: {e}", 502)
@@ -505,6 +530,15 @@ def make_handler_class(config_path: Path, esp32_url: str, frame_cache: FrameCach
             self._send_text("not found", 404)
 
         def do_POST(self):
+            if self.path == "/flash":
+                try:
+                    set_flash(cfg, bool(self._read_json_body().get("on")))
+                except (json.JSONDecodeError, requests.RequestException) as e:
+                    self._send_json({"error": str(e)}, 502)
+                    return
+                self._send_json({"ok": True})
+                return
+
             if self.path == "/config":
                 try:
                     payload = self._read_json_body()
@@ -563,7 +597,7 @@ def make_handler_class(config_path: Path, esp32_url: str, frame_cache: FrameCach
                 frame = frame_cache.get()
                 if frame is None:
                     try:
-                        frame = fetch_frame(esp32_url)
+                        frame = fetch_frame(cfg)
                         frame_cache.set(frame)
                     except requests.RequestException as e:
                         self._send_json({"error": f"ESP32 fetch failed: {e}"}, 502)
@@ -595,6 +629,8 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--config", default=DEFAULT_CONFIG,
                         help=f"Path to config.yaml (default: {DEFAULT_CONFIG})")
+    parser.add_argument("--host", default="127.0.0.1",
+                        help="Address to listen on (default: 127.0.0.1; 0.0.0.0 for the LAN)")
     parser.add_argument("--port", type=int, default=DEFAULT_PORT,
                         help=f"Port to listen on (default: {DEFAULT_PORT})")
     parser.add_argument("--no-browser", action="store_true",
@@ -606,25 +642,30 @@ def main():
     # the typical case during first-time setup.
     source = config_path if config_path.exists() else REPO_ROOT / "config.yaml"
     try:
-        esp32_url = watermeter.load_config(str(source)).esp32_base_url
+        cfg = watermeter.load_config(str(source))
     except Exception as e:
         print(f"error: could not read ESP32 URL from {source}: {e}", file=sys.stderr)
         sys.exit(1)
 
     frame_cache = FrameCache()
-    handler_cls = make_handler_class(config_path, esp32_url, frame_cache)
+    handler_cls = make_handler_class(config_path, cfg, frame_cache)
 
-    with ThreadingHTTPServer(("127.0.0.1", args.port), handler_cls) as httpd:
-        url = f"http://127.0.0.1:{args.port}"
+    with ThreadingHTTPServer((args.host, args.port), handler_cls) as httpd:
+        url = f"http://{'127.0.0.1' if args.host == '0.0.0.0' else args.host}:{args.port}"
         print(f"[calibrate] listening on {url}")
         print(f"[calibrate] config: {config_path}")
-        print(f"[calibrate] ESP32:  {esp32_url}")
+        print(f"[calibrate] ESP32:  {cfg.esp32_base_url} ({cfg.esp32_capture_mode})")
         if not args.no_browser:
             threading.Thread(target=lambda: webbrowser.open(url), daemon=True).start()
         try:
             httpd.serve_forever()
         except KeyboardInterrupt:
             print("\n[calibrate] shutting down")
+        finally:
+            try:
+                set_flash(cfg, False)
+            except requests.RequestException:
+                pass
 
 
 # ---------------------------------------------------------------------------
@@ -708,6 +749,7 @@ HTML_PAGE = r"""<!doctype html>
   <h1>watermeter_ocr · calibrate</h1>
   <span class="meta" id="meta">loading…</span>
   <div class="spacer"></div>
+  <button id="live-btn">Live</button>
   <button id="refresh-btn">Refresh image</button>
 </header>
 
@@ -864,7 +906,7 @@ async function loadConfig() {
 function roiArrToObj(a) { return { x: a[0], y: a[1], w: a[2], h: a[3] }; }
 function roiObjToArr(o) { return [o.x, o.y, o.w, o.h]; }
 
-async function loadImage() {
+async function loadImage(live = false) {
   return new Promise((resolve) => {
     image.onload = () => {
       imageLoaded = true;
@@ -873,7 +915,7 @@ async function loadImage() {
       resolve();
     };
     image.onerror = () => { toast('Failed to fetch frame from ESP32', 'err'); resolve(); };
-    image.src = '/frame.jpg?t=' + Date.now();
+    image.src = '/frame.jpg?' + (live ? 'live=1&' : '') + 't=' + Date.now();
   });
 }
 
@@ -1102,6 +1144,32 @@ function buildPayload() {
     anchors,
   };
 }
+
+// Live mode: flash on, re-fetch a frame back-to-back (~1-2 s each) while the
+// camera is being aimed. The last live frame stays cached for "Test".
+let liveOn = false;
+async function setFlash(on) {
+  try { await fetch('/flash', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ on }) }); }
+  catch (e) { toast('Flash toggle failed', 'err'); }
+}
+async function liveLoop() {
+  while (liveOn) {
+    // Re-assert every frame: the running service switches the flash off
+    // after each of its own captures.
+    await setFlash(true);
+    await loadImage(true);
+    draw();
+    await new Promise(r => setTimeout(r, 500));
+  }
+}
+document.getElementById('live-btn').addEventListener('click', async () => {
+  const btn = document.getElementById('live-btn');
+  liveOn = !liveOn;
+  btn.textContent = liveOn ? 'Stop live' : 'Live';
+  await setFlash(liveOn);
+  if (liveOn) liveLoop();
+});
+window.addEventListener('pagehide', () => { if (liveOn) navigator.sendBeacon('/flash', new Blob([JSON.stringify({ on: false })], { type: 'application/json' })); });
 
 document.getElementById('refresh-btn').addEventListener('click', async () => {
   await loadImage();
