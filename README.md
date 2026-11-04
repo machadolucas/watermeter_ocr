@@ -3,7 +3,7 @@
 Reads a water meter using an **ESP32-S3 AI-on-the-Edge Cam** for image capture and a **Mac** for fast, robust processing. Two pipelines are supported, selectable via `meter.type`:
 
 - **Mechanical** (default): odometer digits + 4 red-pointer dials. Apple **Vision** per-digit OCR (full/top/bottom) resolves rolling digits; OpenCV reads the analog dials.
-- **Digital**: fully electronic LCD (e.g. Qalcosonic W1) with total and instant-flow lines. Apple Vision line OCR only — no dials, no digit composition. Handles the display's rotating views (numeric + two diagnostic) by retrying within a single cycle until a numeric view is captured. The flow-line ROI is optional: if flash glare makes both lines hard to capture cleanly, calibrate only the total and the service falls back to delta-computed rate.
+- **Digital**: fully electronic LCD (e.g. Qalcosonic W1) with total and instant-flow lines. Apple Vision line OCR only — no dials, no digit composition. Handles the display's rotating views (numeric + two diagnostic) by retrying within a single cycle until a numeric view is captured, and accepts readings through `ReadingGate` (integer litres: plausible forward steps at once, doubtful ones only once confirmed, backward steps held unless several consecutive readings agree on a lower total; see [docs/CONFIGURATION.md](./docs/CONFIGURATION.md)). The flow-line ROI is optional: if flash glare makes both lines hard to capture cleanly, calibrate only the total and the service falls back to delta-computed rate.
 
 Publishes **total (m³)**, **flow rate (m³/min)**, **liters/min**, and an **overlay camera feed** to Home Assistant via **MQTT**. Digital mode additionally publishes **`water_flow_m3h`** — the instant flow read straight off the LCD (more responsive than the delta-based rate) — when the flow-line ROI is configured.
 
@@ -41,7 +41,7 @@ Publishes **total (m³)**, **flow rate (m³/min)**, **liters/min**, and an **ove
 * Rolling digits resolved using **×0.1 dial progress** + stickiness
 * MQTT Discovery entities in Home Assistant:
 
-  * `sensor.water_total` (m³, `total_increasing`)
+  * `sensor.water_total` (m³, `total`: a net register, so small dips are legitimate)
   * `sensor.water_rate` (m³/min)
   * `sensor.water_rate_lpm` (L/min)
   * `camera.water_meter_overlay` (debug overlay JPEG with confidence indicators)
@@ -61,7 +61,7 @@ Publishes **total (m³)**, **flow rate (m³/min)**, **liters/min**, and an **ove
 
 ## Install
 
-The installer sets up a Python venv at `~/watermeter/venv/`, dependencies, directories, LaunchAgent, builds the OCR helper from `ocr.swift`, and places starter config & state paths.
+The installer sets up a Python venv at `~/watermeter/venv/`, dependencies, directories, builds the OCR helper from `ocr.swift`, bundles and signs the service as the PyInstaller binary `~/watermeter/bin/watermeter` (the LaunchAgent runs that binary, not `python3 watermeter.py`), and places starter config & state paths.
 
 ```bash
 ./install.sh
@@ -97,7 +97,7 @@ When new code lands in this repo and you've already installed the service on the
 
    This:
    - rebuilds the Swift OCR helper at `~/watermeter/bin/ocr`,
-   - overwrites `~/watermeter/watermeter.py` with the new version,
+   - rebuilds the signed PyInstaller binary `~/watermeter/bin/watermeter` that the service runs,
    - refreshes the LaunchAgent plist and reloads it (unload + load + start),
    - preserves your `~/watermeter/config.yaml`, `state.json`, `reference.jpg`, and everything under `~/watermeter/debug/`.
 
@@ -110,7 +110,7 @@ When new code lands in this repo and you've already installed the service on the
 
 > The installer only copies `config.yaml` from the repo if `~/watermeter/config.yaml` is missing — your tuned settings survive. When a release adds new config keys, the service picks them up via `load_config`'s built-in fallbacks; release notes will call out any default changes that matter.
 
-> If the update introduces a schema change your old file doesn't have (e.g. switching from `mechanical` to `digital`), edit `~/watermeter/config.yaml` before step 2, or use `~/watermeter/venv/bin/python3 calibrate.py` for ROI work. When switching meter types, run `~/watermeter/venv/bin/python3 watermeter.py --config ~/watermeter/config.yaml --reset-total 0` once so the monotonic guard accepts the new baseline.
+> If the update introduces a schema change your old file doesn't have (e.g. switching from `mechanical` to `digital`), edit `~/watermeter/config.yaml` before step 2, or use `~/watermeter/venv/bin/python3 calibrate.py` for ROI work. When switching meter types, run `~/watermeter/venv/bin/python3 watermeter.py --config ~/watermeter/config.yaml --reset-total 0` once so the guards accept the new baseline.
 
 ---
 
@@ -195,8 +195,8 @@ rois:
       zero_angle_deg: -90
 
 postproc:
-  monotonic_epsilon: 0.0005   # ignore tiny backwards steps
-  big_jump_guard: 2.0         # block unrealistic jumps (m³)
+  monotonic_epsilon: 0.0005   # mechanical: ignore tiny backwards steps
+  big_jump_guard: 2.0         # mechanical: block unrealistic jumps (m³); digital uses ReadingGate (see docs/CONFIGURATION.md)
 
 alignment:
   enabled: true
@@ -360,10 +360,12 @@ These improvements deliver:
 
 Entities are auto-created via MQTT Discovery on startup:
 
-* `sensor.water_total` (m³, `total_increasing`)
+* `sensor.water_total` (m³, `total`: a net register, so small dips are legitimate)
 * `sensor.water_rate` (m³/min)
 * `sensor.water_rate_lpm` (L/min)
 * `camera.water_meter_overlay` (latest debug overlay image)
+
+The total, rate and flow sensors carry an availability topic (default `<mqtt.topic>/status`, retained LWT `offline`); the service publishes `offline` once no reading has been accepted for `mqtt.stale_after_sec` (600 s; 0 disables). The overlay camera has no availability.
 
 Example Lovelace card:
 

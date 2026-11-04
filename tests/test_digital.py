@@ -391,12 +391,12 @@ class TestRunDigitalCycle:
     def _patch_capture(self, monkeypatch, return_value=None, returns_seq=None):
         calls = {"n": 0}
         if returns_seq is not None:
-            def fake(cfg, session, log):
+            def fake(cfg, session, log, **kw):
                 r = returns_seq[min(calls["n"], len(returns_seq) - 1)]
                 calls["n"] += 1
                 return r
         else:
-            def fake(cfg, session, log):
+            def fake(cfg, session, log, **kw):
                 calls["n"] += 1
                 return return_value if return_value is not None else _dummy_frame()
         monkeypatch.setattr("watermeter.capture_frame", fake)
@@ -786,7 +786,7 @@ class _RecordingClient:
         self.on_connect = None
         self.on_disconnect = None
     def username_pw_set(self, *a, **kw): pass
-    def publish(self, topic, payload, retain=False):
+    def publish(self, topic, payload, retain=False, qos=0):
         self.published.append((topic, payload, retain))
 
 

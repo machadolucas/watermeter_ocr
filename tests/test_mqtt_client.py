@@ -90,4 +90,4 @@ class TestPublishGatedByConnection:
         client.client.on_connect(client.client, None, {}, 0)
         client.client.publish.reset_mock()
         client.publish("some/topic", "hello")
-        client.client.publish.assert_called_once_with("some/topic", "hello", retain=False)
+        client.client.publish.assert_called_once_with("some/topic", "hello", retain=False, qos=0)

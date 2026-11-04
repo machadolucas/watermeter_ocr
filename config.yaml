@@ -7,6 +7,7 @@ processing:
   retry_backoff_sec: 5
   image_path: "/tmp/water_raw.jpg"
   image_timeout: 8.0
+  max_image_bytes: 2000000   # empty or larger HTTP bodies count as capture failures
   save_debug_overlays: true
   debug_dir: "~/watermeter/debug"
   debug_keep_latest_only: true
@@ -49,6 +50,17 @@ postproc:
   # reading is still rejected.
   big_jump_elapsed_cap_days: 7.0
 
+  # Digital meters only: ReadingGate (integer litres) replaces the
+  # monotonic_epsilon / big_jump_* rules above. The mechanical path still uses those.
+  max_flow_lpm: 40.0             # forward step > this x dt (+ slack) is rejected "too_fast"
+  confirm_above_lpm: 25.0        # up to this rate x min(dt, immediate_dt_cap_sec) is accepted at once
+  immediate_dt_cap_sec: 75.0     # dt cap for the immediate-accept bound
+  flow_slack_l: 1                # litres of slack added to both bounds (and the backward "hold" band)
+  confirm_min_gap_sec: 15.0      # a candidate needs a later independent capture at least this far on
+  candidate_ttl_sec: 600.0       # an unconfirmed candidate expires after this long
+  rebaseline_count: 3            # consecutive agreeing backward readings that re-baseline the total
+  rebaseline_min_span_sec: 60.0  # ...and they must span at least this long
+
 mqtt:
   host: "192.168.1.23"
   port: 1883
@@ -57,11 +69,15 @@ mqtt:
   topic: "home/watermeter"
   client_id: "water-ocr-mac"
   ha_discovery_prefix: "homeassistant"
+  availability_topic: ""    # "" -> <topic>/status (LWT "offline", retained)
+  stale_after_sec: 600      # publish "offline" after this long without an accepted reading; 0 disables
 
 paths:
   ocr_bin: "~/watermeter/bin/ocr"
   state_path: "~/watermeter/state.json"
   log_path:   "~/watermeter/watermeter.log"
+  log_max_bytes: 10000000   # rotate the log at this size
+  log_backup_count: 5       # rotated files kept
 
 alignment:
   enabled: true
@@ -79,6 +95,9 @@ alignment:
   max_rotation_deg: 15.0
   warp_mode: "similarity"
   write_debug_aligned: true
+  min_inliers: 25           # alignment quality gate: minimum RANSAC inliers
+  min_inlier_ratio: 0.5     # ...minimum inliers / good matches
+  max_translation_frac: 0.10  # ...maximum shift as a fraction of frame width/height
 
 # Auto-centering: automatically detects and centers dials for improved accuracy
 auto_centering:
@@ -207,5 +226,14 @@ rois:
 #   # OCR is returning empty; turn off in production (high write volume).
 #   save_ocr_crops: false
 #   max_retries: 2               # extra captures per cycle if wrong view detected
-#   retry_delay_sec: 5.5         # > longest diag-view dwell (5s) so retries phase-cross
+#   retry_delay_sec: 5.5         # > longest diag-view dwell (5.0 s) so retries phase-cross
+#   cycle_budget_sec: 45         # no new attempts once a cycle has run this long
+#   # Optional: capture inside the numeric view window (see docs/CONFIGURATION.md).
+#   # Worth enabling when interval_sec equals the rotation period (20 s).
+#   view_sync:
+#     enabled: false
+#     period_sec: 20.0           # full view-rotation period
+#     numeric_dwell_sec: 11.0    # length of the numeric window
+#     margin_sec: 1.0            # safety margin kept from the window edges
+#     capture_lead_sec: 1.5      # initial guess of request-start -> exposure delay (adapts to measured lead)
 #   min_digits: 6                # cheap-fail bar for diagnostic screens

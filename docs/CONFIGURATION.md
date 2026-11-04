@@ -56,6 +56,7 @@ Running [`calibrate.py`](../calibrate.py) edits `~/watermeter/config.yaml` direc
 | `processing.retry_backoff_sec` | `5` | Delay after a failed capture before retrying. |
 | `processing.image_path` | `/tmp/water_raw.jpg` | Where the fetched JPEG is cached. |
 | `processing.image_timeout` | `8.0` | HTTP timeout for the ESP32 capture. |
+| `processing.max_image_bytes` | `2000000` | Empty or larger HTTP bodies are treated as capture failures. |
 | `processing.save_debug_overlays` | `true` | Whether to write annotated overlay JPEGs. |
 | `processing.debug_dir` | `~/watermeter/debug` | Overlay destination. |
 | `processing.debug_keep_latest_only` | `true` | `true` overwrites a single `overlay_latest.jpg`; `false` timestamps each. |
@@ -64,6 +65,13 @@ Running [`calibrate.py`](../calibrate.py) edits `~/watermeter/config.yaml` direc
 | `mqtt.topic` | `home/watermeter` | Base topic for published sensor values. |
 | `mqtt.client_id` | `water-ocr-mac` | MQTT client id. |
 | `mqtt.ha_discovery_prefix` | `homeassistant` | Prefix for Home Assistant MQTT Discovery configs. |
+| `mqtt.availability_topic` | `{mqtt.topic}/status` | Availability topic (LWT `offline`, retained, QoS 1). |
+| `mqtt.stale_after_sec` | `600` | Publish `offline` once no reading has been accepted for this long; `0` disables. |
+| `paths.log_max_bytes` | `10000000` | Rotate the log at this size. |
+| `paths.log_backup_count` | `5` | Rotated log files kept. |
+| `alignment.min_inliers` | `25` | Alignment quality gate: minimum RANSAC inliers (good frames show ≥ 91). |
+| `alignment.min_inlier_ratio` | `0.5` | ...minimum inliers / good matches (good frames ≥ 0.83). |
+| `alignment.max_translation_frac` | `0.10` | ...maximum shift as a fraction of frame width/height. |
 | `overlay.publish_mqtt` | `true` | Publish the debug overlay JPEG to MQTT as a camera entity. |
 | `overlay.camera_topic` | `{mqtt.topic}/debug/overlay` | Topic the overlay JPEG is published to. |
 | `overlay.font_scale`, `font_thickness`, `outline_thickness`, `line_thickness` | — | Overlay rendering. |
@@ -80,12 +88,26 @@ Running [`calibrate.py`](../calibrate.py) edits `~/watermeter/config.yaml` direc
 | `digital.total_regex` | `^\d{6}\.?\d{3}$` | *(digital)* Regex that Vision's raw total output must match. |
 | `digital.flow_regex` | `^\d{1,3}\.\d{3}$` | *(digital)* Regex for Vision's flow output. |
 | `digital.max_retries` | `2` | *(digital)* Extra captures per cycle if the display is on a diagnostic view. |
-| `digital.retry_delay_sec` | `5.5` | *(digital)* Delay between retries. Must exceed longest diag-view dwell (5 s). |
+| `digital.retry_delay_sec` | `5.5` | *(digital)* Delay between retries. Must exceed longest diag-view dwell (5.0 s). |
+| `digital.cycle_budget_sec` | `45` | *(digital)* No new attempts once a cycle has run this long. |
+| `digital.view_sync.enabled` | `false` | *(digital)* Time captures to the LCD's numeric view (see "The rotating display"). |
+| `digital.view_sync.period_sec` | `20.0` | *(digital)* View-rotation period. |
+| `digital.view_sync.numeric_dwell_sec` | `11.0` | *(digital)* Length of the numeric window. |
+| `digital.view_sync.margin_sec` | `1.0` | *(digital)* Safety margin kept from the window edges. |
+| `digital.view_sync.capture_lead_sec` | `1.5` | *(digital)* Initial guess of the delay from request start to exposure (adapts to the measured lead). |
 | `digital.min_digits` | `6` | *(digital)* Cheap-fail threshold that rejects diagnostic screens before regex. |
-| `postproc.monotonic_epsilon` | `0.0005` | Tolerated backward wobble; anything smaller than this is treated as noise, not a real regression. |
-| `postproc.big_jump_guard` | `2.0` | Base allowance (m³) for forward jumps between captures. The effective allowance is this PLUS `big_jump_rate_per_day` × elapsed-days-since-last-publish. |
-| `postproc.big_jump_rate_per_day` | `1.0` | Per-day catch-up rate (m³/day) added to the base guard, scaled by elapsed time since the last accepted publish. Lets the service self-heal after long outages instead of getting stuck. Set to `0` for a fixed guard. |
-| `postproc.big_jump_elapsed_cap_days` | `7.0` | Cap on the elapsed-time component (in days). After this many days offline the rate-per-day stops adding more allowance. Prevents a wildly bogus OCR read from being accepted after a multi-week outage. |
+| `postproc.monotonic_epsilon` | `0.0005` | *(mechanical)* Tolerated backward wobble; anything smaller than this is treated as noise, not a real regression. |
+| `postproc.big_jump_guard` | `2.0` | *(mechanical)* Base allowance (m³) for forward jumps between captures. The effective allowance is this PLUS `big_jump_rate_per_day` × elapsed-days-since-last-publish. |
+| `postproc.big_jump_rate_per_day` | `1.0` | *(mechanical)* Per-day catch-up rate (m³/day) added to the base guard, scaled by elapsed time since the last accepted publish. Lets the service self-heal after long outages instead of getting stuck. Set to `0` for a fixed guard. |
+| `postproc.big_jump_elapsed_cap_days` | `7.0` | *(mechanical)* Cap on the elapsed-time component (in days). After this many days offline the rate-per-day stops adding more allowance. Prevents a wildly bogus OCR read from being accepted after a multi-week outage. |
+| `postproc.max_flow_lpm` | `40.0` | *(digital, ReadingGate)* Forward step > this × dt + slack is rejected `too_fast`. |
+| `postproc.confirm_above_lpm` | `25.0` | *(digital)* Forward steps up to this × min(dt, `immediate_dt_cap_sec`) + slack are accepted at once. |
+| `postproc.immediate_dt_cap_sec` | `75.0` | *(digital)* dt cap for the immediate-accept bound. |
+| `postproc.flow_slack_l` | `1` | *(digital)* Litres of slack on both bounds and the backward `hold` band. |
+| `postproc.confirm_min_gap_sec` | `15.0` | *(digital)* A candidate must be confirmed by a later independent capture at least this far on. |
+| `postproc.candidate_ttl_sec` | `600.0` | *(digital)* An unconfirmed candidate expires after this long. |
+| `postproc.rebaseline_count` | `3` | *(digital)* Consecutive agreeing backward readings needed to re-baseline. |
+| `postproc.rebaseline_min_span_sec` | `60.0` | *(digital)* Those readings must also span at least this long. |
 | `alignment.enabled` | `true` | Run ORB+RANSAC alignment to the reference frame. |
 | `alignment.reference_path` | `~/watermeter/reference.jpg` | Reference image for alignment. Auto-captured on first run if missing. |
 | `alignment.anchor_rois` | — | Normalized rectangles where ORB is allowed to look for features. Keep over stable printed areas. |
@@ -159,8 +181,9 @@ Defaults (0.92 / 0.08) work for most meters. Tighten (e.g. 0.85 / 0.15) if digit
 
 Postprocessing guards in `postproc`:
 
-- **`monotonic_epsilon`**: a backward step of up to this many m³ is treated as noise and the published total is held at the previous value. Keeps tiny jitter from making the Home Assistant total_increasing sensor reset.
+- **`monotonic_epsilon`**: a backward step of up to this many m³ is treated as noise and the published total is held at the previous value. Keeps tiny jitter from showing up as a backward step in the published total.
 - **`big_jump_guard`** + **`big_jump_rate_per_day`** + **`big_jump_elapsed_cap_days`**: the **effective** forward-jump allowance is `big_jump_guard + min(elapsed_days, big_jump_elapsed_cap_days) × big_jump_rate_per_day`. Where `elapsed_days` is the time between the last successful publish and the current cycle. In normal operation (cycles seconds apart) the effective guard is essentially the base `big_jump_guard`. After long stretches of failed cycles (LCD stuck on a diagnostic view, network outage, etc.) the allowance grows so the service can resume publishing once OCR works again, instead of staying trapped behind a stale `prev_total`. The cap prevents a wildly bogus OCR read from being accepted after a multi-week outage.
+- The two items above apply to the **mechanical** path. The digital path uses `ReadingGate` (see "Digital meter" below).
 - For mechanical meters, when the OCR-integer jumps too far, `estimate_total_from_dials` is consulted as a fallback. If neither fits within the effective guard, the reading is held.
 
 All guards are relative to `prev_total` in `state.json`. After a physical meter swap the new meter's reading will almost certainly trip `big_jump_guard` (the running total drops from ~12k m³ to 0). Use `--reset-total` to clear state — see below.
@@ -200,8 +223,15 @@ digital:
   total_regex: "^\\d{6}\\.?\\d{3}$"
   flow_regex:  "^\\d{1,3}\\.\\d{3}$"
   max_retries: 2                        # extra captures per cycle on a wrong view
-  retry_delay_sec: 5.5                  # must exceed longest diag-view dwell
+  retry_delay_sec: 5.5                  # must exceed longest diag-view dwell (5.0 s)
   min_digits: 6                         # cheap-fail bar for diagnostic screens
+  cycle_budget_sec: 45                  # no new attempts once a cycle has run this long
+  view_sync:                            # optional, off by default
+    enabled: false
+    period_sec: 20.0
+    numeric_dwell_sec: 11.0
+    margin_sec: 1.0
+    capture_lead_sec: 1.5
 ```
 
 `alignment.*` still applies — ORB alignment of the whole frame helps keep the LCD ROIs stable under small camera drift, even without dials.
@@ -221,13 +251,27 @@ Calibrating both ROIs is strictly better when you can manage the reflections; ca
 ### How the pipeline works
 
 1. Capture a JPEG from `/capture_with_flashlight`.
-2. Optionally align against `reference.jpg`.
+2. Optionally align against `reference.jpg`. An alignment that fails the quality gate (`alignment.min_inliers`, `min_inlier_ratio`, `max_translation_frac`) ends the attempt as `align_failed` instead of OCR'ing an unaligned frame. OCR reads the aligned image in memory; `aligned_last.jpg` is optional debug output only.
 3. Run the Swift helper in `--mode line` over the two ROIs. It uses Apple Vision's text recognizer; on empty output it retries with `.accurate`. The returned string is digits plus optional `.`.
 4. Check `is_valid_digital_view` — cheap pre-validator that rejects frames with too few digit characters (diagnostic screens).
 5. Parse each line with the configured regex. `parse_digital_total` injects a decimal at position -3 if Vision didn't see one.
-6. Run `validate_digital_reading` — reject non-finite, negative flow, and forward jumps larger than the effective big-jump guard (base + per-day catch-up; see "Guards"). Backward jumps are still rejected strictly under `monotonic_epsilon`.
-7. If any step fails, retry up to `digital.max_retries` times with `digital.retry_delay_sec` between captures. After that, skip the cycle and hold the previous value.
-8. Apply the usual monotonic / big-jump guards to the total and publish.
+6. Run `validate_digital_reading` — reject non-finite or negative flow — and `ReadingGate.preview` on the total. An implausible step is retried with reason `implausible`.
+7. If any step fails, retry up to `digital.max_retries` times with `digital.retry_delay_sec` between captures (or until the next numeric window when view sync knows the phase); `digital.cycle_budget_sec` stops new attempts in a slow cycle. After that, skip the cycle and hold the previous value; the give-up is logged at WARNING with digits, litres and the gate detail.
+8. `handle_digital_result` runs `ReadingGate.evaluate` on the cycle's final reading. An accepted reading is published (value with 3 decimals, QoS 1, retained) and saved to `state.json`.
+
+### Acceptance policy (`ReadingGate`)
+
+The digital path works in integer litres and does not use `big_jump_guard` or `monotonic_epsilon`. `dt` is the time since the last **accepted** capture. Keys are under `postproc`:
+
+- Forward step ≤ `confirm_above_lpm` (25) × min(dt, `immediate_dt_cap_sec` 75 s) + `flow_slack_l` (1 L): accepted at once.
+- Forward step > `max_flow_lpm` (40) × dt + 1 L: rejected `too_fast`.
+- In between: `candidate`, accepted only when a later independent capture (≥ `confirm_min_gap_sec` 15 s, within `candidate_ttl_sec` 600 s) confirms it.
+- Backward ≤ 1 L: `hold`.
+- Larger backward: rejected, unless `rebaseline_count` (3) consecutive backward readings agree (rate-consistent) and span ≥ `rebaseline_min_span_sec` (60 s); the total is then `rebaseline`d to the lower value. The meter is bidirectional, and this frees a total trapped high by an accepted misread.
+
+Sizing: observed rates 2026-10-01..11-04 were p50 6, p90 9, p99 12.9, p99.9 23.3 L/min. The service pipe is ≤ 20 mm with a pressure-reducing valve (~56 L/min at 3 m/s); a DN20 Q3 2.5 meter has Q4 ≈ 52 L/min.
+
+The 7-segment classifier (`classify_7seg`) returns digit `""` (unreadable, retried) for ink between 0.10 and 0.30 and uses a 0.20 threshold; measured on 616 live frames, unlit segments were ≤ 0.061 and lit ≥ 0.375.
 
 ### The rotating display
 
@@ -235,11 +279,13 @@ The Qalcosonic W1 auto-cycles between three views:
 
 | View | Dwell time |
 |---|---|
-| Numeric (total + flow) | ~10 s |
-| Diagnostic 1 | ~5 s |
-| Diagnostic 2 | ~4 s |
+| Numeric (total + flow) | 11.0 s |
+| Diagnostic B | 3.9 s |
+| Diagnostic A | 5.0 s |
 
-Any single capture has a ~53 % chance of landing on the numeric view. `digital.retry_delay_sec = 5.5` guarantees that a retry crosses at least one dwell boundary (> longest diag-view of 5 s), so the retries don't phase-lock onto the same wrong view.
+Measured 2026-11-04 at 4.7 fps over 12 rotations; the period is 20.0 s (20.004 s by fit). Any single capture has a ~55 % chance of landing on the numeric view. `digital.retry_delay_sec = 5.5` exceeds the longest diagnostic dwell (5.0 s), so a retry crosses at least one dwell boundary and doesn't phase-lock onto the same wrong view.
+
+**View sync.** A `processing.interval_sec` of 20 on a 20.0 s rotation phase-locks: every cycle's first capture lands on the same view. Setting `digital.view_sync.enabled: true` turns on `ViewPhase`: it tracks the phase of the numeric window from labelled captures (numeric frames and wrong-view frames), schedules each cycle's capture inside the numeric window, staggers captures while the phase is unknown, and widens its uncertainty for drift (0.1 % of elapsed time, doubling on a contradiction, capped at 1 %). When the phase is known, wrong-view retries wait for the next numeric window. Simulated: ~4 % first-capture misses and every cycle gets a reading, vs ~45 % misses unsynchronised.
 
 **Retry budget**: 3 captures × ~0.5 s + 2 × 5.5 s delays ≈ 12 s worst case. That's why the recommended `processing.interval_sec: 15` for digital mode — it gives the loop headroom to finish even when the first two captures miss.
 
@@ -249,7 +295,8 @@ Digital mode publishes all the mechanical topics plus a new one:
 
 | Topic | Retained | Source |
 |---|---|---|
-| `{mqtt.topic}/main/value` | yes | Parsed total from the LCD (after guards). |
+| `{mqtt.topic}/main/value` | yes | Parsed total from the LCD (after `ReadingGate`), 3 decimals, QoS 1. |
+| `{mqtt.availability_topic}` (default `{mqtt.topic}/status`) | yes | `online` / `offline`; retained LWT `offline`. Goes `offline` after `mqtt.stale_after_sec` without an accepted reading. |
 | `{mqtt.topic}/main/rate` | no | Delta-computed m³/min (same formula as mechanical). |
 | `{mqtt.topic}/main/rate_lpm` | no | Delta-computed L/min. |
 | `{mqtt.topic}/main/flow_m3h` | no | **New.** Instantaneous flow read directly off the LCD. Published only when `rois.digital.flow` is configured. |
@@ -380,6 +427,7 @@ The calibration GUI does all of this interactively, but the manual path works fi
 ```json
 {
   "total": 12345.678,
+  "total_l": 12345678,
   "ts": 1700000000.0,
   "dial_histories": {
     "dial_0": [5.1, 5.2, 5.3, ...],
@@ -388,7 +436,8 @@ The calibration GUI does all of this interactively, but the manual path works fi
 }
 ```
 
-- `total` — last published m³. Compared against each new reading for the monotonic and big-jump guards.
+- `total` — last published m³. Compared against each new reading for the monotonic and big-jump guards (mechanical).
+- `total_l` — the same total in integer litres, written by the digital path (`ReadingGate`).
 - `ts` — Unix timestamp of that reading. Used to compute flow rate.
 - `dial_histories` — last ~20 readings per dial, for temporal validation and prediction. Can be safely cleared if bad readings polluted it.
 
@@ -418,6 +467,7 @@ Safety on `--reset-total`:
 - Usually `big_jump_guard` is clamping every new reading. Check the log for `CLAMP: big jump detected`. After a meter swap, run `--reset-total`. If you legitimately see > 2 m³ per 10 s of flow, raise `big_jump_guard` — rare for residential use.
 
 **Long stretches of `validate_failed` and the service won't recover.**
+- Digital path: `ReadingGate` frees a total trapped above the meter by itself (`rebaseline` after `postproc.rebaseline_count` agreeing backward readings spanning `rebaseline_min_span_sec`). Look for `Giving up this cycle` warnings; they carry the digits, litres and gate detail. The notes below describe the mechanical path.
 - Pre-`big_jump_rate_per_day` (or with `big_jump_rate_per_day: 0`), if `validate_digital_reading` rejected one cycle, every subsequent successful OCR was compared against the same stale `prev_total` and rejected for the same reason — a permanent trap that required deleting `state.json`. The default `big_jump_rate_per_day: 1.0` self-heals: after `Δt` of failure, the allowance grows by `Δt × 1.0` m³/day. If you've kept it at `0`, raise it (e.g. `1.0` for residential, higher for commercial). If self-healing isn't kicking in, check that `state.json`'s `ts` field is not being refreshed when validation fails (it shouldn't be; only successful publishes update it).
 
 **Alignment keeps failing (`aligned_ok=False` in logs).**
@@ -429,4 +479,4 @@ Safety on `--reset-total`:
 - MQTT not connected. Check logs for `MQTT connect rejected` (bad credentials) or `MQTT disconnected`. Also verify the broker is reachable: `mosquitto_sub -h <host> -t 'home/watermeter/#'`.
 
 **HA accepts readings but `sensor.water_total` appears to reset.**
-- This usually means you reset the state without informing HA. `total_increasing` sensors expect either strictly monotonic growth or a detectable device-reboot. HA uses the `last_reset` attribute for this, which `watermeter_ocr` currently doesn't publish — a reset may briefly look like a rollback. After a meter swap, HA typically recovers within a few sample periods.
+- This usually means you reset the state without informing HA. the total sensor's discovery uses `state_class: total` (a net register, so dips are legitimate), which does not need `last_reset`. If it still looks wrong, check the recorded statistics for a one-off jump.

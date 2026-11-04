@@ -22,6 +22,46 @@ def load_yaml(path): return yaml.safe_load(open(path,"r"))
 def save_json(path,obj):
     tmp=path+".tmp"; open(tmp,"w").write(json.dumps(obj,indent=2))
     os.replace(tmp,path)
+def setup_logging(path, max_bytes, backup_count):
+    """Log to a size-rotated file at INFO level; returns the handler."""
+    import logging.handlers
+    h = logging.handlers.RotatingFileHandler(path, maxBytes=max_bytes, backupCount=backup_count)
+    h.setFormatter(logging.Formatter("%(asctime)s [%(levelname)s] %(message)s"))
+    root = logging.getLogger()
+    root.addHandler(h)
+    root.setLevel(logging.INFO)
+    return h
+
+
+def load_state(path, log):
+    """Load state.json defensively; always returns a dict with the four keys."""
+    out = {"total": None, "ts": None, "meter_type": None, "dial_histories": {}}
+    raw = read_json(path, None)
+    if not isinstance(raw, dict):
+        return out
+    def _num(v):
+        return isinstance(v, (int, float)) and not isinstance(v, bool) and math.isfinite(v)
+    total = raw.get("total")
+    if total is not None:
+        if _num(total) and total >= 0:
+            out["total"] = total
+            ts = raw.get("ts")
+            out["ts"] = ts if _num(ts) else None
+        else:
+            log.warning("state.json total=%r invalid; ignoring saved total and ts", total)
+    else:
+        ts = raw.get("ts")
+        out["ts"] = ts if _num(ts) else None
+    out["meter_type"] = raw.get("meter_type")
+    dh = raw.get("dial_histories")
+    out["dial_histories"] = dh if isinstance(dh, dict) else {}
+    return out
+
+
+def flow_tracked(cfg) -> bool:
+    return bool(cfg.digital_flow_roi) or bool(cfg.digital_flow_digits)
+
+
 def read_json(path,default=None):
     try: return json.load(open(path,"r"))
     except (OSError, ValueError): return default
@@ -72,6 +112,9 @@ class AlignConfig:
     nfeatures:int=1200; ratio_test:float=0.75; min_matches:int=40
     ransac_thresh_px: float=3.0; max_scale_change: float=0.08; max_rotation_deg: float=15.0
     warp_mode:str="similarity"; write_debug_aligned: bool=True
+    # Quality gate on the RANSAC fit. Good frames (2026-11-04): >= 91 inliers,
+    # inlier ratio >= 0.83, shift <= 1.1 px.
+    min_inliers:int=25; min_inlier_ratio:float=0.5; max_translation_frac:float=0.10
 
 @dataclass
 class Config:
@@ -90,19 +133,31 @@ class Config:
     esp32_discard_frames:int=1
     interval_sec:int=10; retry_backoff_sec:int=5
     image_path:str="/tmp/water_raw.jpg"; image_timeout:float=8.0
+    max_image_bytes:int=2_000_000
     save_debug_overlays:bool=True; debug_dir:str=os.path.expanduser("~/watermeter/debug")
     digits_count:int=6; digits_window:List[float]=field(default_factory=lambda:[0.2078,0.0104,0.5984,0.1917])
     per_digit_inset:float=0.10; rolling_threshold_up:float=0.92; rolling_threshold_down:float=0.08
     state_path:str=os.path.expanduser("~/watermeter/state.json")
     monotonic_epsilon:float=0.0005; big_jump_guard:float=2.0
     big_jump_rate_per_day:float=1.0; big_jump_elapsed_cap_days:float=7.0
+    # Digital acceptance policy (ReadingGate); supersedes big_jump_* for digital.
+    # Sized 2026-11-04: observed p99.9 23.3 L/min; service pipe <= 20 mm with a
+    # pressure-reducing valve (~56 L/min at 3 m/s); DN20 Q3 2.5 meter Q4 ~52 L/min.
+    max_flow_lpm:float=40.0; confirm_above_lpm:float=25.0
+    immediate_dt_cap_sec:float=75.0; flow_slack_l:int=1
+    confirm_min_gap_sec:float=15.0; candidate_ttl_sec:float=600.0
+    rebaseline_count:int=3; rebaseline_min_span_sec:float=60.0
     mqtt_host:str="127.0.0.1"; mqtt_port:int=1883
     mqtt_username:Optional[str]=None; mqtt_password:Optional[str]=None
     mqtt_main_topic:str="home/watermeter"; mqtt_client_id:str="water-ocr-mac"
     ha_discovery_prefix:str="homeassistant"
+    mqtt_availability_topic:str=""   # "" -> <mqtt_main_topic>/status
+    mqtt_stale_after_sec:float=600.0  # 0 disables staleness -> offline
     dials:List[DialConfig]=field(default_factory=list)
     ocr_bin:str=os.path.expanduser("~/watermeter/bin/ocr")
     log_path:str=os.path.expanduser("~/watermeter/watermeter.log")
+    log_max_bytes:int=10_000_000
+    log_backup_count:int=5
     align:AlignConfig=field(default_factory=AlignConfig)
     overlay_font_scale: float = 1.0
     overlay_font_thickness: int = 2
@@ -114,7 +169,7 @@ class Config:
     overlay_camera_name: str = "Water Meter Overlay"
     overlay_camera_unique_id: str = "water_overlay_macocr"
     overlay_jpeg_quality: int = 85
-    quiet_hours_enabled: bool = True
+    quiet_hours_enabled: bool = False
     quiet_start: str = "00:00"
     quiet_end: str = "07:00"
     quiet_interval_sec: int = 60
@@ -187,6 +242,15 @@ class Config:
     # call's sub-ROI + raw result at INFO level. Off by default — turn on
     # when diagnosing why per-digit OCR is returning empty.
     digital_save_ocr_crops: bool = False
+    # Capture inside the LCD numeric view (see ViewPhase). Measured cycle:
+    # numeric 11.0 s, diag B 3.9 s, diag A 5.0 s, period 20.0 s.
+    # No new attempt starts once a cycle has run this long (slow HTTP / OCR).
+    digital_cycle_budget_sec: float = 45.0
+    view_sync_enabled: bool = False
+    view_period_sec: float = 20.0
+    view_numeric_dwell_sec: float = 11.0
+    view_margin_sec: float = 1.0
+    view_capture_lead_sec: float = 1.5
 
 def load_config(path)->Config:
     raw=load_yaml(path)
@@ -200,7 +264,9 @@ def load_config(path)->Config:
         nfeatures=al.get("nfeatures",1200), ratio_test=al.get("ratio_test",0.75),
         min_matches=al.get("min_matches",40), ransac_thresh_px=al.get("ransac_thresh_px",3.0),
         max_scale_change=al.get("max_scale_change",0.08), max_rotation_deg=al.get("max_rotation_deg",15.0),
-        warp_mode=al.get("warp_mode","similarity"), write_debug_aligned=al.get("write_debug_aligned",True)
+        warp_mode=al.get("warp_mode","similarity"), write_debug_aligned=al.get("write_debug_aligned",True),
+        min_inliers=int(al.get("min_inliers",25)), min_inlier_ratio=float(al.get("min_inlier_ratio",0.5)),
+        max_translation_frac=float(al.get("max_translation_frac",0.10)),
     )
     ov = raw.get("overlay", {})
     topic_default = raw.get("mqtt", {}).get("topic", "home/watermeter")
@@ -209,6 +275,8 @@ def load_config(path)->Config:
     meter = raw.get("meter", {})
     dig = raw.get("digital", {})
     dig_rois = raw.get("rois", {}).get("digital", {}) or {}
+    pp = raw.get("postproc", {}) or {}
+    vs = dig.get("view_sync", {}) or {}
     return Config(
         esp32_base_url=raw.get("esp32",{}).get("base_url","http://192.168.101.190"),
         esp32_capture_mode=str(raw.get("esp32",{}).get("capture_mode","ai_on_the_edge")).lower(),
@@ -221,6 +289,7 @@ def load_config(path)->Config:
         retry_backoff_sec=raw.get("processing",{}).get("retry_backoff_sec",5),
         image_path=raw.get("processing",{}).get("image_path","/tmp/water_raw.jpg"),
         image_timeout=raw.get("processing",{}).get("image_timeout",8.0),
+        max_image_bytes=int(raw.get("processing",{}).get("max_image_bytes",2_000_000)),
         save_debug_overlays=raw.get("processing",{}).get("save_debug_overlays",True),
         debug_dir=os.path.expanduser(raw.get("processing",{}).get("debug_dir","~/watermeter/debug")),
         digits_count=raw.get("digits",{}).get("count",6),
@@ -233,6 +302,14 @@ def load_config(path)->Config:
         big_jump_guard=raw.get("postproc",{}).get("big_jump_guard",2.0),
         big_jump_rate_per_day=raw.get("postproc",{}).get("big_jump_rate_per_day",1.0),
         big_jump_elapsed_cap_days=raw.get("postproc",{}).get("big_jump_elapsed_cap_days",7.0),
+        max_flow_lpm=float(pp.get("max_flow_lpm",40.0)),
+        confirm_above_lpm=float(pp.get("confirm_above_lpm",25.0)),
+        immediate_dt_cap_sec=float(pp.get("immediate_dt_cap_sec",75.0)),
+        flow_slack_l=int(pp.get("flow_slack_l",1)),
+        confirm_min_gap_sec=float(pp.get("confirm_min_gap_sec",15.0)),
+        candidate_ttl_sec=float(pp.get("candidate_ttl_sec",600.0)),
+        rebaseline_count=int(pp.get("rebaseline_count",3)),
+        rebaseline_min_span_sec=float(pp.get("rebaseline_min_span_sec",60.0)),
         mqtt_host=raw.get("mqtt",{}).get("host","127.0.0.1"),
         mqtt_port=raw.get("mqtt",{}).get("port",1883),
         mqtt_username=raw.get("mqtt",{}).get("username",None),
@@ -240,9 +317,13 @@ def load_config(path)->Config:
         mqtt_main_topic=raw.get("mqtt",{}).get("topic","home/watermeter"),
         mqtt_client_id=raw.get("mqtt",{}).get("client_id","water-ocr-mac"),
         ha_discovery_prefix=raw.get("mqtt",{}).get("ha_discovery_prefix","homeassistant"),
+        mqtt_availability_topic=str(raw.get("mqtt",{}).get("availability_topic","") or ""),
+        mqtt_stale_after_sec=float(raw.get("mqtt",{}).get("stale_after_sec",600.0)),
         dials=dials,
         ocr_bin=os.path.expanduser(raw.get("paths",{}).get("ocr_bin","~/watermeter/bin/ocr")),
         log_path=os.path.expanduser(raw.get("paths",{}).get("log_path","~/watermeter/watermeter.log")),
+        log_max_bytes=int(raw.get("paths",{}).get("log_max_bytes",10_000_000)),
+        log_backup_count=int(raw.get("paths",{}).get("log_backup_count",5)),
         align=align,
         overlay_font_scale = ov.get("font_scale", 1.0),
         overlay_font_thickness = ov.get("font_thickness", 2),
@@ -279,6 +360,12 @@ def load_config(path)->Config:
         digital_per_digit_auto_detect = bool(dig.get("per_digit_auto_detect", True)),
         digital_ocr_upscale_factor = int(dig.get("ocr_upscale_factor", 1)),
         digital_save_ocr_crops = bool(dig.get("save_ocr_crops", False)),
+        digital_cycle_budget_sec = float(dig.get("cycle_budget_sec", 45.0)),
+        view_sync_enabled = bool(vs.get("enabled", False)),
+        view_period_sec = float(vs.get("period_sec", 20.0)),
+        view_numeric_dwell_sec = float(vs.get("numeric_dwell_sec", 11.0)),
+        view_margin_sec = float(vs.get("margin_sec", 1.0)),
+        view_capture_lead_sec = float(vs.get("capture_lead_sec", 1.5)),
         digital_total_int_digits = [list(r) for r in (dig_rois.get("total_int_digits") or [])],
         digital_total_frac_digits = [list(r) for r in (dig_rois.get("total_frac_digits") or [])],
         digital_flow_digits = [list(r) for r in (dig_rois.get("flow_digits") or [])],
@@ -836,8 +923,7 @@ def is_valid_digital_view(raw_total, raw_flow, cfg):
     # Flow is tracked when EITHER the legacy single-ROI or the per-digit
     # list is configured. Only one of the two is ever populated per
     # calibration session, so checking both covers both modes.
-    flow_tracked = bool(cfg.digital_flow_roi) or bool(cfg.digital_flow_digits)
-    if flow_tracked:
+    if flow_tracked(cfg):
         if raw_flow is None:
             return False
         flow_digits = sum(1 for c in raw_flow if c.isdigit())
@@ -880,8 +966,7 @@ def validate_digital_reading(total, flow, prev_total, cfg, prev_ts=None, now=Non
     """
     if total is None or not math.isfinite(total):
         return False
-    flow_tracked = bool(cfg.digital_flow_roi) or bool(cfg.digital_flow_digits)
-    if flow_tracked:
+    if flow_tracked(cfg):
         if flow is None or not math.isfinite(flow) or flow < 0:
             return False
     if prev_total is not None:
@@ -891,6 +976,277 @@ def validate_digital_reading(total, flow, prev_total, cfg, prev_ts=None, now=Non
         if delta > effective_big_jump_guard(cfg, prev_ts, now):
             return False
     return True
+
+
+# ---------------------------------------------------------------------------
+# Digital acceptance policy (litres), staleness and LCD view phase
+# ---------------------------------------------------------------------------
+
+def to_litres(total_m3):
+    """m³ float → integer litres (the LCD resolves 1 L)."""
+    return int(round(float(total_m3) * 1000.0))
+
+
+@dataclass
+class GateDecision:
+    accepted: bool
+    kind: str            # baseline|ok|hold|confirmed|rebaseline|candidate|backward|too_fast
+    litres: Optional[int]  # value to publish when accepted
+    detail: str = ""
+
+
+class ReadingGate:
+    """Decides whether a parsed digital reading (integer litres) is published.
+
+    Replaces the fixed big_jump_guard + elapsed-growth policy for the digital
+    path. All bounds are rates over `dt`, the time since the last ACCEPTED
+    capture:
+
+    - forward step ≤ confirm_above_lpm × min(dt, immediate_dt_cap_sec) + slack
+      → accepted at once ("ok");
+    - forward step > max_flow_lpm × dt + slack → physically impossible
+      through this service pipe → rejected ("too_fast");
+    - anything in between becomes a "candidate" and is accepted only when a
+      later, independent capture (≥ confirm_min_gap_sec after it) confirms it
+      (same or higher, consistent with max_flow_lpm) → "confirmed";
+    - a backward step within slack is a "hold" (fresh, value unchanged);
+    - a larger backward step is rejected ("backward") unless the last
+      rebaseline_count backward readings agree with each other and span
+      ≥ rebaseline_min_span_sec → "rebaseline" to the lower value. This frees
+      a total trapped above the meter by an accepted misread, and follows a
+      genuine reverse step on this bidirectional meter.
+
+    Capping dt for the immediate bound means a long outage never widens what
+    is accepted without confirmation — the hole through which +100/+200/+250 L
+    misreads got in after give-up streaks (2026-10).
+    """
+
+    def __init__(self, max_flow_lpm=40.0, confirm_above_lpm=25.0,
+                 immediate_dt_cap_sec=75.0, slack_l=1, confirm_min_gap_sec=15.0,
+                 candidate_ttl_sec=600.0, rebaseline_count=3,
+                 rebaseline_min_span_sec=60.0, last_l=None, last_ts=None):
+        self.max_flow_lpm = float(max_flow_lpm)
+        self.confirm_above_lpm = float(confirm_above_lpm)
+        self.immediate_dt_cap_sec = float(immediate_dt_cap_sec)
+        self.slack_l = int(slack_l)
+        self.confirm_min_gap_sec = float(confirm_min_gap_sec)
+        self.candidate_ttl_sec = float(candidate_ttl_sec)
+        self.rebaseline_count = max(2, int(rebaseline_count))
+        self.rebaseline_min_span_sec = float(rebaseline_min_span_sec)
+        self.last_l = last_l
+        self.last_ts = last_ts
+        self.candidate = None   # (litres, ts)
+        self.backward = []      # [(litres, ts)] consecutive backward readings
+
+    @classmethod
+    def from_config(cls, cfg, last_total_m3=None, last_ts=None):
+        return cls(
+            max_flow_lpm=cfg.max_flow_lpm,
+            confirm_above_lpm=cfg.confirm_above_lpm,
+            immediate_dt_cap_sec=cfg.immediate_dt_cap_sec,
+            slack_l=cfg.flow_slack_l,
+            confirm_min_gap_sec=cfg.confirm_min_gap_sec,
+            candidate_ttl_sec=cfg.candidate_ttl_sec,
+            rebaseline_count=cfg.rebaseline_count,
+            rebaseline_min_span_sec=cfg.rebaseline_min_span_sec,
+            last_l=None if last_total_m3 is None else to_litres(last_total_m3),
+            last_ts=last_ts,
+        )
+
+    def _bound(self, lpm, dt):
+        return lpm * max(0.0, dt) / 60.0 + self.slack_l
+
+    def _consistent(self, a, b):
+        (la, ta), (lb, tb) = a, b
+        return abs(lb - la) <= self._bound(self.max_flow_lpm, tb - ta)
+
+    def _rebaseline_ready(self, seq):
+        n = self.rebaseline_count
+        if len(seq) < n:
+            return False
+        tail = seq[-n:]
+        if tail[-1][1] - tail[0][1] < self.rebaseline_min_span_sec:
+            return False
+        return all(self._consistent(a, b) for a, b in zip(tail, tail[1:]))
+
+    def _decide(self, litres, ts):
+        if self.last_l is None:
+            return GateDecision(True, "baseline", litres, "first reading")
+        dt = (ts - self.last_ts) if self.last_ts is not None else 0.0
+        d = litres - self.last_l
+        if d < 0:
+            if -d <= self.slack_l:
+                return GateDecision(True, "hold", self.last_l,
+                                    f"{d:+d} L within slack")
+            if self._rebaseline_ready(self.backward + [(litres, ts)]):
+                return GateDecision(True, "rebaseline", litres,
+                                    f"{d:+d} L confirmed by {self.rebaseline_count} readings")
+            return GateDecision(False, "backward", None,
+                                f"{d:+d} L vs accepted {self.last_l} L")
+        if d <= self._bound(self.confirm_above_lpm, min(dt, self.immediate_dt_cap_sec)):
+            return GateDecision(True, "ok", litres, f"{d:+d} L in {dt:.0f} s")
+        if d > self._bound(self.max_flow_lpm, dt):
+            rate = d / (dt / 60.0) if dt > 0 else float("inf")
+            return GateDecision(False, "too_fast", None,
+                                f"{d:+d} L in {dt:.0f} s = {rate:.0f} L/min > "
+                                f"max_flow_lpm {self.max_flow_lpm:g}")
+        c = self.candidate
+        if c is not None:
+            gap = ts - c[1]
+            if (self.confirm_min_gap_sec <= gap <= self.candidate_ttl_sec
+                    and litres >= c[0] - self.slack_l
+                    and self._consistent(c, (litres, ts))):
+                return GateDecision(True, "confirmed", litres,
+                                    f"{d:+d} L in {dt:.0f} s, confirmed after {gap:.0f} s")
+        return GateDecision(False, "candidate", None,
+                            f"{d:+d} L in {dt:.0f} s needs a confirming reading")
+
+    def preview(self, litres, ts):
+        """Decision without changing state (used for in-cycle retries)."""
+        return self._decide(litres, ts)
+
+    def evaluate(self, litres, ts):
+        dec = self._decide(litres, ts)
+        if dec.accepted:
+            self.last_l = dec.litres
+            self.last_ts = ts
+            self.candidate = None
+            self.backward = []
+        elif dec.kind == "candidate":
+            self.candidate = (litres, ts)
+            self.backward = []
+        elif dec.kind == "backward":
+            self.backward = (self.backward + [(litres, ts)])[-2 * self.rebaseline_count:]
+        return dec
+
+
+class StaleTracker:
+    """Has a reading been accepted within `stale_after_sec`? 0 disables."""
+
+    def __init__(self, stale_after_sec, last_fresh_ts=None):
+        self.stale_after_sec = float(stale_after_sec or 0)
+        self.last_fresh_ts = last_fresh_ts
+
+    def mark_fresh(self, ts):
+        self.last_fresh_ts = ts
+
+    def is_stale(self, now):
+        if self.stale_after_sec <= 0:
+            return False
+        if self.last_fresh_ts is None:
+            return True
+        return now - self.last_fresh_ts >= self.stale_after_sec
+
+
+class ViewPhase:
+    """Tracks where the LCD's view rotation is, to capture inside the numeric view.
+
+    The display rotates numeric (≈11 s) → diagnostic B (≈3.9 s) → diagnostic
+    A (≈5 s), period ≈20.0 s (measured 2026-11-04 at 4.7 fps over 12 cycles).
+    The unknown is φ, the time (mod period) at which a numeric window starts.
+    A boolean set over φ (0.1 s bins) is narrowed by every labelled capture:
+    a numeric frame at t means φ ∈ (t − dwell, t]; a diagnostic frame means
+    the opposite. If an observation contradicts the whole set (drift, a
+    firmware change), the set restarts from that observation alone. The set
+    is widened before each update to absorb clock/period drift: 0.1 % of the
+    elapsed time (0.02 s per rotation; the measured period is 20.004 s, so
+    ~5x the observed error). Captures that land inside the numeric view carry
+    no edge information, so the uncertainty only shrinks on a miss; when it
+    outgrows the window, next_start() returns None and the caller captures
+    unsynchronised (today's behaviour) until a miss re-pins the phase.
+
+    Times are time.monotonic() seconds.
+    """
+
+    def __init__(self, period_sec=20.0, numeric_dwell_sec=11.0, margin_sec=1.0,
+                 resolution_sec=0.1, base_blur_sec=0.0, drift_per_sec=0.001,
+                 capture_lead_sec=1.5):
+        self.period = float(period_sec)
+        self.dwell = float(numeric_dwell_sec)
+        self.margin = float(margin_sec)
+        self.res = float(resolution_sec)
+        self.base_blur = float(base_blur_sec)
+        self.drift = float(drift_per_sec)
+        self.lead = float(capture_lead_sec)
+        self.n = max(1, int(round(self.period / self.res)))
+        self.feasible = np.ones(self.n, dtype=bool)
+        self.last_obs = None
+
+    def _offsets(self, t):
+        phis = np.arange(self.n) * self.res
+        return (t - phis) % self.period
+
+    def _dilate(self, width_sec):
+        k = int(math.ceil(width_sec / self.res))
+        if k <= 0 or self.feasible.all():
+            return
+        f = self.feasible.copy()
+        for s in range(1, k + 1):
+            f |= np.roll(self.feasible, s) | np.roll(self.feasible, -s)
+        self.feasible = f
+
+    def observe(self, t, numeric):
+        if self.last_obs is not None:
+            self._dilate(self.base_blur + self.drift * max(0.0, t - self.last_obs))
+        off = self._offsets(t)
+        consistent = (off < self.dwell) if numeric else (off >= self.dwell)
+        new = self.feasible & consistent
+        if new.any():
+            self.feasible = new
+        else:
+            # The phase moved faster than allowed: restart from this
+            # observation and allow twice the drift from now on (cap 1 %).
+            self.feasible = consistent
+            self.drift = min(self.drift * 2.0, 0.01)
+        self.last_obs = t
+
+    def note_lead(self, lead_sec):
+        """EMA of the delay from starting a capture to the frame's exposure."""
+        if lead_sec is not None and 0.0 <= lead_sec < 10.0:
+            self.lead = 0.8 * self.lead + 0.2 * lead_sec
+
+    def _arc(self):
+        """Smallest circular arc (start_sec, width_sec) covering feasible φ."""
+        idx = np.flatnonzero(self.feasible)
+        if idx.size == 0 or idx.size == self.n:
+            return None
+        gaps = np.diff(np.concatenate([idx, [idx[0] + self.n]]))
+        j = int(np.argmax(gaps))           # largest empty gap ends the arc
+        start = idx[(j + 1) % idx.size]
+        width = (self.n - gaps[j] + 1) * self.res
+        return start * self.res, width
+
+    def confident(self):
+        arc = self._arc()
+        return arc is not None and arc[1] + 2 * self.margin <= self.dwell
+
+    def explore_start(self, earliest):
+        """Capture start while the phase is unknown: stagger successive
+        cycles by golden-ratio steps within half a period, so captures probe
+        different phases instead of phase-locking (a 20 s interval on a 20 s
+        rotation samples the same view every time)."""
+        self._explore = (getattr(self, "_explore", 0.0) + 0.382 * self.period) % (0.5 * self.period)
+        return earliest + self._explore
+
+    def next_start(self, earliest):
+        """Earliest capture start ≥ `earliest` whose exposure lands safely in a
+        numeric window for every feasible φ, or None when not confident."""
+        arc = self._arc()
+        if arc is None:
+            return None
+        a, w = arc
+        if self.last_obs is not None:
+            w += 2 * self.drift * max(0.0, earliest - self.last_obs)
+        lo, hi = w + self.margin, self.dwell - self.margin   # offsets from a
+        if lo > hi:
+            return None
+        exposure = earliest + self.lead
+        off = (exposure - a) % self.period
+        if lo <= off <= hi:
+            return earliest
+        target = (lo + hi) / 2.0
+        wait = (target - off) % self.period
+        return earliest + wait
 
 
 def compose_integer(digit_obs, frac, thr_up, thr_dn, prev_int_str=None):
@@ -923,17 +1279,35 @@ def compose_integer(digit_obs, frac, thr_up, thr_dn, prev_int_str=None):
     return "".join(str(d) for d in resolved), resolved
 
 class MqttClient:
+    """MQTT publisher with HA discovery, an LWT and an availability topic.
+
+    Paho's network thread (loop_start) owns connecting and reconnecting: the
+    first connect is connect_async(), so a broker that is down at startup is
+    retried by paho with backoff (reconnect_delay_set). The main loop never
+    calls reconnect()/connect() itself — two owners raced and reset sockets.
+
+    Availability: the broker publishes the retained LWT "offline" when the
+    connection drops uncleanly; `set_available()` publishes "online"/"offline"
+    (retained, QoS 1) when freshness changes; every (re)connect republishes
+    discovery and then the current availability.
+    """
     def __init__(self,cfg,log):
         self.cfg=cfg; self.log=log
         self.client=mqtt.Client(
-            client_id=cfg.mqtt_client_id, 
+            client_id=cfg.mqtt_client_id,
             clean_session=True,
             callback_api_version=mqtt.CallbackAPIVersion.VERSION2,)
         if cfg.mqtt_username: self.client.username_pw_set(cfg.mqtt_username,cfg.mqtt_password)
+        self.availability_topic = (getattr(cfg, "mqtt_availability_topic", "")
+                                   or f"{cfg.mqtt_main_topic}/status")
+        self.available = False
+        try:
+            self.client.will_set(self.availability_topic, "offline", qos=1, retain=True)
+            self.client.reconnect_delay_set(min_delay=1, max_delay=60)
+        except Exception as e:
+            self.log.warning(f"MQTT will/reconnect setup failed: {e}")
         self.connected=False
         self._loop_started=False
-        self._last_attempt=0.0
-        self._reconnect_delay=5.0
         def _on_connect(client, userdata, flags, reason_code, properties=None):
             # reason_code 0 == Success. Anything else means the broker rejected
             # the CONNECT (bad credentials, protocol mismatch, etc). Publishing
@@ -948,6 +1322,9 @@ class MqttClient:
                     self.discovery()
                 except Exception as e:
                     self.log.warning(f"MQTT discovery publish failed: {e}")
+                # Replace the LWT's retained "offline" (or confirm it) with the
+                # current freshness-derived state.
+                self._publish_availability()
             else:
                 self.connected = False
                 self.log.error(f"MQTT connect rejected rc={reason_code}")
@@ -966,31 +1343,34 @@ class MqttClient:
             except Exception as e:
                 self.log.error(f"MQTT loop_start failed: {e}")
     def connect(self):
-        self._last_attempt = time.time()
         try:
-            self.client.connect(self.cfg.mqtt_host, self.cfg.mqtt_port, keepalive=30)
+            self.client.connect_async(self.cfg.mqtt_host, self.cfg.mqtt_port, keepalive=30)
         except Exception as e:
             self.log.error(f"MQTT connect failed: {e}")
         self._ensure_loop()
-    def publish(self,t,p,retain=False):
-        if self.connected: self.client.publish(t,p,retain=retain)
+    def publish(self,t,p,retain=False,qos=0):
+        if self.connected: self.client.publish(t,p,retain=retain,qos=qos)
     def ensure_connection(self):
-        if self.connected:
-            return
-        now = time.time()
-        if now - self._last_attempt < self._reconnect_delay:
-            return
-        self._last_attempt = now
-        try:
-            self.client.reconnect()
-            self.log.info("Attempting MQTT reconnect")
-        except Exception as e:
-            self.log.warning(f"MQTT reconnect failed ({e}); retrying full connect")
-            try:
-                self.client.connect(self.cfg.mqtt_host, self.cfg.mqtt_port, keepalive=30)
-            except Exception as e2:
-                self.log.error(f"MQTT connect retry failed: {e2}")
+        """Kept for callers; paho's loop thread owns reconnection."""
         self._ensure_loop()
+    def _publish_availability(self):
+        self.publish(self.availability_topic,
+                     "online" if self.available else "offline", retain=True, qos=1)
+    def set_available(self, available):
+        available = bool(available)
+        if available == self.available:
+            return
+        self.available = available
+        if available:
+            self.log.info("Availability -> online")
+        else:
+            self.log.warning("Availability -> offline (no accepted reading for >= %ss)",
+                             getattr(self.cfg, "mqtt_stale_after_sec", "?"))
+        self._publish_availability()
+    def _availability(self):
+        return {"availability_topic": self.availability_topic,
+                "payload_available": "online",
+                "payload_not_available": "offline"}
     def discovery(self):
         base = self.cfg.mqtt_main_topic
         pre  = self.cfg.ha_discovery_prefix
@@ -999,10 +1379,13 @@ class MqttClient:
             "name": "Water Total",
             "state_topic": f"{base}/main/value",
             "unit_of_measurement": "m³",
-            "state_class": "total_increasing",
+            # Net register: the meter is bidirectional and corrections can
+            # lower it, so "total" (dips are legitimate) not total_increasing.
+            "state_class": "total",
             "device_class": "water",
             "unique_id": "water_total_macocr",
             "device": {"identifiers": ["water_cam_mac"], "name": "Water Meter (Mac OCR)"},
+            **self._availability(),
         }
         rate = {
             "name": "Water Rate",
@@ -1010,6 +1393,7 @@ class MqttClient:
             "unit_of_measurement": "m³/min",
             "state_class": "measurement",
             "unique_id": "water_rate_macocr",
+            **self._availability(),
             "device": {"identifiers": ["water_cam_mac"], "name": "Water Meter (Mac OCR)"},
         }
         rate_lpm = {
@@ -1018,12 +1402,13 @@ class MqttClient:
             "unit_of_measurement": "L/min",
             "state_class": "measurement",
             "unique_id": "water_rate_lpm_macocr",
+            **self._availability(),
             "icon": "mdi:water-pump",
             "device": {"identifiers": ["water_cam_mac"], "name": "Water Meter (Mac OCR)"},
         }
-        self.publish(f"{pre}/sensor/water_total/config",json.dumps(total),retain=True)
-        self.publish(f"{pre}/sensor/water_rate/config",json.dumps(rate),retain=True)
-        self.publish(f"{pre}/sensor/water_rate_lpm/config", json.dumps(rate_lpm), retain=True)
+        self.publish(f"{pre}/sensor/water_total/config",json.dumps(total),retain=True, qos=1)
+        self.publish(f"{pre}/sensor/water_rate/config",json.dumps(rate),retain=True, qos=1)
+        self.publish(f"{pre}/sensor/water_rate_lpm/config", json.dumps(rate_lpm), retain=True, qos=1)
 
         # Digital meters publish an on-meter instantaneous flow in m³/h directly
         # (no need to infer it from deltas). Advertise the sensor only when
@@ -1031,7 +1416,7 @@ class MqttClient:
         # some installs capture only the total line because of flash glare.
         digital_flow_tracked = (
             getattr(self.cfg, "meter_type", "mechanical") == "digital"
-            and bool(getattr(self.cfg, "digital_flow_roi", []))
+            and flow_tracked(self.cfg)
         )
         if digital_flow_tracked:
             flow_m3h = {
@@ -1041,10 +1426,11 @@ class MqttClient:
                 "state_class": "measurement",
                 "device_class": "volume_flow_rate",
                 "unique_id": "water_flow_m3h_macocr",
+            **self._availability(),
                 "icon": "mdi:water-pump",
                 "device": {"identifiers": ["water_cam_mac"], "name": "Water Meter (Mac OCR)"},
             }
-            self.publish(f"{pre}/sensor/water_flow_m3h/config", json.dumps(flow_m3h), retain=True)
+            self.publish(f"{pre}/sensor/water_flow_m3h/config", json.dumps(flow_m3h), retain=True, qos=1)
 
         cam = {
             "name": self.cfg.overlay_camera_name,
@@ -1053,7 +1439,21 @@ class MqttClient:
             "unique_id": self.cfg.overlay_camera_unique_id,
             "device": {"identifiers": ["water_cam_mac"], "name": "Water Meter (Mac OCR)"},
         }
-        self.publish(f"{pre}/camera/water_overlay/config", json.dumps(cam), retain=True)
+        self.publish(f"{pre}/camera/water_overlay/config", json.dumps(cam), retain=True, qos=1)
+
+def alignment_quality_ok(M, inlier_mask, n_good, shape_hw, cfg):
+    """RANSAC fit gate: enough inliers, a sane inlier ratio, bounded shift."""
+    inliers = int(np.count_nonzero(inlier_mask)) if inlier_mask is not None else 0
+    if inliers < getattr(cfg, "min_inliers", 25):
+        return False
+    if n_good <= 0 or inliers / n_good < getattr(cfg, "min_inlier_ratio", 0.5):
+        return False
+    h, w = shape_hw
+    frac = getattr(cfg, "max_translation_frac", 0.10)
+    if abs(float(M[0, 2])) > frac * w or abs(float(M[1, 2])) > frac * h:
+        return False
+    return True
+
 
 class Aligner:
     def __init__(self,cfg,log):
@@ -1100,15 +1500,17 @@ class Aligner:
         if descC is None or self.descR is None or len(kpC)<10 or len(self.kpR)<10: return img,None,False
         bf=cv2.BFMatcher(cv2.NORM_HAMMING, crossCheck=False)
         matches=bf.knnMatch(self.descR,descC,k=2)
-        good=[m for m,n in matches if m.distance < self.cfg.ratio_test*n.distance]
+        good=[p[0] for p in matches if len(p)==2 and p[0].distance < self.cfg.ratio_test*p[1].distance]
         if len(good) < self.cfg.min_matches: return img,None,False
         src=np.float32([ self.kpR[m.queryIdx].pt for m in good ]).reshape(-1,1,2)
         dst=np.float32([ kpC[m.trainIdx].pt for m in good ]).reshape(-1,1,2)
         if self.cfg.warp_mode=="similarity":
-            M,_=cv2.estimateAffinePartial2D(dst,src,method=cv2.RANSAC,ransacReprojThreshold=self.cfg.ransac_thresh_px)
+            M,inl=cv2.estimateAffinePartial2D(dst,src,method=cv2.RANSAC,ransacReprojThreshold=self.cfg.ransac_thresh_px)
         else:
-            M,_=cv2.estimateAffine2D(dst,src,method=cv2.RANSAC,ransacReprojThreshold=self.cfg.ransac_thresh_px)
+            M,inl=cv2.estimateAffine2D(dst,src,method=cv2.RANSAC,ransacReprojThreshold=self.cfg.ransac_thresh_px)
         if M is None: return img,None,False
+        if not alignment_quality_ok(M, inl, len(good), gray.shape[:2], self.cfg):
+            return img,None,False
         a,b=M[0,0],M[0,1]; scale=(a*a+b*b)**0.5; rot=math.degrees(math.atan2(b,a))
         if abs(scale-1.0)>self.cfg.max_scale_change or abs(rot)>self.cfg.max_rotation_deg:
             return img,None,False
@@ -1639,7 +2041,16 @@ def _isolate_main_digit(crop_bw):
     return isolated
 
 
-def classify_7seg(crop_bw, threshold=0.18):
+SEVEN_SEG_THRESHOLD = 0.20
+# Ink fractions inside this open band are neither clearly lit nor clearly
+# dark; the digit is reported unreadable ("") instead of guessed. Measured on
+# 616 numeric frames from the live meter (2026-11-04): unlit segments peak at
+# 0.061, lit segments bottom out at 0.375.
+SEVEN_SEG_AMBIGUOUS = (0.10, 0.30)
+
+
+def classify_7seg(crop_bw, threshold=SEVEN_SEG_THRESHOLD,
+                  ambiguous=SEVEN_SEG_AMBIGUOUS):
     """Classify a binarized single-digit crop via 7-segment pattern lookup.
 
     `crop_bw` is uint8 grayscale with 0 = ink and 255 = background. The
@@ -1648,8 +2059,16 @@ def classify_7seg(crop_bw, threshold=0.18):
     and crops to its bounding box, then measures ink fraction in each
     of seven segment regions relative to that bounding box.
 
+    The vertical-segment probes deliberately stay clear of the rows where the
+    horizontal bars sit (top 0–18 %, middle 42–58 %, bottom 82–100 %). The
+    previous probes spanned rows 10–48 % / 52–90 % and caught the left ends
+    of the top and middle bars, so a "3" read 0.13–0.21 ink in the top-left
+    probe against a 0.18 threshold and came out as "9" on ~16 % of frames
+    (the +60 L / +600 L misreads that trapped prev_total, 2026-10/11).
+
     Returns a single-char digit string, or "" if no ink is present, the
-    crop is too small, or the detected pattern isn't a valid digit.
+    crop is too small, any segment is ambiguous, or the detected pattern
+    isn't a valid digit.
     """
     if crop_bw is None or crop_bw.size == 0:
         return ""
@@ -1678,14 +2097,14 @@ def classify_7seg(crop_bw, threshold=0.18):
 
     y0, y1 = 0, ih
     x0, x1 = 0, iw
-    top_band    = (y0,                  y0 + int(ih * 0.22))
+    top_band    = (y0,                  y0 + int(ih * 0.18))
     middle_band = (y0 + int(ih * 0.42), y0 + int(ih * 0.58))
-    bottom_band = (y0 + int(ih * 0.78), y1)
+    bottom_band = (y0 + int(ih * 0.82), y1)
     left_col    = (x0,                  x0 + int(iw * 0.30))
     right_col   = (x0 + int(iw * 0.70), x1)
-    upper_half  = (y0 + int(ih * 0.10), y0 + int(ih * 0.48))
-    lower_half  = (y0 + int(ih * 0.52), y0 + int(ih * 0.90))
-    inner_x     = (x0 + int(iw * 0.25), x0 + int(iw * 0.75))
+    upper_half  = (y0 + int(ih * 0.20), y0 + int(ih * 0.38))
+    lower_half  = (y0 + int(ih * 0.62), y0 + int(ih * 0.80))
+    inner_x     = (x0 + int(iw * 0.30), x0 + int(iw * 0.70))
 
     segs = (
         _ink_fraction(isolated, *top_band,    *inner_x),
@@ -1696,6 +2115,10 @@ def classify_7seg(crop_bw, threshold=0.18):
         _ink_fraction(isolated, *upper_half,  *left_col),
         _ink_fraction(isolated, *middle_band, *inner_x),
     )
+    if ambiguous is not None:
+        lo, hi = ambiguous
+        if any(lo < v < hi for v in segs):
+            return ""
     bits = tuple(1 if v > threshold else 0 for v in segs)
     return _SEVEN_SEG_PATTERNS.get(bits, "")
 
@@ -1925,31 +2348,61 @@ def apply_ocr_preprocess(src_path, dst_path, mode):
     return False
 
 
-def _fetch_jpeg(cfg, session, log):
-    """Return the raw JPEG bytes of one flash-lit frame; raises on HTTP failure."""
+def _read_capped(r, cap):
+    """Read a streamed response body, raising if it exceeds `cap` bytes."""
+    buf = bytearray()
+    try:
+        for chunk in r.iter_content(chunk_size=65536):
+            buf.extend(chunk)
+            if len(buf) > cap:
+                raise ValueError(f"image body exceeds max_image_bytes={cap}")
+    finally:
+        close = getattr(r, "close", None)
+        if close:
+            close()
+    return bytes(buf)
+
+
+def _fetch_jpeg(cfg, session, log, stamp=None):
+    """Return the raw JPEG bytes of one flash-lit frame; raises on HTTP failure.
+
+    When `stamp` is a dict, stamp["t_frame"] is set to the time.monotonic()
+    midpoint of the kept snapshot request — the best estimate of when the
+    frame was exposed (the view-phase tracker needs exposure time, not the
+    time OCR finished).
+    """
     base = cfg.esp32_base_url.rstrip("/")
     if cfg.esp32_capture_mode != "esphome":
-        r = session.get(base + "/capture_with_flashlight", timeout=cfg.image_timeout)
+        t_a = time.monotonic()
+        r = session.get(base + "/capture_with_flashlight", timeout=cfg.image_timeout, stream=True)
         r.raise_for_status()
-        return r.content
+        if stamp is not None:
+            stamp["t_frame"] = (t_a + time.monotonic()) / 2.0
+        return _read_capped(r, cfg.max_image_bytes)
     snapshot_url = cfg.esp32_snapshot_url or (base + ":8080/")
     try:
         session.post(base + cfg.esp32_flash_on_path, timeout=cfg.image_timeout).raise_for_status()
         time.sleep(cfg.esp32_flash_settle_sec)
         for _ in range(cfg.esp32_discard_frames):
             session.get(snapshot_url, timeout=cfg.image_timeout).raise_for_status()
-        r = session.get(snapshot_url, timeout=cfg.image_timeout)
+        t_a = time.monotonic()
+        r = session.get(snapshot_url, timeout=cfg.image_timeout, stream=True)
         r.raise_for_status()
-        return r.content
+        if stamp is not None:
+            stamp["t_frame"] = (t_a + time.monotonic()) / 2.0
+        return _read_capped(r, cfg.max_image_bytes)
     finally:
-        # Never leave the LEDs on if the snapshot failed.
-        try:
-            session.post(base + cfg.esp32_flash_off_path, timeout=cfg.image_timeout)
-        except Exception as e:
-            log.warning(f"Flash off failed: {e}")
+        # Never leave the LEDs on if the snapshot failed. Retry once; never raise.
+        for attempt in (1, 2):
+            try:
+                session.post(base + cfg.esp32_flash_off_path, timeout=cfg.image_timeout).raise_for_status()
+                break
+            except Exception as e:
+                if attempt == 2:
+                    log.warning(f"Flash off failed: {e}")
 
 
-def capture_frame(cfg, session, log):
+def capture_frame(cfg, session, log, stamp=None):
     """Fetch + decode one JPEG from the ESP32 camera.
 
     Returns the decoded BGR ndarray on success, or None on HTTP/decode failure.
@@ -1957,21 +2410,23 @@ def capture_frame(cfg, session, log):
     run_digital_cycle retries within the same cycle).
     """
     try:
-        content = _fetch_jpeg(cfg, session, log)
+        content = _fetch_jpeg(cfg, session, log, stamp=stamp)
+        if not content:
+            raise ValueError("empty image body")
+        raw = cv2.imdecode(np.frombuffer(content, np.uint8), cv2.IMREAD_COLOR)
+        if raw is None:
+            raise ValueError("image decode failed")
         with open(cfg.image_path, "wb") as f:
             f.write(content)
-    except Exception as e:
+    except Exception as e:  # includes cv2.error
         log.warning(f"Capture failed: {e}")
-        return None
-    raw = cv2.imdecode(np.fromfile(cfg.image_path, dtype=np.uint8), cv2.IMREAD_COLOR)
-    if raw is None:
-        log.warning("Decode failed")
         return None
     return raw
 
 
 def run_digital_cycle(cfg, ocr, aligner, session, prev_total, log,
-                      sleep=time.sleep, on_attempt=None, prev_ts=None):
+                      sleep=time.sleep, on_attempt=None, prev_ts=None,
+                      gate=None, phase=None, clock=time.monotonic, wall=time.time):
     """Capture + OCR one digital-meter reading, retrying on wrong-view frames.
 
     The LCD auto-cycles between a numeric view and two diagnostic views. A
@@ -2003,6 +2458,19 @@ def run_digital_cycle(cfg, ocr, aligner, session, prev_total, log,
     logged and swallowed to keep the cycle running.
 
     `sleep` is injected so tests can run this loop without real sleeps.
+
+    With a `gate` (ReadingGate), plausibility is the gate's call: a parsed
+    reading the gate would not accept now ends the attempt with reason
+    "implausible" (and is retried); the caller then runs `gate.evaluate` on
+    the final result so candidates / backward runs are recorded. Without a
+    gate the legacy `validate_digital_reading(prev_total, ...)` applies.
+
+    With a `phase` (ViewPhase), every labelled frame (numeric / diagnostic)
+    refines the LCD rotation estimate, and a wrong-view retry waits for the
+    next numeric window instead of a fixed retry delay once the phase is known.
+
+    Extra result keys: "litres" (int), "ts" (wall-clock exposure time),
+    "t_frame" (monotonic exposure time), "gate_detail" (str, on implausible).
     """
     def _notify(state):
         if on_attempt is None:
@@ -2027,9 +2495,29 @@ def run_digital_cycle(cfg, ocr, aligner, session, prev_total, log,
         "flow_digits_list": [],
         "total": None,
         "flow_m3h": None,
+        "litres": None,
+        "ts": None,
+        "t_frame": None,
+        "gate_detail": None,
     }
+
+    def _retry_wait():
+        if phase is not None and phase.confident():
+            now_m = clock()
+            nxt = phase.next_start(now_m)
+            if nxt is not None:
+                return min(max(0.0, nxt - now_m), phase.period)
+        return cfg.digital_retry_delay_sec
+
+    cycle_start = clock()
+    budget = getattr(cfg, "digital_cycle_budget_sec", 45.0)
     for attempt in range(attempts):
-        frame = capture_frame(cfg, session, log)
+        t_attempt = clock()
+        if attempt > 0 and budget and t_attempt - cycle_start > budget:
+            log.warning("Cycle budget %.0fs exceeded after %d attempts", budget, attempt)
+            break
+        stamp = {}
+        frame = capture_frame(cfg, session, log, stamp=stamp)
         if frame is None:
             # Capture failure is distinct from wrong view; fall back to the loop's
             # outer retry_backoff_sec rather than the digital retry spacing.
@@ -2037,16 +2525,37 @@ def run_digital_cycle(cfg, ocr, aligner, session, prev_total, log,
                 sleep(cfg.retry_backoff_sec)
             continue
 
+        t_frame = stamp.get("t_frame", clock())
+        wall_ts = wall() - (clock() - t_frame)
+        if phase is not None:
+            phase.note_lead(t_frame - t_attempt)
+        last.update({"t_frame": t_frame, "ts": wall_ts, "litres": None,
+                     "gate_detail": None})
+
         if aligner is not None:
             aligned_img, _, aligned_ok = aligner.align(frame)
+            if not aligned_ok:
+                # ROIs are drawn in the reference frame: OCR on an unaligned
+                # frame reads the wrong pixels, so don't try.
+                last.update({"frame": frame, "aligned_ok": False,
+                             "raw_total": None, "raw_flow": None,
+                             "total": None, "flow_m3h": None,
+                             "reason": "align_failed"})
+                _notify(last)
+                if attempt < attempts - 1:
+                    sleep(cfg.digital_retry_delay_sec)
+                continue
         else:
             aligned_img, aligned_ok = frame, False
 
-        ocr_path = (
-            os.path.expanduser("~/watermeter/aligned_last.jpg")
-            if aligned_ok
-            else cfg.image_path
-        )
+        # OCR input comes from the aligned image in memory; path-based OCR
+        # helpers get a working copy written here, never the optional debug
+        # file (aligned_last.jpg exists only when write_debug_aligned is on).
+        ocr_path = cfg.image_path
+        if aligned_ok:
+            ocr_path = cfg.image_path + ".aligned.jpg"
+            cv2.imwrite(ocr_path, aligned_img)
+        cached_img = aligned_img
 
         # Optional contrast preprocessing before OCR. When enabled, writes a
         # preprocessed copy and redirects OCR calls to it. Fallthrough on
@@ -2055,6 +2564,7 @@ def run_digital_cycle(cfg, ocr, aligner, session, prev_total, log,
             preproc_path = ocr_path + ".preproc.jpg"
             if apply_ocr_preprocess(ocr_path, preproc_path, cfg.digital_ocr_preprocess):
                 ocr_path = preproc_path
+                cached_img = cv2.imread(ocr_path)
 
         # Split-ROI mode: when both integer and fractional sub-ROIs are set,
         # OCR them separately and concatenate with "." before parsing. Needed
@@ -2077,8 +2587,8 @@ def run_digital_cycle(cfg, ocr, aligner, session, prev_total, log,
         # 6-int + 3-frac + 5-flow meter. Classical 7-seg classification
         # is the only consumer that needs the pixels in-memory; line and
         # subdivision modes still go through the Swift OCR binary by
-        # path.
-        cached_img = cv2.imread(ocr_path)
+        # path. (`cached_img` is set above: the aligned frame in memory, or
+        # the preprocessed copy.)
 
         # Captured per-digit lists for each region, filled in by
         # `_read_region` when the individual-digits path runs. Used by
@@ -2142,7 +2652,7 @@ def run_digital_cycle(cfg, ocr, aligner, session, prev_total, log,
         # Flow line is optional. If the user configured only rois.digital.total
         # (typical when flash glare forces alignment to favour the total line),
         # skip the flow OCR call entirely and publish only the delta-based rate.
-        flow_active = bool(cfg.digital_flow_digits) or bool(cfg.digital_flow_roi)
+        flow_active = flow_tracked(cfg)
         raw_flow = _read_region(cfg.digital_flow_roi,
                                 cfg.digital_flow_digit_count,
                                 "flow",
@@ -2172,9 +2682,11 @@ def run_digital_cycle(cfg, ocr, aligner, session, prev_total, log,
                 attempt + 1, attempts, raw_total, raw_flow,
             )
             last["reason"] = "wrong_view"
+            if phase is not None:
+                phase.observe(t_frame, numeric=False)
             _notify(last)
             if attempt < attempts - 1:
-                sleep(cfg.digital_retry_delay_sec)
+                sleep(_retry_wait())
             continue
 
         total = parse_digital_total(raw_total, cfg.digital_total_regex)
@@ -2198,8 +2710,25 @@ def run_digital_cycle(cfg, ocr, aligner, session, prev_total, log,
                 sleep(cfg.digital_retry_delay_sec)
             continue
 
-        if not validate_digital_reading(total, flow, prev_total, cfg,
-                                        prev_ts=prev_ts, now=time.time()):
+        if phase is not None:
+            phase.observe(t_frame, numeric=True)
+        if gate is not None:
+            litres = to_litres(total) if total is not None and math.isfinite(total) else None
+            last["litres"] = litres
+            sane = litres is not None and validate_digital_reading(total, flow, None, cfg)
+            dec = gate.preview(litres, wall_ts) if sane else None
+            if dec is None or not dec.accepted:
+                last["reason"] = "implausible" if sane else "validate_failed"
+                last["gate_detail"] = dec.detail if dec is not None else None
+                log.debug("Rejected (attempt %d/%d): raw_total=%r parsed=%s %s",
+                          attempt + 1, attempts, raw_total, total,
+                          last["gate_detail"])
+                _notify(last)
+                if attempt < attempts - 1:
+                    sleep(cfg.digital_retry_delay_sec)
+                continue
+        elif not validate_digital_reading(total, flow, prev_total, cfg,
+                                          prev_ts=prev_ts, now=time.time()):
             log.debug(
                 "Validate failed (attempt %d/%d): raw_total=%r raw_flow=%r "
                 "parsed=(%s, %s) prev=%s",
@@ -2225,6 +2754,10 @@ def run_digital_cycle(cfg, ocr, aligner, session, prev_total, log,
             "total_int_digits_list": list(per_digit_lists.get("total_int") or []),
             "total_frac_digits_list": list(per_digit_lists.get("total_frac") or []),
             "flow_digits_list": list(per_digit_lists.get("flow") or []),
+            "litres": last.get("litres") if gate is not None else to_litres(total),
+            "ts": wall_ts,
+            "t_frame": t_frame,
+            "gate_detail": None,
         }
         _notify(result)
         return result
@@ -2285,6 +2818,71 @@ def reset_state(cfg, new_total, log=None):
     return backup_path, new_state
 
 
+def _fmt_digits(result):
+    chars = (list(result.get("total_int_digits_list") or [])
+             + ["."] + list(result.get("total_frac_digits_list") or []))
+    if len(chars) > 1:
+        return "".join(c or "_" for c in chars)
+    return repr(result.get("raw_total"))
+
+
+def handle_digital_result(cfg, mqttc, gate, stale, result, log, now=None):
+    """Publish / persist / mark availability for one digital cycle.
+
+    Runs the gate's (state-changing) evaluation on the cycle's final reading
+    when one was parsed — accepted readings are published (value retained,
+    QoS 1), saved to state.json and mark the reading fresh; anything else is
+    logged at WARNING with the evidence (digits, parsed litres, gate detail),
+    and availability drops to "offline" once no reading has been accepted for
+    `mqtt.stale_after_sec`. Returns the GateDecision or None.
+    """
+    now = time.time() if now is None else now
+    reason = result.get("reason")
+    litres = result.get("litres")
+    ts = result.get("ts") or now
+    dec = None
+    if litres is not None and reason in ("ok", "implausible"):
+        prev_l, prev_ts = gate.last_l, gate.last_ts
+        dec = gate.evaluate(litres, ts)
+    if dec is not None and dec.accepted:
+        value_l = dec.litres
+        rate_lpm = 0.0
+        if (prev_l is not None and prev_ts is not None and ts > prev_ts
+                and value_l >= prev_l and dec.kind != "rebaseline"):
+            rate_lpm = (value_l - prev_l) / ((ts - prev_ts) / 60.0)
+        base = cfg.mqtt_main_topic
+        mqttc.publish(f"{base}/main/value", f"{value_l / 1000.0:.3f}", retain=True, qos=1)
+        mqttc.publish(f"{base}/main/rate", f"{rate_lpm / 1000.0:.6f}", retain=False)
+        mqttc.publish(f"{base}/main/rate_lpm", f"{rate_lpm:.3f}", retain=False)
+        flow_m3h = result.get("flow_m3h")
+        if flow_m3h is not None:
+            mqttc.publish(f"{base}/main/flow_m3h", f"{flow_m3h:.3f}", retain=False)
+        if dec.kind in ("rebaseline", "confirmed"):
+            log.warning("Publish (%s): total=%.3f m³ — %s", dec.kind, value_l / 1000.0, dec.detail)
+        elif prev_l is None or value_l != prev_l:
+            delta = "baseline" if prev_l is None else f"Δ{(value_l - prev_l) / 1000.0:+.3f}"
+            log.info("Publish: total=%.3f m³ rate=%.3f L/min (%s)", value_l / 1000.0, rate_lpm, delta)
+        else:
+            log.debug("Publish (steady): total=%.3f m³", value_l / 1000.0)
+        save_json(cfg.state_path, {
+            "total": value_l / 1000.0,
+            "total_l": value_l,
+            "ts": ts,
+            "meter_type": cfg.meter_type,
+            "dial_histories": {},
+        })
+        stale.mark_fresh(ts)
+        mqttc.set_available(True)
+    else:
+        detail = dec.detail if dec is not None else (result.get("gate_detail") or "")
+        kind = f" {dec.kind}" if dec is not None else ""
+        log.warning("Giving up this cycle (reason=%s%s) digits=%s litres=%s %s — holding %s",
+                    reason, kind, _fmt_digits(result), litres, detail,
+                    "nothing" if gate.last_l is None else f"{gate.last_l / 1000.0:.3f} m³")
+        mqttc.set_available(not stale.is_stale(now))
+    return dec
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", required=True)
@@ -2297,7 +2895,7 @@ def main():
     )
     a = parser.parse_args(); cfg = load_config(a.config)
     ensure_dir(os.path.dirname(cfg.log_path))
-    logging.basicConfig(filename=a.log or cfg.log_path, level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
+    setup_logging(a.log or cfg.log_path, cfg.log_max_bytes, cfg.log_backup_count)
     log = logging.getLogger("watermeter")
 
     # Reset branch — runs before any network/MQTT/image processing setup.
@@ -2332,7 +2930,7 @@ def main():
             cfg.digital_max_retries, cfg.digital_retry_delay_sec,
             cfg.digital_min_digits,
         )
-    state=read_json(cfg.state_path,{"total":None,"ts":None,"dial_histories":{}})
+    state=load_state(cfg.state_path, log)
     prev_total=state.get("total"); prev_ts=state.get("ts")
 
     # State-schema guard: if the persisted state was produced by a different
@@ -2361,13 +2959,24 @@ def main():
     
     # discovery() fires automatically from on_connect (see MqttClient._on_connect);
     # no need to invoke it explicitly here or in the loop.
-    ocr=VisionOCR(cfg.ocr_bin); mqttc=MqttClient(cfg,log); mqttc.connect()
+    ocr=VisionOCR(cfg.ocr_bin); mqttc=MqttClient(cfg,log)
+    # Availability starts from freshness of the persisted reading, so a quick
+    # restart comes back "online" at once and a long-dead one stays "offline".
+    stale = StaleTracker(cfg.mqtt_stale_after_sec, prev_ts)
+    mqttc.available = not stale.is_stale(time.time())
+    mqttc.connect()
+    gate = ReadingGate.from_config(cfg, prev_total, prev_ts) if cfg.meter_type == "digital" else None
+    phase = (ViewPhase(cfg.view_period_sec, cfg.view_numeric_dwell_sec,
+                       margin_sec=cfg.view_margin_sec,
+                       capture_lead_sec=cfg.view_capture_lead_sec)
+             if cfg.meter_type == "digital" and cfg.view_sync_enabled else None)
     aligner = Aligner(cfg.align, log) if cfg.align.enabled else None
     session=requests.Session()
     mode_prev = None
 
     while True:
         t0=time.time()
+        t0_mono=time.monotonic()
         
         # Determine target interval based on local time (needed for temporal validation)
         if cfg.quiet_hours_enabled and _in_window_local(datetime.now(), cfg.quiet_start, cfg.quiet_end):
@@ -2446,88 +3055,26 @@ def main():
 
             result = run_digital_cycle(cfg, ocr, aligner, session, prev_total, log,
                                        on_attempt=_overlay_for_attempt,
-                                       prev_ts=prev_ts)
+                                       prev_ts=prev_ts, gate=gate, phase=phase)
+            handle_digital_result(cfg, mqttc, gate, stale, result, log, now=time.time())
+            if gate.last_l is not None:
+                prev_total = gate.last_l / 1000.0
+                prev_ts = gate.last_ts
 
-            img = result["frame"]
-            aligned_ok = result["aligned_ok"]
-            total = result["total"]
-            flow_m3h = result["flow_m3h"]
-            raw_total_str = result["raw_total"]
-            raw_flow_str = result["raw_flow"]
-            success = result["success"]
-            reason = result["reason"]
-
-            now = time.time()
-            publish_total = None
-
-            if success:
-                # Guards mirror the mechanical clamp so HA always sees a monotonic total.
-                publish_total = total
-                if prev_total is not None:
-                    eff_guard = effective_big_jump_guard(cfg, prev_ts, now)
-                    if total + cfg.monotonic_epsilon < prev_total:
-                        log.warning(
-                            f"CLAMP: negative step detected "
-                            f"(total={total:.6f} < prev={prev_total:.6f} - eps). Holding previous."
-                        )
-                        publish_total = prev_total
-                    elif total - prev_total > eff_guard:
-                        log.warning(
-                            f"CLAMP: big jump detected "
-                            f"(Δ={total - prev_total:.6f} > guard={eff_guard:.6f}). Holding previous."
-                        )
-                        publish_total = prev_total
-
-                rate = 0.0
-                if prev_total is not None and prev_ts is not None and now > prev_ts:
-                    dv = max(0.0, publish_total - prev_total)
-                    dt = (now - prev_ts) / 60.0
-                    rate = dv / dt if dt > 1e-6 else 0.0
-                rate_lpm = rate * 1000.0
-
-                base = cfg.mqtt_main_topic
-                mqttc.publish(f"{base}/main/value", f"{publish_total:.6f}", retain=True)
-                mqttc.publish(f"{base}/main/rate", f"{rate:.6f}", retain=False)
-                mqttc.publish(f"{base}/main/rate_lpm", f"{rate_lpm:.3f}", retain=False)
-                if flow_m3h is not None:
-                    mqttc.publish(f"{base}/main/flow_m3h", f"{flow_m3h:.3f}", retain=False)
-
-                # Log at INFO only when the published total actually advanced
-                # (first reading, or value changed). Steady-state "nothing
-                # changed" cycles log at DEBUG so the normal-operation log
-                # stays quiet over long periods.
-                if prev_total is None or publish_total != prev_total:
-                    delta_str = ("baseline" if prev_total is None
-                                 else f"Δ{publish_total - prev_total:+.3f}")
-                    log.info("Publish: total=%.3f m³ flow=%s m³/h rate=%.3f L/min (%s)",
-                             publish_total,
-                             f"{flow_m3h:.3f}" if flow_m3h is not None else "—",
-                             rate_lpm, delta_str)
-                else:
-                    log.debug("Publish (steady): total=%.3f m³ flow=%s",
-                              publish_total,
-                              f"{flow_m3h:.3f}" if flow_m3h is not None else "—")
-
-                prev_total = publish_total
-                prev_ts = now
-                save_json(cfg.state_path, {
-                    "total": prev_total,
-                    "ts": prev_ts,
-                    "meter_type": cfg.meter_type,
-                    "dial_histories": {},
-                })
-            else:
-                log.warning("Giving up this cycle (reason=%s) — holding previous total", reason)
-
-            # Overlay drawing moved into the _overlay_for_attempt callback so
+            # Overlay drawing lives in the _overlay_for_attempt callback so
             # each retry attempt refreshes overlay_latest.jpg + MQTT camera.
 
-            elapsed = time.time() - t0
-            time.sleep(max(0.0, target_interval - elapsed))
+            next_start = t0_mono + target_interval
+            if phase is not None:
+                aligned_start = phase.next_start(next_start) if phase.confident() else None
+                next_start = (aligned_start if aligned_start is not None
+                              else phase.explore_start(next_start))
+            time.sleep(max(0.0, next_start - time.monotonic()))
             continue
 
         raw = capture_frame(cfg, session, log)
         if raw is None:
+            mqttc.set_available(not stale.is_stale(time.time()))
             time.sleep(cfg.retry_backoff_sec); continue
 
         work=raw; aligned_ok=False
@@ -2666,7 +3213,7 @@ def main():
         # is pure waste. Initial discovery happens once at startup; if we
         # reconnect, ensure_connection will bring us back and the broker will
         # replay retained config to late subscribers.
-        mqttc.publish(f"{base}/main/value", f"{publish_total:.6f}", retain=True)
+        mqttc.publish(f"{base}/main/value", f"{publish_total:.6f}", retain=True, qos=1)
         mqttc.publish(f"{base}/main/rate", f"{rate:.6f}", retain=False)
         rate_lpm = rate * 1000.0
         mqttc.publish(f"{base}/main/rate_lpm", f"{rate_lpm:.3f}", retain=False)
@@ -2705,6 +3252,7 @@ def main():
                     mqttc.publish(topic, buf.tobytes(), retain=True)
 
         prev_total=publish_total; prev_ts=now
+        stale.mark_fresh(now); mqttc.set_available(True)
 
         # Save state including dial histories for persistence across restarts
         dial_histories = {f"dial_{i}": d.reading_history for i, d in enumerate(cfg.dials)}

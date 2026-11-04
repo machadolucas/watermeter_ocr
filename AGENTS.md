@@ -33,10 +33,11 @@ Entry point: `main()` at [watermeter.py](watermeter.py). The mechanical pipeline
 ~/watermeter/
   config.yaml                 # user-edited config
   watermeter.py               # deployed copy
+  bin/watermeter              # signed PyInstaller binary the service runs (built by install.sh)
   reference.jpg               # alignment reference frame
   state.json                  # persisted total + per-dial history
   watermeter.log              # logs
-  aligned_last.jpg            # last aligned frame (debug)
+  aligned_last.jpg            # last aligned frame (optional debug output; not the OCR input)
   debug/overlay_latest.jpg    # overlay image (also published to MQTT)
   bin/ocr                     # compiled Swift helper
   venv/                       # Python venv
@@ -137,13 +138,39 @@ Alternative, simpler pipeline for fully-digital LCD meters. Runs instead of the 
                                 run_digital_cycle returns a dict ───────◄──────┘
                                                      │
                                                      ▼
-                    guards (monotonic, big_jump) → publish value, rate, rate_lpm, flow_m3h
+                    ReadingGate (handle_digital_result) → publish value, rate, rate_lpm, flow_m3h
                                                      │
                                                      ▼
                                         draw_overlays_digital, save state, sleep
 ```
 
-All orchestrated by `run_digital_cycle` ([watermeter.py](watermeter.py)), called from `main()` when `cfg.meter_type == "digital"`.
+All orchestrated by `run_digital_cycle(..., gate=, phase=)` ([watermeter.py](watermeter.py)), called from `main()` when `cfg.meter_type == "digital"`. An alignment that fails `alignment_quality_ok` ends the attempt as `align_failed` (no OCR on an unaligned frame); OCR reads the aligned image in memory (path helpers get `<image_path>.aligned.jpg`), not the optional debug `aligned_last.jpg`. `digital.cycle_budget_sec` (45) stops new attempts in a slow cycle. Per attempt `gate.preview` runs without changing state; an implausible step gets reason `implausible` and is retried. `handle_digital_result` runs `gate.evaluate` on the cycle's final reading, publishes (value with 3 decimals, QoS 1, retained), saves `state.json` (`total` in m³ and `total_l` in litres) and logs give-ups at WARNING with digits, litres and the gate detail.
+
+### `ReadingGate` (digital acceptance policy)
+
+Works in integer litres (`to_litres`) and replaces `big_jump_guard` + the elapsed-time growth on the digital path; the mechanical path still uses `monotonic_epsilon` / `big_jump_*`. `dt` is the time since the last ACCEPTED capture. Keys are under `postproc`:
+
+| Step | Rule | Outcome |
+|---|---|---|
+| forward ≤ `confirm_above_lpm` (25) × min(dt, `immediate_dt_cap_sec` 75 s) + `flow_slack_l` (1 L) | plausible | accepted at once |
+| forward > `max_flow_lpm` (40) × dt + 1 L | impossible | rejected `too_fast` |
+| in between | suspicious | `candidate`; accepted only when a later independent capture (≥ `confirm_min_gap_sec` 15 s, within `candidate_ttl_sec` 600 s) confirms it |
+| backward ≤ 1 L | noise | `hold` |
+| larger backward | rejected, unless `rebaseline_count` (3) consecutive backward readings agree (rate-consistent) and span ≥ `rebaseline_min_span_sec` (60 s) | `rebaseline` to the lower value |
+
+The meter is bidirectional, and the re-baseline frees a total trapped high by an accepted misread. Sizing: observed rates 2026-10-01..11-04 were p50 6, p90 9, p99 12.9, p99.9 23.3 L/min; the service pipe is ≤ 20 mm behind a pressure-reducing valve (~56 L/min at 3 m/s); a DN20 Q3 2.5 meter has Q4 ≈ 52 L/min.
+
+### LCD view rotation and `ViewPhase`
+
+Measured 2026-11-04 at 4.7 fps over 12 rotations: numeric view 11.0 s, diagnostic view B 3.9 s, diagnostic view A 5.0 s; period 20.0 s (20.004 s by fit). A 20 s `interval_sec` phase-locks on that rotation: every cycle's first capture lands on the same view. `ViewPhase` (opt-in via `digital.view_sync.enabled`) tracks the phase of the numeric window from labelled captures (a numeric frame or a `wrong_view` frame), `next_start` schedules each cycle's capture inside the numeric window, `explore_start` staggers captures while the phase is unknown, and the uncertainty widens for drift (0.1 % of elapsed time, doubling on a contradiction, capped at 1 %). Wrong-view retries wait for the next numeric window when the phase is known. Capture exposure time comes from `_fetch_jpeg(..., stamp=)` (`stamp["t_frame"]`). Simulated: ~4 % first-capture misses and every cycle gets a reading, vs ~45 % misses unsynchronised.
+
+### Availability
+
+`MqttClient` sets an LWT (`will_set(availability_topic, "offline", qos=1, retain=True)`); discovery for total/rate/rate_lpm/flow carries `availability_topic` (default `<mqtt.topic>/status`, key `mqtt.availability_topic`); `set_available()` publishes online/offline on change, and `_on_connect` republishes discovery, then availability. `StaleTracker` goes offline once no reading has been accepted for `mqtt.stale_after_sec` (600; 0 disables). The overlay camera has no availability. The total sensor's discovery is `state_class: total` (net register; dips are legitimate), not `total_increasing`.
+
+### History: the "9" misread (2026-11)
+
+The 7-segment classifier's vertical-segment probes overlapped the horizontal bars, so a "3" read 0.13–0.21 ink in the top-left probe against a 0.18 threshold and came out "9" on ~16 % of frames. Accepted +60 L / +600 L misreads then trapped `prev_total` above the meter and every correct reading failed as "backward" until real use caught up (lost consumption, give-up streaks of hundreds/thousands per day). Fix in `classify_7seg`: vertical probes at rows 20–38 % / 62–80 %, horizontal bands 0–18 % / 42–58 % / 82–100 %, inner x 30–70 %, threshold 0.20, and an ambiguity band (0.10, 0.30) → digit `""` (unreadable, retried). Measured on 616 live frames: unlit ≤ 0.061, lit ≥ 0.375; 616/616 correct after the fix (100 were "9" before). Real-LCD fixtures live in `tests/fixtures/lcd/`.
 
 ## Load-bearing invariants
 
@@ -153,24 +180,24 @@ Break these and things go silently wrong.
 - **`decide_digit` keeps `prev_digit` in the stable zone** (`thr_dn < progress < thr_up`). It only flips to a new value at the thresholds. Changing `rolling_threshold_up/down` shifts where OCR flips vs. where the previous value is trusted. See [watermeter.py:565](watermeter.py:565). The function is stateless per call — it does NOT infer a rollover from "low progress + all OCR None" (an earlier heuristic caused persistent OCR failure to creep the digit by 1 every cycle). If OCR is silent, the fallback prefers `prev_digit`.
 - **`estimate_total_from_dials` assumes < 1 m³ consumption per capture** — at most one rollover between samples. At 10 s sampling this is comfortably true for residential meters. If you change `interval_sec` or `quiet_interval_sec` to minutes, revisit. See [watermeter.py:919](watermeter.py:919).
 - **`VisionOCR._run` silently swallows subprocess errors** and returns `""`. Also truncates multi-char output to the first digit (`out[0] if len(out)>1 else out` at [watermeter.py:163](watermeter.py:163)) — intentional because Vision sometimes returns two digits during rollover. Callers must always handle empty strings.
-- **`Aligner.align` returns `(img, None, False)` on failure** and processing continues on the raw frame. `aligned_ok=False` is a normal steady state, not an error.
+- **`Aligner.align` returns `(img, None, False)` on failure** and processing continues on the raw frame. On the mechanical path `aligned_ok=False` is a normal steady state, not an error; the digital path ends the attempt as `align_failed` instead (see above).
 - **ROI format everywhere is `[x, y, w, h]` normalized to `[0..1]`**, not `[x1, y1, x2, y2]`. `norm_to_abs` converts to integer pixel rects.
 - **`read_dial` returns `reading % 10.0`** — a full revolution maps to `0.0`, never `10.0`. A test expecting `10.0` will fail.
 - **Dial reading history is persisted in `state.json`** (up to 20 per dial) and restored on startup ([watermeter.py:971](watermeter.py:971)). Temporal validation in `validate_reading_with_history` and prediction in `predict_expected_reading` depend on this history — resetting state.json is a legitimate fix when a dial is consistently misread and has polluted history.
 - **The Swift helper's `--half top|bottom` carves 55% of height**, not 50% ([ocr.swift:34-38](ocr.swift:34)). Top and bottom intentionally overlap by ~10% so a digit mid-transition is visible in both crops.
 - **MQTT defaults cascade**: if `overlay.camera_topic` is omitted, it defaults to `{mqtt.topic}/debug/overlay`. Moving the `mqtt.topic` key or renaming it silently changes the overlay topic.
 - **HA discovery publishes fire from `MqttClient._on_connect`**, not from the main loop. They happen automatically on every (re)connect and are idempotent because the broker retains them. Do NOT add a per-loop `mqttc.discovery()` call — it just burns bandwidth.
-- **`MqttClient.connected` is gated on `reason_code == 0`.** A rejected CONNECT (bad credentials, protocol mismatch, access denied) leaves `connected=False` and `publish()` silently no-ops. Watch the logs for `MQTT connect rejected` to spot this; the service will keep attempting `reconnect()` every `_reconnect_delay` seconds.
+- **`MqttClient.connected` is gated on `reason_code == 0`.** A rejected CONNECT (bad credentials, protocol mismatch, access denied) leaves `connected=False` and `publish()` silently no-ops. Watch the logs for `MQTT connect rejected` to spot this. paho's loop thread owns connect/reconnect (`connect_async` + `loop_start` + `reconnect_delay_set(1, 60)`); `ensure_connection` no longer reconnects.
 - **Readings in `read_dial` are blended circularly** when `conf < 0.6` and a prediction is available. The helper is `circular_blend(a, b, alpha)` (mod 10). A previous linear blend produced nonsensical midpoints across the 9→0 wrap; do not revert without replacing the helper.
 - **Per-dial `reading_history` is only appended when `confidence > 0.2`.** Low-confidence fallback readings (blank frame → `reading=0.0`) were previously polluting the temporal validator; the gate lives in the main loop around [watermeter.py:1052](watermeter.py:1052).
 - **Digital pipeline bypasses `compose_integer` and all rolling-threshold logic.** LCD digits transition atomically; there's no in-between frame to arbitrate with top/bottom crops. Do NOT try to graft mechanical composition onto the digital path — it reintroduces the drift bug warned about at [watermeter.py:611-614](watermeter.py:611) (persistent silent OCR + stateless progress heuristics creeping the counter).
 - **`digital_total_regex` must accept both dotted and undotted input.** Vision is unreliable about the decimal point on 7-segment LCDs — some frames emit `"000100.000"`, others `"000100000"`. `parse_digital_total` injects a `.` at position `-3` when missing. The default regex `^\d{6}\.?\d{3}$` matches both; a stricter regex will silently drop half your readings.
-- **`run_digital_cycle` is the ONLY place that retries within a single capture cycle.** The display auto-cycles between 3 views (measured dwells 10 s / 5 s / 4 s, total ≈ 19 s). Adding ad-hoc retries elsewhere compounds the budget and can overrun `interval_sec`. If you need more retries, tune `digital_max_retries` in config.
-- **`digital_retry_delay_sec` must exceed the longest diag-view dwell (5 s).** Shorter delays phase-lock: every retry lands on the same diagnostic screen. The default 5.5 s guarantees a retry crosses at least one dwell boundary. If the meter's firmware changes dwell times, recheck this.
+- **`run_digital_cycle` is the ONLY place that retries within a single capture cycle.** The display auto-cycles between 3 views (measured 2026-11-04: numeric 11.0 s, diagnostic B 3.9 s, diagnostic A 5.0 s; period 20.0 s). Adding ad-hoc retries elsewhere compounds the budget and can overrun `interval_sec`. If you need more retries, tune `digital_max_retries` in config.
+- **`digital_retry_delay_sec` must exceed the longest diag-view dwell (5.0 s, diagnostic A).** Shorter delays phase-lock: every retry lands on the same diagnostic screen. The default 5.5 s guarantees a retry crosses at least one dwell boundary. If the meter's firmware changes dwell times, recheck this.
 - **`state.json.meter_type` is the cross-contamination guard.** When config flips between `mechanical` and `digital`, the persisted totals aren't comparable. The load path at [watermeter.py](watermeter.py) discards `prev_total` on mismatch and logs a warning; it does NOT exit, because launchd crash-looping is worse than a one-cycle unknown rate.
 - **HA discovery for `water_flow_m3h` is gated on `cfg.meter_type == "digital"` AND `cfg.digital_flow_roi` being non-empty.** Mechanical installs must not see a dead sensor in HA. Digital installs that chose to skip the flow ROI (flash-glare workaround) also must not see it. The gate lives in `MqttClient.discovery`.
 - **`cfg.digital_flow_roi` is optional.** When it's empty, `run_digital_cycle` skips the flow OCR call, `parse_digital_flow` is not invoked, and `flow` in the result dict is `None`. The `is_valid_digital_view` and `validate_digital_reading` helpers both treat flow as optional when the ROI is unconfigured. Any new code that reads `result["flow_m3h"]` must handle `None`.
-- **`big_jump_guard` is time-aware.** The effective forward-jump allowance is `effective_big_jump_guard(cfg, prev_ts, now) = big_jump_guard + min(elapsed_days, big_jump_elapsed_cap_days) × big_jump_rate_per_day`. Used by `validate_digital_reading` (forward delta only — backward deltas are still strictly bounded by `monotonic_epsilon`) AND by both pipelines' main-loop clamps. A previous fixed-guard implementation had a permanent lock-in trap: once a long OCR outage accumulated more consumption than the base guard, every subsequent successful read failed `validate_digital_reading` because `prev_ts` is held while validation fails (only successful publishes refresh it). Manual `state.json` deletion was the only escape. Do not revert to a fixed guard without replacing the self-healing mechanism.
+- **`big_jump_guard` is time-aware (mechanical path only).** The digital path uses `ReadingGate` instead (see above). The effective forward-jump allowance is `effective_big_jump_guard(cfg, prev_ts, now) = big_jump_guard + min(elapsed_days, big_jump_elapsed_cap_days) × big_jump_rate_per_day`. Used by `validate_digital_reading` (forward delta only — backward deltas are still strictly bounded by `monotonic_epsilon`) AND by both pipelines' main-loop clamps. A previous fixed-guard implementation had a permanent lock-in trap: once a long OCR outage accumulated more consumption than the base guard, every subsequent successful read failed `validate_digital_reading` because `prev_ts` is held while validation fails (only successful publishes refresh it). Manual `state.json` deletion was the only escape. Do not revert to a fixed guard without replacing the self-healing mechanism.
 
 ## Config pitfalls
 
@@ -179,6 +206,11 @@ Break these and things go silently wrong.
 - `per_digit_inset` shrinks each derived digit cell inward. Too high and Vision sees nothing; too low and it includes the plastic frame.
 - `dials[].rotation` is `cw` or `ccw`; `zero_angle_deg` is where "0" points relative to screen coordinates (-90 = top). Nudge by ±5–10° if readings are consistently offset.
 - `alignment.anchor_rois` is a list of normalized `[x, y, w, h]` rects that mask where ORB looks for features; keep them over stable printed areas, not over moving needles.
+
+- **Alignment quality gate** (`alignment_quality_ok`): `alignment.min_inliers` (25), `min_inlier_ratio` (0.5), `max_translation_frac` (0.10). Good frames show ≥ 91 inliers and a ratio ≥ 0.83.
+- **Capture hardening**: empty bodies and bodies over `processing.max_image_bytes` (2 MB) are capture failures; flash-off is checked and retried once.
+- **Logging**: rotating log, `paths.log_max_bytes` (10 MB) and `paths.log_backup_count` (5).
+- **`load_state` validates `state.json`**; a bad `total` is ignored with a warning. A single `flow_tracked(cfg)` predicate decides whether the flow line is tracked.
 
 ## Extension points
 
@@ -232,5 +264,5 @@ Tolerances on image tests are deliberately loose. ORB, Hough, and the dial-detec
 - **ORB is not deterministic across OpenCV versions** for degenerate match sets. Alignment tests assert "close enough," never exact pixel values.
 - **`_in_window_local` uses local `datetime`.** Unit tests must construct explicit `datetime(2025, 1, 1, H, M)` — never `datetime.now()` — so they're reproducible regardless of host timezone.
 - **macOS is case-insensitive by default.** `CLAUDE.md` and `claude.md` would collide. The repo uses one symlink (`CLAUDE.md → AGENTS.md`) to keep a single source of truth; do not commit both as files.
-- **MQTT is best-effort.** `MqttClient.publish` silently no-ops when disconnected; `ensure_connection` throttles reconnect attempts. Missing data points are expected during broker outages — that's by design, not a bug.
+- **MQTT is best-effort.** `MqttClient.publish` silently no-ops when disconnected; paho's loop thread retries the connection with backoff. Missing data points are expected during broker outages — that's by design, not a bug.
 - **`state.json` is the source of truth for `prev_total`.** Deleting it resets monotonic guards; the next reading is accepted unconditionally and becomes the new floor. Treat it as recoverable but not trivially expendable.
