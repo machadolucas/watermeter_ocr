@@ -251,6 +251,10 @@ class Config:
     view_numeric_dwell_sec: float = 11.0
     view_margin_sec: float = 1.0
     view_capture_lead_sec: float = 1.5
+    view_dwells_sec: Optional[List[float]] = None
+    view_drift_per_sec: float = 0.0003
+    view_drift_decay_observations: int = 180
+    view_observation_slack_sec: float = 0.25
 
 def load_config(path)->Config:
     raw=load_yaml(path)
@@ -366,6 +370,10 @@ def load_config(path)->Config:
         view_numeric_dwell_sec = float(vs.get("numeric_dwell_sec", 11.0)),
         view_margin_sec = float(vs.get("margin_sec", 1.0)),
         view_capture_lead_sec = float(vs.get("capture_lead_sec", 1.5)),
+        view_dwells_sec = vs.get("view_dwells_sec"),
+        view_drift_per_sec = float(vs.get("drift_per_sec", 0.0003)),
+        view_drift_decay_observations = int(vs.get("drift_decay_observations", 180)),
+        view_observation_slack_sec = float(vs.get("observation_slack_sec", 0.25)),
         digital_total_int_digits = [list(r) for r in (dig_rois.get("total_int_digits") or [])],
         digital_total_frac_digits = [list(r) for r in (dig_rois.get("total_frac_digits") or [])],
         digital_flow_digits = [list(r) for r in (dig_rois.get("flow_digits") or [])],
@@ -1139,69 +1147,155 @@ class StaleTracker:
 
 
 class ViewPhase:
-    """Tracks where the LCD's view rotation is, to capture inside the numeric view.
+    """Feasible numeric-window origins on a circular grid (monotonic seconds).
 
-    The display rotates numeric (≈11 s) → diagnostic B (≈3.9 s) → diagnostic
-    A (≈5 s), period ≈20.0 s (measured 2026-11-04 at 4.7 fps over 12 cycles).
-    The unknown is φ, the time (mod period) at which a numeric window starts.
-    A boolean set over φ (0.1 s bins) is narrowed by every labelled capture:
-    a numeric frame at t means φ ∈ (t − dwell, t]; a diagnostic frame means
-    the opposite. If an observation contradicts the whole set (drift, a
-    firmware change), the set restarts from that observation alone. The set
-    is widened before each update to absorb clock/period drift: 0.1 % of the
-    elapsed time (0.02 s per rotation; the measured period is 20.004 s, so
-    ~5x the observed error). Captures that land inside the numeric view carry
-    no edge information, so the uncertainty only shrinks on a miss; when it
-    outgrows the window, next_start() returns None and the caller captures
-    unsynchronised (today's behaviour) until a miss re-pins the phase.
-
-    Times are time.monotonic() seconds.
+    Ordered view dwells start with numeric. Unknown diagnostic identities use
+    the whole nonnumeric interval. Cell masks are learned ONLY from a separate
+    numeric/not-numeric model, so an inferred identity cannot reinforce itself.
+    The default drift is 1.5 * (20.004 - 20) / 20 = 0.0003 s/s. Edge jitter
+    belongs in observation slack, not in an allowance compounded every frame.
     """
 
     def __init__(self, period_sec=20.0, numeric_dwell_sec=11.0, margin_sec=1.0,
-                 resolution_sec=0.1, base_blur_sec=0.0, drift_per_sec=0.001,
-                 capture_lead_sec=1.5):
+                 resolution_sec=0.1, base_blur_sec=0.0, drift_per_sec=0.0003,
+                 capture_lead_sec=1.5, view_dwells_sec=None,
+                 drift_decay_observations=180, observation_slack_sec=0.25):
         self.period = float(period_sec)
         self.dwell = float(numeric_dwell_sec)
         self.margin = float(margin_sec)
         self.res = float(resolution_sec)
         self.base_blur = float(base_blur_sec)
-        self.drift = float(drift_per_sec)
+        self.default_drift = self.drift = float(drift_per_sec)
+        self.decay_observations = int(drift_decay_observations)
+        self.slack = float(observation_slack_sec)
         self.lead = float(capture_lead_sec)
+        if view_dwells_sec is None:
+            # Measured tail is 8.9 s; put its rounding residual in the last
+            # view (5.1 s), keeping the B edge at numeric + 3.9 s by default.
+            tail = self.period - self.dwell
+            view_dwells_sec = [self.dwell, tail * 3.9 / 9.0, tail * 5.1 / 9.0]
+        self.dwells = tuple(float(d) for d in view_dwells_sec)
+        if (self.period <= 0 or self.res <= 0 or not 0 <= self.default_drift <= 0.01
+                or self.slack < 0 or len(self.dwells) < 2
+                or any(not math.isfinite(d) or d <= 0 for d in self.dwells)
+                or not math.isclose(sum(self.dwells), self.period, abs_tol=1e-6)
+                or not math.isclose(self.dwells[0], self.dwell, abs_tol=1e-6)):
+            raise ValueError("view dwells must be positive, start with numeric_dwell_sec and sum to period_sec")
+        self.edges = np.cumsum((0.0,) + self.dwells)
         self.n = max(1, int(round(self.period / self.res)))
+        self.res = self.period / self.n
         self.feasible = np.ones(self.n, dtype=bool)
+        self.coarse = self.feasible.copy()
         self.last_obs = None
+        self._blur_remainder = 0.0
+        self._clean = 0
+        self._clean_since = None
+        self._signatures = {}
+        self.contradictions = 0
+        self.start_source = "exploring"   # startup is an unsynchronised probe
+        self._summary_since = None
+        self._counts = dict(cycles=0, first_numeric=0, wrong_synced=0,
+                            wrong_exploring=0, explore_probes=0, contradictions=0)
 
     def _offsets(self, t):
-        phis = np.arange(self.n) * self.res
-        return (t - phis) % self.period
+        return (t - np.arange(self.n) * self.res) % self.period
+
+    def _expanded(self, f, bins):
+        if bins <= 0 or f.all():
+            return f.copy()
+        if bins >= self.n:
+            return np.ones(self.n, dtype=bool)
+        out = f.copy()
+        for shift in range(1, bins + 1):
+            out |= np.roll(f, shift) | np.roll(f, -shift)
+        return out
 
     def _dilate(self, width_sec):
-        k = int(math.ceil(width_sec / self.res))
-        if k <= 0 or self.feasible.all():
-            return
-        f = self.feasible.copy()
-        for s in range(1, k + 1):
-            f |= np.roll(self.feasible, s) | np.roll(self.feasible, -s)
-        self.feasible = f
+        # Carry fractional bins forward. ceil() on every observation used to
+        # add 0.1 s every 20 s even when the requested allowance was 0.006 s.
+        self._blur_remainder += max(0.0, width_sec)
+        bins = int(self._blur_remainder / self.res)
+        self._blur_remainder -= bins * self.res
+        self.feasible = self._expanded(self.feasible, bins)
+        self.coarse = self._expanded(self.coarse, bins)
 
-    def observe(self, t, numeric):
+    def _constraint(self, off, lo, hi):
+        return (off - lo + self.slack) % self.period < min(self.period, hi - lo + 2 * self.slack)
+
+    def _diagnostic_view(self, t, off, cells):
+        """Return a learned view index, or None. Never inspect digit VALUES.
+
+        Three independent rotations with an unambiguous coarse phase must
+        agree on the exact unreadable-cell mask. Mixed evidence disables that
+        mask. Missing cell boundaries, mostly blank frames and new masks abstain.
+        """
+        if not cells or not 3 <= len(cells) <= 32:
+            return None
+        mask = tuple(not (isinstance(c, str) and len(c) == 1 and c.isdigit())
+                     for c in cells)
+        if not 2 <= sum(mask) <= len(mask) - 3:
+            return None
+        possible = off[self.coarse]
+        certain = [i for i in range(1, len(self.dwells))
+                   if possible.size and np.all((possible >= self.edges[i] + self.slack)
+                                              & (possible < self.edges[i + 1] - self.slack))]
+        evidence = self._signatures.get(mask)
+        if evidence is None:
+            if len(self._signatures) >= 128:
+                return None
+            evidence = self._signatures[mask] = {}
+        if len(certain) == 1:
+            i = certain[0]
+            count, last = evidence.get(i, (0, -math.inf))
+            if t - last >= 0.8 * self.period:
+                evidence[i] = (count + 1, t)
+        if len(evidence) == 1:
+            i, (count, _) = next(iter(evidence.items()))
+            if count >= 3 and np.any(self._constraint(possible, self.edges[i], self.edges[i + 1])):
+                return i
+        return None
+
+    def observe(self, t, numeric, cells=None):
         if self.last_obs is not None:
             self._dilate(self.base_blur + self.drift * max(0.0, t - self.last_obs))
         off = self._offsets(t)
-        consistent = (off < self.dwell) if numeric else (off >= self.dwell)
+        broad = (self._constraint(off, 0.0, self.dwell) if numeric else
+                 self._constraint(off, self.dwell, self.period))
+        coarse = self.coarse & broad
+        if not coarse.any():
+            # Relearn after a phase/firmware discontinuity; old identities
+            # must not keep steering retries after the broad model resets.
+            self._signatures.clear()
+        self.coarse = coarse if coarse.any() else broad.copy()
+        view = 0 if numeric else self._diagnostic_view(t, off, cells)
+        consistent = broad if view is None else self._constraint(off, self.edges[view], self.edges[view + 1])
         new = self.feasible & consistent
+        if view not in (None, 0) and not new.any() and (self.feasible & broad).any():
+            # Identity is weaker evidence than the observed numeric/not-numeric
+            # distinction. On a conflict, forget the learned masks and abstain.
+            self._signatures.clear()
+            view, consistent = None, broad
+            new = self.feasible & broad
         if new.any():
             self.feasible = new
+            self._clean += 1
+            if self._clean_since is None:
+                self._clean_since = t
+            if (self.decay_observations > 0 and self._clean >= self.decay_observations
+                    and t - self._clean_since >= 3600.0):
+                self.drift = max(self.default_drift, self.drift / 2.0)
+                self._clean, self._clean_since = 0, t
         else:
-            # The phase moved faster than allowed: restart from this
-            # observation and allow twice the drift from now on (cap 1 %).
             self.feasible = consistent
-            self.drift = min(self.drift * 2.0, 0.01)
+            self.drift = min(max(self.default_drift, self.drift * 2.0), 0.01)
+            self.contradictions += 1
+            self._counts["contradictions"] += 1
+            self._clean, self._clean_since = 0, t
         self.last_obs = t
+        return view
 
     def note_lead(self, lead_sec):
-        """EMA of the delay from starting a capture to the frame's exposure."""
+        """EMA of start-to-kept-GET-midpoint delay, excluding OCR/flash-off."""
         if lead_sec is not None and 0.0 <= lead_sec < 10.0:
             self.lead = 0.8 * self.lead + 0.2 * lead_sec
 
@@ -1211,42 +1305,73 @@ class ViewPhase:
         if idx.size == 0 or idx.size == self.n:
             return None
         gaps = np.diff(np.concatenate([idx, [idx[0] + self.n]]))
-        j = int(np.argmax(gaps))           # largest empty gap ends the arc
-        start = idx[(j + 1) % idx.size]
-        width = (self.n - gaps[j] + 1) * self.res
-        return start * self.res, width
+        j = int(np.argmax(gaps))
+        return idx[(j + 1) % idx.size] * self.res, (self.n - gaps[j] + 1) * self.res
+
+    def _predicted_arc(self, t):
+        arc = self._arc()
+        if arc is None:
+            return None
+        pad = self._blur_remainder + self.drift * max(0.0, t - (self.last_obs if self.last_obs is not None else t))
+        return (arc[0] - pad) % self.period, arc[1] + 2 * pad
 
     def confident(self):
         arc = self._arc()
         return arc is not None and arc[1] + 2 * self.margin <= self.dwell
 
     def explore_start(self, earliest):
-        """Capture start while the phase is unknown: stagger successive
-        cycles by golden-ratio steps within half a period, so captures probe
-        different phases instead of phase-locking (a 20 s interval on a 20 s
-        rotation samples the same view every time)."""
+        """Stagger probes to break interval/rotation phase locking."""
+        self.start_source = "exploring"
         self._explore = (getattr(self, "_explore", 0.0) + 0.382 * self.period) % (0.5 * self.period)
         return earliest + self._explore
 
     def next_start(self, earliest):
-        """Earliest capture start ≥ `earliest` whose exposure lands safely in a
-        numeric window for every feasible φ, or None when not confident."""
-        arc = self._arc()
+        """Schedule a start, adding lead to predict exposure, subtracting it
+        implicitly via the wait. Forecast BOTH arc edges through the latest
+        possible exposure (including one rotation of waiting)."""
+        arc = self._predicted_arc(earliest + self.lead + self.period)
         if arc is None:
             return None
         a, w = arc
-        if self.last_obs is not None:
-            w += 2 * self.drift * max(0.0, earliest - self.last_obs)
-        lo, hi = w + self.margin, self.dwell - self.margin   # offsets from a
+        lo, hi = w + self.margin, self.dwell - self.margin
         if lo > hi:
             return None
-        exposure = earliest + self.lead
-        off = (exposure - a) % self.period
-        if lo <= off <= hi:
-            return earliest
-        target = (lo + hi) / 2.0
-        wait = (target - off) % self.period
+        off = (earliest + self.lead - a) % self.period
+        wait = 0.0 if lo <= off <= hi else ((lo + hi) / 2.0 - off) % self.period
+        self.start_source = "synced"
         return earliest + wait
+
+    def begin_cycle(self, now):
+        self._counts["cycles"] += 1
+        self._counts["explore_probes"] += self.start_source == "exploring"
+        if self._summary_since is None:
+            self._summary_since = now
+        return self.start_source
+
+    def first_attempt(self, t, label, source, log):
+        """Log prediction BEFORE lead/phase updates can hide a bad prediction."""
+        self._counts["first_numeric"] += label == "numeric"
+        if label == "wrong_view":
+            self._counts["wrong_synced" if source == "synced" else "wrong_exploring"] += 1
+        if label not in ("wrong_view", "parse_failed", "align_failed"):
+            return
+        arc = self._predicted_arc(t)
+        a, w = arc if arc is not None else (math.nan, self.period)
+        offset = (t - a - w / 2.0) % self.period if arc is not None else math.nan
+        log.info("LCD first_attempt view=%s source=%s offset=%.3fs arc_start=%.3fs "
+                 "arc_width=%.3fs lead=%.3fs drift=%.6f",
+                 label, source, offset, a, w, self.lead, self.drift)
+
+    def summary(self, now, log):
+        if self._summary_since is None or now - self._summary_since < 3600.0:
+            return
+        arc = self._predicted_arc(now)
+        log.info("LCD hourly cycles=%d first_numeric=%d wrong_view_synced=%d "
+                 "wrong_view_exploring=%d explore_probes=%d contradictions=%d "
+                 "arc_width=%.3fs lead=%.3fs drift=%.6f",
+                 *self._counts.values(), arc[1] if arc else self.period, self.lead, self.drift)
+        self._counts = dict.fromkeys(self._counts, 0)
+        self._summary_since = now
 
 
 def compose_integer(digit_obs, frac, thr_up, thr_dn, prev_int_str=None):
@@ -2367,9 +2492,12 @@ def _fetch_jpeg(cfg, session, log, stamp=None):
     """Return the raw JPEG bytes of one flash-lit frame; raises on HTTP failure.
 
     When `stamp` is a dict, stamp["t_frame"] is set to the time.monotonic()
-    midpoint of the kept snapshot request — the best estimate of when the
-    frame was exposed (the view-phase tracker needs exposure time, not the
-    time OCR finished).
+    midpoint from starting the kept GET to receiving its headers (stream=True).
+    This is a host-side exposure proxy, NOT a camera timestamp. A constant
+    buffering bias cancels between phase observations and scheduling; variable
+    buffering does not. The sync margin must cover that variation plus edge
+    jitter. Body transfer, flash-off and OCR are deliberately excluded. Do not
+    move this stamp to the end of the transfer without camera timing evidence.
     """
     base = cfg.esp32_base_url.rstrip("/")
     if cfg.esp32_capture_mode != "esphome":
@@ -2510,6 +2638,20 @@ def run_digital_cycle(cfg, ocr, aligner, session, prev_total, log,
         return cfg.digital_retry_delay_sec
 
     cycle_start = clock()
+    start_source = phase.begin_cycle(cycle_start) if phase is not None else None
+
+    def _label(label):
+        if phase is not None:
+            if attempt == 0:
+                phase.first_attempt(t_frame, label, start_source, log)
+            if "t_frame" in stamp:
+                phase.note_lead(t_frame - t_attempt)
+
+    def _finish(result):
+        if phase is not None:
+            phase.summary(clock(), log)
+        return result
+
     budget = getattr(cfg, "digital_cycle_budget_sec", 45.0)
     for attempt in range(attempts):
         t_attempt = clock()
@@ -2527,8 +2669,6 @@ def run_digital_cycle(cfg, ocr, aligner, session, prev_total, log,
 
         t_frame = stamp.get("t_frame", clock())
         wall_ts = wall() - (clock() - t_frame)
-        if phase is not None:
-            phase.note_lead(t_frame - t_attempt)
         last.update({"t_frame": t_frame, "ts": wall_ts, "litres": None,
                      "gate_detail": None})
 
@@ -2541,6 +2681,7 @@ def run_digital_cycle(cfg, ocr, aligner, session, prev_total, log,
                              "raw_total": None, "raw_flow": None,
                              "total": None, "flow_m3h": None,
                              "reason": "align_failed"})
+                _label("align_failed")
                 _notify(last)
                 if attempt < attempts - 1:
                     sleep(cfg.digital_retry_delay_sec)
@@ -2673,17 +2814,19 @@ def run_digital_cycle(cfg, ocr, aligner, session, prev_total, log,
         })
 
         if not is_valid_digital_view(raw_total, raw_flow, cfg):
-            # Individual attempts on diag / partial views are routine —
-            # log at DEBUG so the normal-operation log stays quiet. Only
-            # the cycle-level "Giving up" message (when ALL attempts fail)
-            # is escalated to WARNING.
+            # Retry details stay at DEBUG; view sync logs only the first miss
+            # and an hourly rollup. Whole-cycle give-ups remain WARNING.
             log.debug(
                 "Wrong display view (attempt %d/%d): total=%r flow=%r",
                 attempt + 1, attempts, raw_total, raw_flow,
             )
             last["reason"] = "wrong_view"
+            _label("wrong_view")
             if phase is not None:
-                phase.observe(t_frame, numeric=False)
+                int_cells = per_digit_lists["total_int"]
+                frac_cells = per_digit_lists["total_frac"]
+                cells = int_cells + frac_cells if int_cells and frac_cells else None
+                phase.observe(t_frame, numeric=False, cells=cells)
             _notify(last)
             if attempt < attempts - 1:
                 sleep(_retry_wait())
@@ -2705,11 +2848,13 @@ def run_digital_cycle(cfg, ocr, aligner, session, prev_total, log,
                 attempt + 1, attempts, raw_total, raw_flow, total, flow,
             )
             last["reason"] = "parse_failed"
+            _label("parse_failed")
             _notify(last)
             if attempt < attempts - 1:
                 sleep(cfg.digital_retry_delay_sec)
             continue
 
+        _label("numeric")
         if phase is not None:
             phase.observe(t_frame, numeric=True)
         if gate is not None:
@@ -2760,9 +2905,9 @@ def run_digital_cycle(cfg, ocr, aligner, session, prev_total, log,
             "gate_detail": None,
         }
         _notify(result)
-        return result
+        return _finish(result)
 
-    return last
+    return _finish(last)
 
 def _hhmm_to_min(s: str) -> int:
     h, m = map(int, s.split(":"))
@@ -2968,7 +3113,11 @@ def main():
     gate = ReadingGate.from_config(cfg, prev_total, prev_ts) if cfg.meter_type == "digital" else None
     phase = (ViewPhase(cfg.view_period_sec, cfg.view_numeric_dwell_sec,
                        margin_sec=cfg.view_margin_sec,
-                       capture_lead_sec=cfg.view_capture_lead_sec)
+                       capture_lead_sec=cfg.view_capture_lead_sec,
+                       view_dwells_sec=cfg.view_dwells_sec,
+                       drift_per_sec=cfg.view_drift_per_sec,
+                       drift_decay_observations=cfg.view_drift_decay_observations,
+                       observation_slack_sec=cfg.view_observation_slack_sec)
              if cfg.meter_type == "digital" and cfg.view_sync_enabled else None)
     aligner = Aligner(cfg.align, log) if cfg.align.enabled else None
     session=requests.Session()
@@ -3064,7 +3213,9 @@ def main():
             # Overlay drawing lives in the _overlay_for_attempt callback so
             # each retry attempt refreshes overlay_latest.jpg + MQTT camera.
 
-            next_start = t0_mono + target_interval
+            # Subtract work already done; after an overrun, schedule from NOW
+            # rather than aiming at a numeric window that has already passed.
+            next_start = max(t0_mono + target_interval, time.monotonic())
             if phase is not None:
                 aligned_start = phase.next_start(next_start) if phase.confident() else None
                 next_start = (aligned_start if aligned_start is not None

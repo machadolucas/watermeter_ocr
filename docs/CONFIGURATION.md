@@ -94,7 +94,11 @@ Running [`calibrate.py`](../calibrate.py) edits `~/watermeter/config.yaml` direc
 | `digital.view_sync.period_sec` | `20.0` | *(digital)* View-rotation period. |
 | `digital.view_sync.numeric_dwell_sec` | `11.0` | *(digital)* Length of the numeric window. |
 | `digital.view_sync.margin_sec` | `1.0` | *(digital)* Safety margin kept from the window edges. |
-| `digital.view_sync.capture_lead_sec` | `1.5` | *(digital)* Initial guess of the delay from request start to exposure (adapts to the measured lead). |
+| `digital.view_sync.capture_lead_sec` | `1.5` | *(digital)* Initial start-to-kept-GET-midpoint delay; adapts by EMA, excluding OCR, body transfer and flash-off. Exposure is a host-side proxy; see timing caveat below. |
+| `digital.view_sync.view_dwells_sec` | `null` | *(digital)* Ordered view dwells, numeric first. Positive values must sum to `period_sec`; first must equal `numeric_dwell_sec`. `null` splits the remaining time in B:A proportions 3.9:5.1, giving `[11.0, 3.9, 5.1]` with the defaults. Set an explicit list for other rotations (including two views). |
+| `digital.view_sync.drift_per_sec` | `0.0003` | *(digital)* Phase uncertainty growth in seconds per elapsed second (0–0.01). Default covers the measured 0.0002 relative period error with 50% headroom. Doubles on contradictory observations, capped at 0.01. Fractional grid bins accumulate without rounding up each capture. |
+| `digital.view_sync.drift_decay_observations` | `180` | *(digital)* Halve adapted drift after this many consecutive consistent observations spanning at least one hour; floor at `drift_per_sec`. `0` disables decay. |
+| `digital.view_sync.observation_slack_sec` | `0.25` | *(digital)* Nonaccumulating tolerance at each observed view edge, covering measured ±0.2 s edge jitter and sampling uncertainty. Separate from scheduling's `margin_sec`. |
 | `digital.min_digits` | `6` | *(digital)* Cheap-fail threshold that rejects diagnostic screens before regex. |
 | `postproc.monotonic_epsilon` | `0.0005` | *(mechanical)* Tolerated backward wobble; anything smaller than this is treated as noise, not a real regression. |
 | `postproc.big_jump_guard` | `2.0` | *(mechanical)* Base allowance (m³) for forward jumps between captures. The effective allowance is this PLUS `big_jump_rate_per_day` × elapsed-days-since-last-publish. |
@@ -232,6 +236,10 @@ digital:
     numeric_dwell_sec: 11.0
     margin_sec: 1.0
     capture_lead_sec: 1.5
+    view_dwells_sec: null               # defaults to [11.0, 3.9, 5.1]
+    drift_per_sec: 0.0003
+    drift_decay_observations: 180
+    observation_slack_sec: 0.25
 ```
 
 `alignment.*` still applies — ORB alignment of the whole frame helps keep the LCD ROIs stable under small camera drift, even without dials.
@@ -285,7 +293,15 @@ The Qalcosonic W1 auto-cycles between three views:
 
 Measured 2026-11-04 at 4.7 fps over 12 rotations; the period is 20.0 s (20.004 s by fit). Any single capture has a ~55 % chance of landing on the numeric view. `digital.retry_delay_sec = 5.5` exceeds the longest diagnostic dwell (5.0 s), so a retry crosses at least one dwell boundary and doesn't phase-lock onto the same wrong view.
 
-**View sync.** A `processing.interval_sec` of 20 on a 20.0 s rotation phase-locks: every cycle's first capture lands on the same view. Setting `digital.view_sync.enabled: true` turns on `ViewPhase`: it tracks the phase of the numeric window from labelled captures (numeric frames and wrong-view frames), schedules each cycle's capture inside the numeric window, staggers captures while the phase is unknown, and widens its uncertainty for drift (0.1 % of elapsed time, doubling on a contradiction, capped at 1 %). When the phase is known, wrong-view retries wait for the next numeric window. Simulated: ~4 % first-capture misses and every cycle gets a reading, vs ~45 % misses unsynchronised.
+**View sync.** A `processing.interval_sec` of 20 on a 20.0 s rotation phase-locks: every cycle's first capture lands on the same view. Setting `digital.view_sync.enabled: true` turns on `ViewPhase`. `next_start` schedules a capture safe for every feasible numeric-window origin; `explore_start` staggers probes when uncertainty exceeds that safe window. Wrong-view retries use the next safe window when possible. The default drift allowance is 0.03%: the fitted period error is `(20.004 - 20) / 20 = 0.0002`, with 50% headroom. Contradictions double the allowance up to 1%; a clean hour with at least 180 consistent observations halves it toward the default. Fractional grid-bin growth is carried forward, avoiding the former 0.1 s enlargement on every observation. Edge slack is applied to each observation without accumulating it. Numeric captures can trim the feasible arc at a boundary but captures well inside the window provide no new edge information, so occasional exploration is still expected.
+
+With explicit per-cell integer **and** fractional ROIs, diagnostic identity is learned from the exact unreadable-cell mask, independent of digit values. A separate numeric/not-numeric phase model must place the mask unambiguously in the same ordered diagnostic view on three observations at least 0.8 periods apart before that mask can narrow the main phase. New, mostly blank, conflicting or ambiguous masks, and OCR paths without cell boundaries, retain the ordinary not-numeric constraint. A phase reset discards learned signatures. No identity can validate a total or bypass `ReadingGate`. The measured dwells sum to 19.9 s; the default model assigns the 0.1 s rounding residual to the final view. For another meter, set `view_dwells_sec` to its measured ordered rotation rather than assuming these proportions.
+
+**Diagnostics.** With view sync enabled, the first attempt of a cycle logs one INFO line only for `wrong_view`, `parse_failed` or `align_failed`. It includes `source=synced` (`next_start`) or `source=exploring` (`explore_start`, including startup), predicted exposure `offset` from the midpoint of the pre-update feasible numeric-origin arc, that arc's start/width, lead EMA and drift. Unknown offsets/start are `nan`. These are predictions before observing that frame, not hindsight. Once per elapsed hour, INFO reports cycles, first-attempt numeric parses (including gate rejections), first-attempt wrong views split by source, explore probes, contradictions, projected arc width, lead and drift. Retries remain DEBUG; cycle give-ups remain WARNING. Counters and learned masks reset on process restart, and the summary is emitted on the first completed cycle after the hour.
+
+**Timing.** `stamp["t_frame"]` is the midpoint from starting the kept streamed GET to receiving its headers, not a camera exposure timestamp. The lead EMA measures that proxy minus attempt start. Scheduling adds lead to a proposed start to predict the frame time and chooses its wait accordingly. A constant camera-buffer delay cancels because both observations and predictions use the same proxy; variable buffering and lead variation do not cancel and must fit within `margin_sec` (default 1 s). The 0.25 s edge slack does not establish a bound on camera buffering. No camera timestamps were available to verify that bound. Flash settling and the discarded frame retain their existing behaviour. Processing time is subtracted from the next start-to-start interval; overruns schedule from the current time. Neither ordinary processing time nor the lead EMA adds a cumulative per-cycle delay. Waiting for a safe window or an exploration probe deliberately extends some intervals.
+
+Offline simulation (`tests/view_sync_simulation.py`, 400 cycles, first 20 excluded from miss rates) gives first-attempt misses of 0.26%, 0.26%, 0%, 1.58% at true periods 20.0/20.004/20.01/20.05 s, respectively, versus 4.21%, 4.21%, 3.68%, 2.63% with the previous tracker in the same simulation. Every cycle gets a reading. This is model validation, not a live camera measurement.
 
 **Retry budget**: 3 captures × ~0.5 s + 2 × 5.5 s delays ≈ 12 s worst case. That's why the recommended `processing.interval_sec: 15` for digital mode — it gives the loop headroom to finish even when the first two captures miss.
 

@@ -21,6 +21,7 @@ import numpy as np
 import pytest
 
 import watermeter as W
+from tests.view_sync_simulation import simulate
 from watermeter import (
     Config, MqttClient, ReadingGate, StaleTracker, ViewPhase,
     alignment_quality_ok, handle_digital_result, to_litres,
@@ -355,43 +356,26 @@ class TestViewPhase:
         assert (start - phi) % 20.0 >= 1.0 and (start - phi) % 20.0 <= 10.0
 
     @staticmethod
-    def _simulate(true_period, cycles=400, phi=3.0, lead=1.4, interval=20.0):
-        """Mirror main() + run_digital_cycle(): schedule, capture, retry on miss."""
-        p = ViewPhase(20.0, 11.0, margin_sec=1.0, capture_lead_sec=lead)
-        t = 0.0
-        first_miss = no_reading = 0
-        for cycle in range(cycles):
-            start = p.next_start(t) if p.confident() else None
-            if start is None:
-                start = p.explore_start(t)
-            tt = start
-            got = False
-            for attempt in range(3):
-                e = tt + lead
-                num = _lcd_numeric(e, phi, true_period)
-                p.observe(e, num)
-                if cycle >= 20 and attempt == 0 and not num:
-                    first_miss += 1
-                if num:
-                    got = True
-                    break
-                nxt = p.next_start(e) if p.confident() else None
-                tt = e + (min(max(0.0, nxt - e), 20.0) if nxt is not None else 5.5)
-            if cycle >= 20 and not got:
-                no_reading += 1
-            t = start + interval
-        return first_miss / (cycles - 20), no_reading
+    def _simulate(*args, **kwargs):
+        return simulate(*args, **kwargs)
 
     @pytest.mark.parametrize("true_period,max_first_miss", [
-        # First-capture misses are the periodic re-probes once the phase
-        # uncertainty outgrows the window (~4 %); unsynchronised it is ~45 %.
-        (20.0, 0.06),
-        (20.01, 0.06),   # ~2.5x the measured period error
+        (20.0, 0.02),
+        (20.004, 0.02),  # fitted period from the recording
+        (20.01, 0.02),   # ~2.5x the measured period error
         (20.05, 0.06),   # stress: 12x; adaptive drift must keep up
     ])
     def test_scheduled_captures_stay_numeric_with_period_drift(self, true_period, max_first_miss):
         miss_rate, no_reading = self._simulate(true_period)
         assert miss_rate <= max_first_miss, miss_rate
+        assert no_reading == 0
+
+    @pytest.mark.parametrize("true_period", [20.0, 20.004, 20.01, 20.05])
+    @pytest.mark.parametrize("interval", [20.0, 60.0])
+    def test_jitter_and_quiet_hours(self, true_period, interval):
+        miss_rate, no_reading = self._simulate(true_period, cycles=1200, interval=interval,
+                                               timing_jitter=0.2)
+        assert miss_rate <= (0.06 if true_period == 20.05 else 0.025), miss_rate
         assert no_reading == 0
 
     def test_unsynchronised_baseline_is_worse(self):
