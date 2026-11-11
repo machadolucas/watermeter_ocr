@@ -24,9 +24,19 @@ LOG_PATH="$APP_ROOT/watermeter.log"
 SIGNING_IDENTITY="Macserver Code Signing"
 BUNDLE_IDENTIFIER="me.machadolucas.watermeter"
 REPO_DIR="$(cd "$(dirname "$0")" && pwd)"
+BUILD_TMP="$REPO_DIR/build-tmp"
+
+# Release transaction (stage -> health gates -> swap, keeping *.prev ->
+# rollback on failure). A failed build or health gate leaves the running
+# service on its previous binaries. Manual rollback: ./release.sh rollback
+# shellcheck source=release.sh
+source "$REPO_DIR/release.sh"
 
 echo "[watermeter] Installing to: $APP_ROOT"
 mkdir -p "$APP_ROOT" "$BIN_DIR" "$APP_ROOT/debug"
+rm -rf "$BUILD_TMP"
+mkdir -p "$BUILD_TMP"
+trap 'rm -rf "$BUILD_TMP"' EXIT
 
 # 0. Verify the code-signing identity exists. This is a one-time per-machine
 #    setup handled by setup-codesign.sh — without it the binary would end up
@@ -45,7 +55,7 @@ if ! command -v swiftc >/dev/null; then
   xcode-select --install || true
 fi
 echo "[watermeter] Building Swift OCR helper"
-swiftc -O "$REPO_DIR/ocr.swift" -o "$BIN_DIR/ocr"
+swiftc -O "$REPO_DIR/ocr.swift" -o "$BUILD_TMP/ocr"
 
 # 2. Python environment. The same venv serves both build and dev: it holds
 #    the runtime deps (pinned in requirements.txt) plus pyinstaller for the
@@ -62,14 +72,14 @@ source "$VENV_DIR/bin/activate"
 pip install -q -U pip wheel
 pip install -q -r "$REPO_DIR/requirements.txt"
 pip install -q pyinstaller
+# Dev/test tooling, so the documented test commands keep working after a
+# reinstall (the service itself runs the bundled binary, not this venv).
+pip install -q -r "$REPO_DIR/requirements-dev.txt"
 
 # 3. Build the bundled binary. --onefile produces a single self-extracting
 #    Mach-O; --collect-all keeps PyInstaller's hook detection from missing
 #    runtime data files in cv2/numpy. distpath/workpath/specpath isolate the
 #    build artifacts under build-tmp/ so the repo stays clean.
-BUILD_TMP="$REPO_DIR/build-tmp"
-rm -rf "$BUILD_TMP"
-mkdir -p "$BUILD_TMP"
 echo "[watermeter] Bundling watermeter.py with PyInstaller (this takes ~60s)"
 pyinstaller --clean --noconfirm \
   --onefile \
@@ -97,9 +107,12 @@ codesign --force \
   "$BUILD_TMP/dist/watermeter"
 codesign -dvv "$BUILD_TMP/dist/watermeter" 2>&1 | grep -E '(Identifier|Authority|flags)' | sed 's/^/[watermeter]   /'
 
-# 5. Install the binary and starter config
-install -m 0755 "$BUILD_TMP/dist/watermeter" "$BIN_DIR/watermeter"
+# 5. Starter config, then stage the new binaries. Health gate 1 runs the
+#    staged binary with --check-config: it proves the bundle starts and that
+#    the live config passes this version's validation. Nothing live changes
+#    if it fails.
 [ -f "$APP_ROOT/config.yaml" ] || cp "$REPO_DIR/config.yaml" "$APP_ROOT/config.yaml"
+stage_release "$BUILD_TMP/dist/watermeter" "$BUILD_TMP/ocr"
 
 # 6. LaunchAgent. ProgramArguments now points at the binary directly — no
 #    Python invocation at runtime, no dependency on the venv at all (the
@@ -123,16 +136,14 @@ cat > "$PLIST" <<PLIST
 </dict></plist>
 PLIST
 
-# 7. Reload service (bootout / bootstrap is the modern equivalent of
-#    unload / load and avoids deprecation warnings on recent macOS).
-launchctl bootout gui/$(id -u) "$PLIST" 2>/dev/null || true
-launchctl bootstrap gui/$(id -u) "$PLIST"
-
-# 8. Cleanup build artifacts
-rm -rf "$BUILD_TMP"
+# 7. Swap the staged binaries in (the running ones become *.prev), restart
+#    the service with bootout / bootstrap, and run health gate 2: it must stay
+#    running on one pid for HEALTH_WAIT_SEC. Otherwise *.prev is restored.
+activate_release
 
 echo "[watermeter] Installed."
 echo "[watermeter]   Binary:   $BIN_DIR/watermeter"
 echo "[watermeter]   Config:   $APP_ROOT/config.yaml"
 echo "[watermeter]   Logs:     $LOG_PATH"
 echo "[watermeter]   Service:  launchctl print gui/\$(id -u)/com.watermeter.ocr"
+echo "[watermeter]   Rollback: $REPO_DIR/release.sh rollback"
