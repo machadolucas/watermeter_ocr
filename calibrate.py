@@ -9,29 +9,47 @@ docs/CONFIGURATION.md for the end-to-end meter-swap procedure.
 Usage:
     python3 calibrate.py [--config PATH] [--host ADDR] [--port N] [--no-browser]
 
+Every request needs the per-run session token: open the exact URL printed at
+startup (`.../?token=...`). The token blocks other LAN hosts and cross-site
+pages from rewriting config.yaml. Bodies are capped at 64 KiB and a stalled
+client is dropped after 15 s.
+
 "Live" mode (for aiming the camera) keeps the flash on and re-fetches a frame
 every couple of seconds. Pass --host 0.0.0.0 to reach the page from a phone
-on the LAN while standing at the meter; the page can rewrite config.yaml, so
-only do that for the duration of a calibration session.
+on the LAN while standing at the meter (open the printed URL with the Mac's
+LAN address); stop the tool when the calibration session is done.
+
+"Test current config" runs the service's real pipeline on the last fetched
+frame: dial reading for mechanical meters; capture decode, alignment, per-digit
+/ line OCR, parsing and validation for digital ones. Nothing is published and
+the live service's files are not touched.
 
 No new dependencies — uses only the existing venv (yaml, requests, cv2, numpy).
 """
 from __future__ import annotations
 
 import argparse
-import logging
 import copy
+import dataclasses
+import hmac
 import http.server
+import ipaddress
 import json
+import logging
 import os
+import re
+import secrets
 import socketserver
+import stat
 import sys
+import tempfile
 import threading
 import traceback
 import webbrowser
 from datetime import datetime
 from pathlib import Path
 from typing import Any, Optional
+from urllib.parse import parse_qs, urlsplit
 
 import cv2
 import numpy as np
@@ -48,6 +66,19 @@ DEFAULT_PORT = 8765
 DIAL_COUNT = 4
 ANCHOR_COUNT = 3
 MIN_ROI_DIM = 0.005  # reject rectangles smaller than 0.5% in either dimension
+
+# HTTP hardening. Every route needs the per-run session token (header or
+# ?token=), request bodies are capped, and a stalled client is dropped.
+TOKEN_HEADER = "X-Calibrate-Token"
+MAX_BODY_BYTES = 64 * 1024     # a full digital payload is ~3 KB
+REQUEST_TIMEOUT_SEC = 15.0
+
+# Per-digit cell slots the UI offers when the parser's counts can't be derived.
+FALLBACK_DIGIT_SLOTS = {"total_int": 6, "total_frac": 4, "flow": 6}
+DIGIT_LIST_KEYS = ("total_int_digits", "total_frac_digits", "flow_digits")
+
+# One writer at a time: the read-merge-write in POST /config is not atomic.
+_SAVE_LOCK = threading.Lock()
 
 # dials[0] MUST be the tenths wheel (factor 0.1) — see AGENTS.md invariants.
 DIAL_FACTORS = [0.1, 0.01, 0.001, 0.0001]
@@ -271,66 +302,115 @@ def validate_payload(payload: dict) -> Optional[str]:
     return None
 
 
-def validate_digital_payload(payload: dict) -> Optional[str]:
+def trim_cells(list_key: str, cells: list) -> tuple[list, Optional[str]]:
+    """Drop trailing undrawn (None) cells; reject a gap before a drawn cell.
+
+    Cell i is digit i, so a gap would shift every later digit one place left
+    and the saved list would read a different number than the display shows.
+    """
+    out = list(cells)
+    while out and out[-1] is None:
+        out.pop()
+    for i, r in enumerate(out):
+        if r is None:
+            last = len(out)
+            return out, (f"{list_key}: cell {i + 1} is empty but cell {last} is drawn; "
+                         f"draw cell {i + 1} or clear the cells after it")
+    return out, None
+
+
+def _regexes_from_doc(doc: dict) -> tuple["re.Pattern", "re.Pattern"]:
+    """The total/flow regexes the runtime would use for `doc` (defaults if unset/invalid)."""
+    dig = (doc or {}).get("digital") or {}
+    out = []
+    for key, default in (("total_regex", watermeter._DEFAULT_DIGITAL_TOTAL_REGEX),
+                         ("flow_regex", watermeter._DEFAULT_DIGITAL_FLOW_REGEX)):
+        try:
+            out.append(re.compile(dig.get(key) or default))
+        except (re.error, TypeError):
+            out.append(re.compile(default))  # load_config reports the bad regex on save
+    return out[0], out[1]
+
+
+def digit_slots_for(doc: dict) -> dict:
+    """How many cells the UI shows per region: the largest count the parser accepts."""
+    total_re, flow_re = _regexes_from_doc(doc)
+    pairs = watermeter.valid_total_digit_counts(total_re)
+    flows = watermeter.valid_flow_digit_counts(flow_re)
+    return {
+        "total_int": max((i for i, _ in pairs), default=FALLBACK_DIGIT_SLOTS["total_int"]),
+        "total_frac": max((f for _, f in pairs), default=FALLBACK_DIGIT_SLOTS["total_frac"]),
+        "flow": max(flows, default=FALLBACK_DIGIT_SLOTS["flow"]),
+    }
+
+
+def validate_digital_payload(payload: dict, total_regex=None, flow_regex=None) -> Optional[str]:
     """Digital-mode payload validation.
 
-    {total: [x,y,w,h]?, total_int: [...]?, total_frac: [...]?,
-     flow: [...]?, anchors: [...]}
+    {total: [x,y,w,h]?, total_int: [...]?, total_frac: [...]?, flow: [...]?,
+     total_int_digits: [roi|null, ...]?, total_frac_digits: [...]?,
+     flow_digits: [...]?, anchors: [...]}
 
-    Exactly one of these reading modes must be configured:
-      - single-ROI: `total` alone
-      - split-ROI:  `total_int` + `total_frac` (both required together)
-    At least one mode is mandatory. Both modes can coexist — in that case the
-    runtime uses split. `total_int` and `total_frac` must be BOTH drawn
-    together or NEITHER. `flow` is optional — some installs sacrifice the
-    flow line to keep the total line free of flash glare, so a null/missing
-    flow just means the pipeline falls back to delta-computed rate only.
+    The reading needs a source: the single-ROI `total`, or an integer +
+    fractional pair, each side being a per-digit list (`*_digits`) or a split
+    ROI (`total_int` / `total_frac`). One side without the other is rejected:
+    the runtime would silently ignore it and fall back to `total`.
+
+    Per-digit lists are positional (null = undrawn cell). Trailing nulls are
+    trimmed; a null before a drawn cell is rejected. When both sides are
+    per-digit lists, their lengths must make a reading `total_regex` parses
+    (6 + 3 with the default regex); `flow_digits` must suit `flow_regex`.
+    `flow` is optional — some installs sacrifice the flow line to keep the
+    total line free of flash glare.
+
+    Trimmed lists are written back into `payload` so the merge sees them.
     """
     if not isinstance(payload, dict):
         return "payload must be a JSON object"
-    total = payload.get("total")
-    total_int = payload.get("total_int")
-    total_frac = payload.get("total_frac")
-    total_int_digits = payload.get("total_int_digits") or []
-    total_frac_digits = payload.get("total_frac_digits") or []
-    has_split = bool(total_int) and bool(total_frac)
-    has_per_digit = bool(total_int_digits) and bool(total_frac_digits)
-    # Need either single-ROI total, the split-ROI pair, or per-digit lists
-    # covering both integer and fractional parts.
-    if total is None and not has_split and not has_per_digit:
-        return ("missing total ROI — configure either `total` (single-ROI "
-                "mode), both `total_int` + `total_frac` (split-ROI mode), "
-                "or both `total_int_digits` + `total_frac_digits` (per-digit mode)")
-    # total is optional; validate shape only if drawn
-    if total is not None:
-        err = _valid_roi(total)
-        if err:
-            return f"total: {err}"
-    # split-ROI pair: both or neither
-    if bool(total_int) ^ bool(total_frac):
-        return "total_int and total_frac must be set together (both or neither)"
-    for key, val in (("total_int", total_int), ("total_frac", total_frac)):
+    total_regex = total_regex or re.compile(watermeter._DEFAULT_DIGITAL_TOTAL_REGEX)
+    flow_regex = flow_regex or re.compile(watermeter._DEFAULT_DIGITAL_FLOW_REGEX)
+    for key in ("total", "total_int", "total_frac", "flow"):
+        val = payload.get(key)
         if val is not None:
             err = _valid_roi(val)
             if err:
                 return f"{key}: {err}"
-    # flow is optional — validate shape only if the user drew one
-    flow = payload.get("flow")
-    if flow is not None:
-        err = _valid_roi(flow)
-        if err:
-            return f"flow: {err}"
-    # Per-digit ROI lists: each drawn rectangle is geometry-validated.
-    for list_key in ("total_int_digits", "total_frac_digits", "flow_digits"):
-        rois = payload.get(list_key) or []
-        if not isinstance(rois, list):
+    lists = {}
+    for list_key in DIGIT_LIST_KEYS:
+        cells = payload.get(list_key) or []
+        if not isinstance(cells, list):
             return f"{list_key} must be a list"
-        for i, r in enumerate(rois):
-            if r is None:
-                continue
+        cells, err = trim_cells(list_key, cells)
+        if err:
+            return err
+        for i, r in enumerate(cells):
             err = _valid_roi(r)
             if err:
                 return f"{list_key}[{i}]: {err}"
+        lists[list_key] = cells
+        if list_key in payload:
+            payload[list_key] = cells
+
+    int_side = bool(lists["total_int_digits"]) or bool(payload.get("total_int"))
+    frac_side = bool(lists["total_frac_digits"]) or bool(payload.get("total_frac"))
+    if int_side != frac_side:
+        have, miss = ("integer", "fractional") if int_side else ("fractional", "integer")
+        return (f"total_int and total_frac must be set together (both or neither): the "
+                f"{have} part is drawn but the {miss} part is not")
+    if payload.get("total") is None and not int_side:
+        return ("missing total ROI — configure either `total` (single-ROI "
+                "mode), both `total_int` + `total_frac` (split-ROI mode), "
+                "or both `total_int_digits` + `total_frac_digits` (per-digit mode)")
+    if lists["total_int_digits"] and lists["total_frac_digits"]:
+        err = watermeter.digit_count_problem(len(lists["total_int_digits"]),
+                                             len(lists["total_frac_digits"]), total_regex)
+        if err:
+            return f"per-digit cells: {err}"
+    if lists["flow_digits"]:
+        err = watermeter.flow_count_problem(len(lists["flow_digits"]), flow_regex)
+        if err:
+            return f"flow_digits: {err}"
+
     anchors = payload.get("anchors", [])
     if not isinstance(anchors, list) or len(anchors) > ANCHOR_COUNT:
         return f"anchors must be a list of at most {ANCHOR_COUNT} entries"
@@ -347,29 +427,56 @@ def validate_digital_payload(payload: dict) -> Optional[str]:
 # Config write (atomic, with backup + round-trip check)
 # ---------------------------------------------------------------------------
 
+def _unique_backup(config_path: Path, data: bytes) -> Path:
+    """Write `data` to a new `<config>.bak.<timestamp>[-N]`, mode 0600.
+
+    Microsecond timestamps plus exclusive create (O_EXCL) mean two saves can
+    never share a backup name. 0600 because the config holds the MQTT password.
+    """
+    ts = datetime.now().strftime("%Y%m%dT%H%M%S%f")
+    for n in range(1000):
+        candidate = Path(f"{config_path}.bak.{ts}" + (f"-{n}" if n else ""))
+        try:
+            fd = os.open(candidate, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        except FileExistsError:
+            continue
+        with os.fdopen(fd, "wb") as f:
+            f.write(data)
+        return candidate
+    raise RuntimeError(f"could not find a free backup name for {config_path}")
+
+
 def backup_and_write(config_path: Path, new_doc: dict) -> Optional[Path]:
     """Serialize new_doc to config_path. Round-trip through watermeter.load_config
     first to catch schema regressions; back up the old file with a timestamp
     suffix before overwriting. Returns the backup path or None if no prior file.
+
+    The temp file is unique per call (concurrent saves never share it) and is
+    removed on any failure. The config keeps its existing file mode.
     """
-    tmp_path = config_path.with_suffix(config_path.suffix + ".tmp")
-    tmp_path.parent.mkdir(parents=True, exist_ok=True)
-    with open(tmp_path, "w") as f:
-        yaml.safe_dump(new_doc, f, sort_keys=False)
+    config_path.parent.mkdir(parents=True, exist_ok=True)
+    fd, tmp_name = tempfile.mkstemp(dir=config_path.parent,
+                                    prefix=f".{config_path.name}.", suffix=".tmp")
+    tmp_path = Path(tmp_name)
     try:
-        watermeter.load_config(str(tmp_path))
-    except Exception as e:
-        tmp_path.unlink()
-        raise RuntimeError(f"generated YAML failed to load: {e}") from e
+        with os.fdopen(fd, "w") as f:
+            yaml.safe_dump(new_doc, f, sort_keys=False)
+        try:
+            watermeter.load_config(str(tmp_path))
+        except Exception as e:
+            raise RuntimeError(f"generated YAML failed to load: {e}") from e
 
-    backup_path = None
-    if config_path.exists():
-        ts = datetime.now().strftime("%Y%m%dT%H%M%S")
-        backup_path = Path(f"{config_path}.bak.{ts}")
-        backup_path.write_bytes(config_path.read_bytes())
-
-    os.replace(tmp_path, config_path)
-    return backup_path
+        backup_path = None
+        if config_path.exists():
+            os.chmod(tmp_path, stat.S_IMODE(config_path.stat().st_mode))
+            backup_path = _unique_backup(config_path, config_path.read_bytes())
+        else:
+            os.chmod(tmp_path, 0o600)
+        os.replace(tmp_path, config_path)
+        return backup_path
+    finally:
+        if tmp_path.exists():
+            tmp_path.unlink()
 
 
 # ---------------------------------------------------------------------------
@@ -448,6 +555,110 @@ def run_dial_tests(frame_bytes: bytes, dials: list[dict]) -> list[dict]:
     return results
 
 
+class _FrameResponse:
+    def __init__(self, data: bytes):
+        self.content = data
+
+    def raise_for_status(self):
+        pass
+
+    def iter_content(self, chunk_size=65536):
+        for i in range(0, len(self.content), chunk_size):
+            yield self.content[i:i + chunk_size]
+
+    def close(self):
+        pass
+
+
+class _FrameSession:
+    """requests.Session stand-in that serves one cached frame for every GET.
+
+    Lets run_digital_test drive the service's own capture → decode → align →
+    OCR → parse path without touching the camera. POSTs (flash) are refused.
+    """
+
+    def __init__(self, data: bytes):
+        self.data = data
+        self.gets = 0
+
+    def get(self, url, timeout=None, stream=False):
+        self.gets += 1
+        return _FrameResponse(self.data)
+
+    def post(self, *a, **k):
+        raise RuntimeError("calibrate test must not talk to the camera")
+
+
+_REASON_HINTS = {
+    "wrong_view": "the frame shows a diagnostic screen or unreadable cells; refresh and retry",
+    "parse_failed": "the cells read but don't form a reading the regex accepts",
+    "validate_failed": "the reading parsed but failed the sanity checks",
+    "align_failed": "the frame could not be aligned to reference.jpg",
+    "no_frame": "the cached frame could not be decoded",
+}
+
+
+def run_digital_test(frame_bytes: bytes, merged_doc: dict, workdir: Path) -> dict:
+    """Run the service's real digital pipeline on one frame. Publishes nothing.
+
+    `merged_doc` is the config as it would be saved. Everything the pipeline
+    writes (frame copy, aligned copy) goes under `workdir`; the live
+    service's image_path, debug crops, aligned_last.jpg and reference.jpg
+    are never touched.
+    """
+    workdir = Path(workdir)
+    cfg_path = workdir / "test-config.yaml"
+    with open(cfg_path, "w") as f:
+        yaml.safe_dump(merged_doc, f, sort_keys=False)
+    cfg = watermeter.load_config(str(cfg_path))
+    cfg_path.unlink()
+    align = dataclasses.replace(cfg.align, write_debug_aligned=False)
+    cfg = dataclasses.replace(
+        cfg, image_path=str(workdir / "frame.jpg"), esp32_capture_mode="ai_on_the_edge",
+        digital_max_retries=0, digital_save_ocr_crops=False,
+        debug_dir=str(workdir / "debug"), align=align)
+
+    notes = []
+    # Per-digit cells use the built-in 7-segment classifier; every other
+    # region shape goes through the Swift Vision helper.
+    needs_line_ocr = (
+        not (cfg.digital_total_int_digits and cfg.digital_total_frac_digits)
+        or (watermeter.flow_tracked(cfg) and not cfg.digital_flow_digits)
+    )
+    if needs_line_ocr and not os.access(cfg.ocr_bin, os.X_OK):
+        return {"error": f"OCR helper not found at {cfg.ocr_bin}; run install.sh first "
+                         "(per-digit cells don't need it)"}
+    aligner = None
+    if cfg.align.enabled:
+        if os.path.exists(os.path.expanduser(cfg.align.reference_path)):
+            aligner = watermeter.Aligner(cfg.align, _log)
+        else:
+            notes.append("alignment skipped: no reference.jpg yet")
+
+    result = watermeter.run_digital_cycle(
+        cfg, watermeter.VisionOCR(cfg.ocr_bin), aligner, _FrameSession(frame_bytes),
+        None, _log, sleep=lambda s: None, gate=None, phase=None)
+    reason = result.get("reason")
+    out = {
+        "meter_type": "digital",
+        "success": bool(result.get("success")),
+        "reason": reason,
+        "hint": None if result.get("success") else _REASON_HINTS.get(reason),
+        "aligned_ok": bool(result.get("aligned_ok")),
+        "raw_total": result.get("raw_total"),
+        "raw_flow": result.get("raw_flow"),
+        "total": result.get("total"),
+        "flow_m3h": result.get("flow_m3h"),
+        "cells": {
+            "total_int_digits": result.get("total_int_digits_list") or [],
+            "total_frac_digits": result.get("total_frac_digits_list") or [],
+            "flow_digits": result.get("flow_digits_list") or [],
+        },
+        "notes": notes,
+    }
+    return out
+
+
 # ---------------------------------------------------------------------------
 # HTTP server + routes
 # ---------------------------------------------------------------------------
@@ -462,12 +673,20 @@ def _current_meter_type(config_path: Path) -> str:
     return detect_meter_type(doc)
 
 
-def make_handler_class(config_path: Path, cfg: "watermeter.Config", frame_cache: FrameCache):
+class _HttpError(Exception):
+    def __init__(self, status: int, message: str):
+        super().__init__(message)
+        self.status = status
+        self.message = message
+
+
+def make_handler_class(config_path: Path, cfg: "watermeter.Config", frame_cache: FrameCache,
+                       token: str, timeout: float = REQUEST_TIMEOUT_SEC):
 
     class Handler(http.server.BaseHTTPRequestHandler):
-        # Quiet default access logs; we only want failures.
+
         def log_message(self, fmt, *args):
-            pass
+            pass  # quiet default access logs; we only want failures
 
         def _send_json(self, obj: Any, status: int = 200):
             body = json.dumps(obj).encode()
@@ -485,21 +704,59 @@ def make_handler_class(config_path: Path, cfg: "watermeter.Config", frame_cache:
             self.end_headers()
             self.wfile.write(body)
 
+        def _route(self) -> tuple[str, dict]:
+            parts = urlsplit(self.path)
+            return parts.path, parse_qs(parts.query)
+
+        def _authorized(self, query: dict) -> bool:
+            supplied = self.headers.get(TOKEN_HEADER) or (query.get("token") or [""])[0]
+            return hmac.compare_digest(supplied.encode(), token.encode())
+
         def _read_json_body(self):
-            length = int(self.headers.get("Content-Length", "0"))
+            raw_len = self.headers.get("Content-Length")
+            if raw_len is None:
+                raise _HttpError(411, "Content-Length required")
+            try:
+                length = int(raw_len)
+            except ValueError:
+                raise _HttpError(400, "invalid Content-Length")
+            if length < 0:
+                raise _HttpError(400, "invalid Content-Length")
+            if length > MAX_BODY_BYTES:
+                # Not read: closing the connection discards the body.
+                self.close_connection = True
+                raise _HttpError(413, f"request body over {MAX_BODY_BYTES} bytes")
             raw = self.rfile.read(length) if length else b""
-            return json.loads(raw.decode() or "{}")
+            try:
+                return json.loads(raw.decode() or "{}")
+            except (json.JSONDecodeError, UnicodeDecodeError) as e:
+                raise _HttpError(400, f"invalid JSON: {e}")
+
+        def _cached_or_fetch_frame(self) -> bytes:
+            frame = frame_cache.get()
+            if frame is None:
+                try:
+                    frame = fetch_frame(cfg)
+                except (requests.RequestException, ValueError) as e:
+                    raise _HttpError(502, f"ESP32 fetch failed: {e}")
+                frame_cache.set(frame)
+            return frame
 
         def do_GET(self):
-            if self.path == "/" or self.path.startswith("/?"):
+            path, query = self._route()
+            if not self._authorized(query):
+                self._send_text("forbidden: open the URL (with ?token=...) printed in the "
+                                "terminal that started calibrate.py", 403)
+                return
+            if path == "/":
                 self._send_text(HTML_PAGE, 200, "text/html; charset=utf-8")
                 return
 
-            if self.path == "/frame.jpg" or self.path.startswith("/frame.jpg?"):
+            if path == "/frame.jpg":
                 try:
-                    data = fetch_frame(cfg, live="live=1" in self.path)
+                    data = fetch_frame(cfg, live=query.get("live") == ["1"])
                     frame_cache.set(data)
-                except requests.RequestException as e:
+                except (requests.RequestException, ValueError) as e:
                     self._send_text(f"ESP32 fetch failed: {e}", 502)
                     return
                 self.send_response(200)
@@ -510,7 +767,7 @@ def make_handler_class(config_path: Path, cfg: "watermeter.Config", frame_cache:
                 self.wfile.write(data)
                 return
 
-            if self.path == "/config":
+            if path == "/config":
                 try:
                     doc = load_yaml_doc(config_path)
                     meter_type = detect_meter_type(doc)
@@ -521,6 +778,7 @@ def make_handler_class(config_path: Path, cfg: "watermeter.Config", frame_cache:
                         "config_path": str(config_path),
                         "meter_type": meter_type,
                         "rois": rois,
+                        "digit_slots": digit_slots_for(doc),
                         "exists": config_path.exists(),
                     })
                 except Exception as e:
@@ -530,89 +788,87 @@ def make_handler_class(config_path: Path, cfg: "watermeter.Config", frame_cache:
             self._send_text("not found", 404)
 
         def do_POST(self):
-            if self.path == "/flash":
-                try:
-                    set_flash(cfg, bool(self._read_json_body().get("on")))
-                except (json.JSONDecodeError, requests.RequestException) as e:
-                    self._send_json({"error": str(e)}, 502)
-                    return
-                self._send_json({"ok": True})
+            path, query = self._route()
+            if not self._authorized(query):
+                self._send_json({"error": "forbidden: missing or wrong session token"}, 403)
                 return
+            try:
+                payload = self._read_json_body()
+                if path == "/flash":
+                    if not isinstance(payload, dict):
+                        raise _HttpError(400, "payload must be a JSON object")
+                    try:
+                        set_flash(cfg, bool(payload.get("on")))
+                    except requests.RequestException as e:
+                        raise _HttpError(502, str(e))
+                    self._send_json({"ok": True})
+                elif path == "/config":
+                    self._save(payload)
+                elif path == "/test":
+                    self._test(payload)
+                else:
+                    self._send_text("not found", 404)
+            except _HttpError as e:
+                self._send_json({"error": e.message}, e.status)
 
-            if self.path == "/config":
-                try:
-                    payload = self._read_json_body()
-                except json.JSONDecodeError as e:
-                    self._send_json({"error": f"invalid JSON: {e}"}, 400)
-                    return
-                meter_type = _current_meter_type(config_path)
-                validator = (validate_digital_payload
-                             if meter_type == "digital"
-                             else validate_payload)
-                err = validator(payload)
+        def _save(self, payload):
+            with _SAVE_LOCK:
+                doc = load_yaml_doc(config_path)
+                meter_type = detect_meter_type(doc)
+                if meter_type == "digital":
+                    err = validate_digital_payload(payload, *_regexes_from_doc(doc))
+                else:
+                    err = validate_payload(payload)
                 if err:
-                    self._send_json({"error": err}, 400)
-                    return
+                    raise _HttpError(400, err)
                 try:
-                    doc = load_yaml_doc(config_path)
                     merged = (merge_digital_rois(doc, payload)
                               if meter_type == "digital"
                               else merge_rois(doc, payload))
                     backup = backup_and_write(config_path, merged)
                 except Exception as e:
                     traceback.print_exc()
-                    self._send_json({"error": str(e)}, 500)
-                    return
-                self._send_json({
-                    "ok": True,
-                    "backup": str(backup) if backup else None,
-                    "config_path": str(config_path),
-                })
-                return
+                    raise _HttpError(500, str(e))
+            self._send_json({
+                "ok": True,
+                "backup": str(backup) if backup else None,
+                "config_path": str(config_path),
+            })
 
-            if self.path == "/test":
-                try:
-                    payload = self._read_json_body()
-                except json.JSONDecodeError as e:
-                    self._send_json({"error": f"invalid JSON: {e}"}, 400)
-                    return
-                meter_type = _current_meter_type(config_path)
-                if meter_type == "digital":
-                    err = validate_digital_payload(payload)
-                    if err:
-                        self._send_json({"error": err}, 400)
-                        return
-                    # Digital test currently reports placeholders: actual line OCR
-                    # needs the Swift Vision binary, which is deployment-local.
-                    # The calibrator confirms ROI geometry; live verification
-                    # happens once the service is restarted.
-                    self._send_json({"meter_type": "digital",
-                                     "note": "ROI geometry validated; OCR verified on the live service"})
-                    return
-
-                err = validate_payload(payload)
+        def _test(self, payload):
+            doc = load_yaml_doc(config_path)
+            if detect_meter_type(doc) == "digital":
+                err = validate_digital_payload(payload, *_regexes_from_doc(doc))
                 if err:
-                    self._send_json({"error": err}, 400)
-                    return
-                frame = frame_cache.get()
-                if frame is None:
-                    try:
-                        frame = fetch_frame(cfg)
-                        frame_cache.set(frame)
-                    except requests.RequestException as e:
-                        self._send_json({"error": f"ESP32 fetch failed: {e}"}, 502)
-                        return
+                    raise _HttpError(400, err)
+                frame = self._cached_or_fetch_frame()
                 try:
-                    dial_results = run_dial_tests(frame, payload["dials"])
+                    with tempfile.TemporaryDirectory(prefix="calibrate-test-") as work:
+                        out = run_digital_test(frame, merge_digital_rois(doc, payload), Path(work))
+                except watermeter.ConfigError as e:
+                    raise _HttpError(400, str(e))
                 except Exception as e:
                     traceback.print_exc()
-                    self._send_json({"error": str(e)}, 500)
-                    return
-                self._send_json({"meter_type": "mechanical", "dials": dial_results})
+                    raise _HttpError(500, str(e))
+                if "error" in out:
+                    raise _HttpError(500, out["error"])
+                self._send_json(out)
                 return
 
-            self._send_text("not found", 404)
+            err = validate_payload(payload)
+            if err:
+                raise _HttpError(400, err)
+            frame = self._cached_or_fetch_frame()
+            try:
+                dial_results = run_dial_tests(frame, payload["dials"])
+            except Exception as e:
+                traceback.print_exc()
+                raise _HttpError(500, str(e))
+            self._send_json({"meter_type": "mechanical", "dials": dial_results})
 
+    # StreamRequestHandler applies this as the socket timeout: a client that
+    # stalls mid-request is dropped instead of pinning a thread.
+    Handler.timeout = timeout
     return Handler
 
 
@@ -624,6 +880,15 @@ class ThreadingHTTPServer(socketserver.ThreadingMixIn, http.server.HTTPServer):
 # ---------------------------------------------------------------------------
 # Entry point
 # ---------------------------------------------------------------------------
+
+def _is_loopback(host: str) -> bool:
+    if host == "localhost":
+        return True
+    try:
+        return ipaddress.ip_address(host).is_loopback
+    except ValueError:
+        return False
+
 
 def main():
     parser = argparse.ArgumentParser(description=__doc__)
@@ -643,16 +908,26 @@ def main():
     source = config_path if config_path.exists() else REPO_ROOT / "config.yaml"
     try:
         cfg = watermeter.load_config(str(source))
+    except watermeter.ConfigError as e:
+        print(f"error: {e}", file=sys.stderr)
+        sys.exit(watermeter.EX_CONFIG)
     except Exception as e:
         print(f"error: could not read ESP32 URL from {source}: {e}", file=sys.stderr)
         sys.exit(1)
 
     frame_cache = FrameCache()
-    handler_cls = make_handler_class(config_path, cfg, frame_cache)
+    token = secrets.token_urlsafe(24)
+    handler_cls = make_handler_class(config_path, cfg, frame_cache, token)
 
     with ThreadingHTTPServer((args.host, args.port), handler_cls) as httpd:
-        url = f"http://{'127.0.0.1' if args.host == '0.0.0.0' else args.host}:{args.port}"
+        port = httpd.server_address[1]
+        url = (f"http://{'127.0.0.1' if args.host in ('0.0.0.0', '::') else args.host}:{port}"
+               f"/?token={token}")
         print(f"[calibrate] listening on {url}")
+        if not _is_loopback(args.host):
+            print(f"[calibrate] WARNING: reachable from the network on {args.host}:{port}. "
+                  "Anyone with the token URL can rewrite the config; stop the tool "
+                  "(Ctrl-C) when the calibration is done.")
         print(f"[calibrate] config: {config_path}")
         print(f"[calibrate] ESP32:  {cfg.esp32_base_url} ({cfg.esp32_capture_mode})")
         if not args.no_browser:
@@ -810,13 +1085,28 @@ function digitCellSlots(listKey, labelPrefix, count, color) {
   }));
 }
 
-const DIGITAL_SLOTS = [
+// Session token from the URL calibrate.py printed; every request carries it.
+const TOKEN = new URLSearchParams(location.search).get('token') || '';
+function api(path, opts = {}) {
+  const headers = { ...(opts.headers || {}), 'X-Calibrate-Token': TOKEN };
+  return fetch(path, { ...opts, headers });
+}
+function withToken(path) {
+  return path + (path.includes('?') ? '&' : '?') + 'token=' + encodeURIComponent(TOKEN);
+}
+
+// Cell counts come from the server (derived from digital.total_regex /
+// flow_regex: 6 + 3 for the default), so the UI never offers more cells than
+// the parser accepts. The server still validates every save.
+const FALLBACK_DIGIT_SLOTS = { total_int: 6, total_frac: 4, flow: 6 };
+let DIGIT_SLOTS = FALLBACK_DIGIT_SLOTS;
+const digitalSlots = () => [
   // Per-digit slots — draw each rectangle tight around one digit, one per
   // row. Runtime prefers these when set; skip the legacy section below
   // entirely if you're using per-digit calibration.
-  ...digitCellSlots('total_int_digits', 'Total int', 6, '#74b6ff'),
-  ...digitCellSlots('total_frac_digits', 'Total frac', 4, '#ffc76e'),
-  ...digitCellSlots('flow_digits', 'Flow', 6, '#6ee09a'),
+  ...digitCellSlots('total_int_digits', 'Total int', DIGIT_SLOTS.total_int, '#74b6ff'),
+  ...digitCellSlots('total_frac_digits', 'Total frac', DIGIT_SLOTS.total_frac, '#ffc76e'),
+  ...digitCellSlots('flow_digits', 'Flow', DIGIT_SLOTS.flow, '#6ee09a'),
   // Legacy single-ROI / split-ROI slots. Still honoured by the runtime as
   // fallbacks, but only if the per-digit lists above are empty. If you're
   // using per-digit mode and legacy entries remain in config.yaml, use
@@ -859,11 +1149,13 @@ function toast(msg, kind = 'ok') {
 function slotFor(key) { return SLOTS.find(s => s.key === key); }
 
 async function loadConfig() {
-  const r = await fetch('/config');
+  const r = await api('/config');
+  if (r.status === 403) { toast('Open the URL with ?token=… printed in the terminal', 'err'); return; }
   const data = await r.json();
   if (data.error) { toast(data.error, 'err'); return; }
   METER_TYPE = data.meter_type || 'mechanical';
-  SLOTS = METER_TYPE === 'digital' ? DIGITAL_SLOTS : MECHANICAL_SLOTS;
+  DIGIT_SLOTS = data.digit_slots || FALLBACK_DIGIT_SLOTS;
+  SLOTS = METER_TYPE === 'digital' ? digitalSlots() : MECHANICAL_SLOTS;
   document.getElementById('meta').textContent =
     data.config_path + (data.exists ? '' : ' (new)') + ` · ${METER_TYPE}`;
 
@@ -881,6 +1173,10 @@ async function loadConfig() {
       saved.forEach((r, i) => {
         if (r) state.rois[`${listKey}_${i}`] = roiArrToObj(r);
       });
+      const max = DIGIT_SLOTS[listKey.replace(/_digits$/, '')];
+      if (saved.length > max) {
+        toast(`${listKey} has ${saved.length} cells; the parser expects at most ${max}. Clear the extra cells before saving.`, 'warn');
+      }
     }
   } else {
     if (rois.digits) state.rois.digits = roiArrToObj(rois.digits);
@@ -915,7 +1211,7 @@ async function loadImage(live = false) {
       resolve();
     };
     image.onerror = () => { toast('Failed to fetch frame from ESP32', 'err'); resolve(); };
-    image.src = '/frame.jpg?' + (live ? 'live=1&' : '') + 't=' + Date.now();
+    image.src = withToken('/frame.jpg?' + (live ? 'live=1&' : '') + 't=' + Date.now());
   });
 }
 
@@ -986,7 +1282,9 @@ function renderSelectedPanel() {
     `;
   }
 
-  if (res) {
+  if (res && res.char !== undefined) {
+    html += `<div class="result">test: read <span class="${res.char ? 'val' : 'bad'}">${res.char || 'nothing (unreadable)'}</span></div>`;
+  } else if (res) {
     if (res.error) {
       html += `<div class="result"><span class="bad">test: ${res.error}</span></div>`;
     } else {
@@ -1105,15 +1403,15 @@ function buildPayload() {
     return r ? roiObjToArr(r) : null;
   });
   if (METER_TYPE === 'digital') {
-    // Collect per-digit lists by iterating DIGITAL_SLOTS in order (so the
-    // saved list preserves left-to-right ordering). Unset slots are
-    // skipped, so an unused slot just leaves the list shorter than the
-    // maximum — exactly what the runtime expects.
+    // Per-digit lists are positional: cell i is digit i. An undrawn slot is
+    // sent as null so the server can tell "trailing, unused" (trimmed) from
+    // "a gap before a drawn cell" (rejected — it would shift every later
+    // digit one place left).
     const lists = { total_int_digits: [], total_frac_digits: [], flow_digits: [] };
     for (const s of SLOTS) {
       if (s.kind !== 'digit_cell') continue;
       const roi = state.rois[s.key];
-      if (roi) lists[s.list_key].push(roiObjToArr(roi));
+      lists[s.list_key][s.idx] = roi ? roiObjToArr(roi) : null;
     }
     return {
       total:      state.rois.total      ? roiObjToArr(state.rois.total)      : null,
@@ -1149,7 +1447,7 @@ function buildPayload() {
 // camera is being aimed. The last live frame stays cached for "Test".
 let liveOn = false;
 async function setFlash(on) {
-  try { await fetch('/flash', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ on }) }); }
+  try { await api('/flash', { method: 'POST', headers: { 'Content-Type': 'application/json' }, body: JSON.stringify({ on }) }); }
   catch (e) { toast('Flash toggle failed', 'err'); }
 }
 async function liveLoop() {
@@ -1169,7 +1467,7 @@ document.getElementById('live-btn').addEventListener('click', async () => {
   await setFlash(liveOn);
   if (liveOn) liveLoop();
 });
-window.addEventListener('pagehide', () => { if (liveOn) navigator.sendBeacon('/flash', new Blob([JSON.stringify({ on: false })], { type: 'application/json' })); });
+window.addEventListener('pagehide', () => { if (liveOn) navigator.sendBeacon(withToken('/flash'), new Blob([JSON.stringify({ on: false })], { type: 'application/json' })); });
 
 document.getElementById('refresh-btn').addEventListener('click', async () => {
   await loadImage();
@@ -1192,7 +1490,7 @@ document.getElementById('clear-btn').addEventListener('click', () => {
 
 document.getElementById('test-btn').addEventListener('click', async () => {
   const payload = buildPayload();
-  const r = await fetch('/test', {
+  const r = await api('/test', {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(payload),
   });
@@ -1200,7 +1498,17 @@ document.getElementById('test-btn').addEventListener('click', async () => {
   if (!r.ok || data.error) { toast(data.error || 'test failed', 'err'); return; }
   state.testResults = {};
   if (METER_TYPE === 'digital') {
-    toast(data.note || 'Digital ROIs validated', 'ok');
+    // The server ran the service's own pipeline on the last fetched frame.
+    for (const [listKey, chars] of Object.entries(data.cells || {})) {
+      chars.forEach((c, i) => { state.testResults[`${listKey}_${i}`] = { char: c }; });
+    }
+    const notes = (data.notes || []).length ? ` (${data.notes.join('; ')})` : '';
+    if (data.success) {
+      const flow = data.flow_m3h != null ? ` · flow ${data.flow_m3h} m³/h` : '';
+      toast(`OCR: ${data.total.toFixed(3)} m³${flow}${data.aligned_ok ? ' · aligned' : ''}${notes}`, 'ok');
+    } else {
+      toast(`OCR failed: ${data.reason}${data.hint ? ' — ' + data.hint : ''}; read ${JSON.stringify(data.raw_total)}${notes}`, 'warn');
+    }
   } else {
     (data.dials || []).forEach((res, i) => { state.testResults['dial_' + i] = res; });
     toast('Test complete — see per-dial readings in the sidebar', 'ok');
@@ -1210,7 +1518,7 @@ document.getElementById('test-btn').addEventListener('click', async () => {
 
 document.getElementById('save-btn').addEventListener('click', async () => {
   const payload = buildPayload();
-  const r = await fetch('/config', {
+  const r = await api('/config', {
     method: 'POST', headers: { 'Content-Type': 'application/json' },
     body: JSON.stringify(payload),
   });

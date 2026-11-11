@@ -5,7 +5,7 @@
 Water meter reader (Mac) with reference-image alignment.
 See README for details.
 """
-import os, re, sys, time, json, math, subprocess, logging, argparse
+import os, re, sys, time, json, math, subprocess, logging, argparse, difflib
 from dataclasses import dataclass, field
 from typing import List, Tuple, Optional
 from datetime import datetime
@@ -257,7 +257,32 @@ class Config:
     view_observation_slack_sec: float = 0.25
 
 def load_config(path)->Config:
-    raw=load_yaml(path)
+    """Load + validate config.yaml. Raises ConfigError listing every problem.
+
+    Validation runs in two passes: the raw YAML (unknown keys, types, enums,
+    ranges, ROI shapes, regexes) before anything is built, then the built
+    Config (mode-specific requirements, digit counts vs the parser, view sync).
+    """
+    raw = load_yaml(path)
+    if raw is None:
+        raw = {}
+    if not isinstance(raw, dict):
+        raise ConfigError(path, ["top level must be a mapping of sections"])
+    problems = _validate_raw(raw)
+    if problems:
+        raise ConfigError(path, problems)
+    raw = _normalize_sections(raw, _CONFIG_SCHEMA)
+    try:
+        cfg = _build_config(raw)
+    except (TypeError, ValueError, re.error) as e:
+        raise ConfigError(path, [f"could not build config: {e}"]) from e
+    problems = _validate_built(cfg)
+    if problems:
+        raise ConfigError(path, problems)
+    return cfg
+
+
+def _build_config(raw)->Config:
     dials=[DialConfig(**d) for d in raw.get("rois",{}).get("dials",[])]
     al=raw.get("alignment",{})
     align=AlignConfig(
@@ -378,6 +403,480 @@ def load_config(path)->Config:
         digital_total_frac_digits = [list(r) for r in (dig_rois.get("total_frac_digits") or [])],
         digital_flow_digits = [list(r) for r in (dig_rois.get("flow_digits") or [])],
     )
+
+
+# ---------------------------------------------------------------------------
+# Config validation
+# ---------------------------------------------------------------------------
+
+class ConfigError(ValueError):
+    """config.yaml is unusable. `problems` lists every `dotted.key: message`."""
+
+    def __init__(self, path, problems):
+        self.path = str(path)
+        self.problems = list(problems)
+        n = len(self.problems)
+        super().__init__(
+            f"{self.path}: invalid config ({n} problem{'s' if n != 1 else ''}):\n"
+            + "\n".join(f"  - {p}" for p in self.problems))
+
+
+# Every key load_config reads. A dict value is a nested section; None is a
+# leaf. Anything else in the YAML is a typo that would silently be a default.
+_CONFIG_SCHEMA = {
+    "esp32": dict.fromkeys(["base_url", "capture_mode", "snapshot_url", "flash_on_path",
+                            "flash_off_path", "flash_settle_sec", "discard_frames"]),
+    "meter": dict.fromkeys(["type"]),
+    "processing": {
+        **dict.fromkeys(["interval_sec", "retry_backoff_sec", "image_path", "image_timeout",
+                         "max_image_bytes", "save_debug_overlays", "debug_dir",
+                         "debug_keep_latest_only"]),
+        "quiet_hours": dict.fromkeys(["enabled", "start", "end", "interval_sec"]),
+    },
+    "digits": dict.fromkeys(["count", "per_digit_inset", "rolling_threshold_up",
+                             "rolling_threshold_down"]),
+    "rois": {
+        "digits": None,
+        "dials": None,
+        "digital": dict.fromkeys(["total", "total_int", "total_frac", "flow",
+                                  "total_int_digits", "total_frac_digits", "flow_digits"]),
+    },
+    "postproc": dict.fromkeys(["monotonic_epsilon", "big_jump_guard", "big_jump_rate_per_day",
+                               "big_jump_elapsed_cap_days", "max_flow_lpm", "confirm_above_lpm",
+                               "immediate_dt_cap_sec", "flow_slack_l", "confirm_min_gap_sec",
+                               "candidate_ttl_sec", "rebaseline_count", "rebaseline_min_span_sec"]),
+    "mqtt": dict.fromkeys(["host", "port", "username", "password", "topic", "client_id",
+                           "ha_discovery_prefix", "availability_topic", "stale_after_sec"]),
+    "paths": dict.fromkeys(["state_path", "ocr_bin", "log_path", "log_max_bytes",
+                            "log_backup_count"]),
+    "alignment": dict.fromkeys(["enabled", "reference_path", "use_mask", "anchor_rois",
+                                "nfeatures", "ratio_test", "min_matches", "ransac_thresh_px",
+                                "max_scale_change", "max_rotation_deg", "warp_mode",
+                                "write_debug_aligned", "min_inliers", "min_inlier_ratio",
+                                "max_translation_frac"]),
+    "overlay": dict.fromkeys(["font_scale", "font_thickness", "outline_thickness",
+                              "line_thickness", "publish_mqtt", "camera_topic", "camera_name",
+                              "camera_unique_id", "jpeg_quality"]),
+    "auto_centering": dict.fromkeys(["enabled", "smoothing_alpha", "min_confidence_threshold"]),
+    "digital": {
+        **dict.fromkeys(["total_regex", "flow_regex", "max_retries", "retry_delay_sec",
+                         "min_digits", "ocr_preprocess", "total_int_digit_count",
+                         "total_frac_digit_count", "flow_digit_count", "per_digit_inset",
+                         "per_digit_auto_detect", "ocr_upscale_factor", "save_ocr_crops",
+                         "cycle_budget_sec"]),
+        "view_sync": dict.fromkeys(["enabled", "period_sec", "numeric_dwell_sec", "margin_sec",
+                                    "capture_lead_sec", "view_dwells_sec", "drift_per_sec",
+                                    "drift_decay_observations", "observation_slack_sec"]),
+    },
+}
+_DIAL_KEYS = ("name", "roi", "factor", "rotation", "zero_angle_deg")
+_HHMM = re.compile(r"^([01]\d|2[0-3]):[0-5]\d$")
+_MAX_DIGIT_CELLS = 12
+
+
+def _normalize_sections(raw, schema):
+    """Copy of raw where an empty YAML section (`digital:` -> None) becomes {}."""
+    out = dict(raw)
+    for key, sub in schema.items():
+        if isinstance(sub, dict):
+            if out.get(key) is None and key in out:
+                out[key] = {}
+            if isinstance(out.get(key), dict):
+                out[key] = _normalize_sections(out[key], sub)
+    return out
+
+
+class _Checker:
+    def __init__(self):
+        self.problems = []
+
+    def add(self, path, msg, value=None, show=True):
+        self.problems.append(f"{path}: {msg}" + (f" (got {value!r})" if show else ""))
+
+    def unknown_keys(self, mapping, schema, prefix=""):
+        for key, value in mapping.items():
+            path = f"{prefix}{key}"
+            if key not in schema:
+                close = difflib.get_close_matches(str(key), list(schema), n=1, cutoff=0.6)
+                hint = f"; did you mean '{prefix}{close[0]}'?" if close else ""
+                self.problems.append(f"{path}: unknown key{hint}")
+                continue
+            sub = schema[key]
+            if isinstance(sub, dict):
+                if value is None:
+                    continue
+                if not isinstance(value, dict):
+                    self.add(path, "must be a mapping", value)
+                    continue
+                self.unknown_keys(value, sub, prefix=path + ".")
+
+    def num(self, path, v, lo=None, hi=None, lo_open=False, hi_open=False, integer=False):
+        if v is None:
+            return
+        if isinstance(v, bool) or not isinstance(v, (int, float)) or (
+                integer and not isinstance(v, int)) or not math.isfinite(v):
+            self.add(path, "must be an integer" if integer else "must be a number", v)
+            return
+        if lo is not None and (v <= lo if lo_open else v < lo):
+            self.add(path, f"must be {'>' if lo_open else '>='} {lo}", v)
+        if hi is not None and (v >= hi if hi_open else v > hi):
+            self.add(path, f"must be {'<' if hi_open else '<='} {hi}", v)
+
+    def boolean(self, path, v):
+        if v is not None and not isinstance(v, bool):
+            self.add(path, "must be true or false", v)
+
+    def string(self, path, v, allow_none=False):
+        if v is None and allow_none:
+            return
+        if v is not None and not isinstance(v, str):
+            self.add(path, "must be a string", v)
+
+    def enum(self, path, v, choices):
+        if v is None:
+            return
+        if str(v).lower() not in choices:
+            self.add(path, f"must be one of {', '.join(choices)}", v)
+
+    def roi(self, path, v):
+        """[x, y, w, h] normalized to [0, 1], inside the frame. True if valid."""
+        if (not isinstance(v, (list, tuple)) or len(v) != 4
+                or any(isinstance(c, bool) or not isinstance(c, (int, float)) for c in v)):
+            self.add(path, "must be an [x, y, w, h] list of 4 numbers", v)
+            return False
+        x, y, w, h = v
+        if not all(0.0 <= c <= 1.0 for c in v) or w <= 0 or h <= 0:
+            self.add(path, "values must be in [0, 1] with w and h > 0", list(v))
+            return False
+        if x + w > 1.0 + 1e-9 or y + h > 1.0 + 1e-9:
+            self.add(path, "extends past the frame (x+w or y+h > 1)", list(v))
+            return False
+        return True
+
+    def roi_list(self, path, v):
+        if v is None:
+            return
+        if not isinstance(v, list):
+            self.add(path, "must be a list of [x, y, w, h] ROIs", v)
+            return
+        for i, r in enumerate(v):
+            if r is None:
+                self.add(f"{path}[{i}]", "cell is empty (null); every cell needs an ROI",
+                         show=False)
+            else:
+                self.roi(f"{path}[{i}]", r)
+
+    def regex(self, path, v):
+        if v is None:
+            return
+        if not isinstance(v, str):
+            self.add(path, "must be a string", v)
+            return
+        try:
+            re.compile(v)
+        except re.error as e:
+            self.add(path, f"is not a valid regular expression: {e}", v)
+
+
+def _validate_raw(raw):
+    """Pass 1: the YAML document, before any type conversion."""
+    c = _Checker()
+    c.unknown_keys(raw, _CONFIG_SCHEMA)
+    if c.problems:
+        # Wrong section types make the per-key checks below meaningless.
+        return c.problems
+
+    def sec(*keys):
+        d = raw
+        for k in keys:
+            d = d.get(k) if isinstance(d, dict) else None
+        return d if isinstance(d, dict) else {}
+
+    e = sec("esp32")
+    base = e.get("base_url")
+    if base is not None and not (isinstance(base, str) and re.match(r"^https?://\S+$", base)):
+        c.add("esp32.base_url", "must be an http:// or https:// URL", base)
+    c.enum("esp32.capture_mode", e.get("capture_mode"), ("ai_on_the_edge", "esphome"))
+    for k in ("snapshot_url", "flash_on_path", "flash_off_path"):
+        c.string(f"esp32.{k}", e.get(k))
+    c.num("esp32.flash_settle_sec", e.get("flash_settle_sec"), lo=0)
+    c.num("esp32.discard_frames", e.get("discard_frames"), lo=0, integer=True)
+
+    c.enum("meter.type", sec("meter").get("type"), ("mechanical", "digital"))
+
+    p = sec("processing")
+    c.num("processing.interval_sec", p.get("interval_sec"), lo=0, lo_open=True)
+    c.num("processing.retry_backoff_sec", p.get("retry_backoff_sec"), lo=0)
+    c.num("processing.image_timeout", p.get("image_timeout"), lo=0, lo_open=True)
+    c.num("processing.max_image_bytes", p.get("max_image_bytes"), lo=1, integer=True)
+    for k in ("image_path", "debug_dir"):
+        c.string(f"processing.{k}", p.get(k))
+    for k in ("save_debug_overlays", "debug_keep_latest_only"):
+        c.boolean(f"processing.{k}", p.get(k))
+    q = sec("processing", "quiet_hours")
+    c.boolean("processing.quiet_hours.enabled", q.get("enabled"))
+    c.num("processing.quiet_hours.interval_sec", q.get("interval_sec"), lo=0, lo_open=True)
+    for k in ("start", "end"):
+        v = q.get(k)
+        if v is not None and not (isinstance(v, str) and _HHMM.match(v)):
+            c.add(f"processing.quiet_hours.{k}",
+                  'must be a quoted "HH:MM" string (unquoted YAML times parse as numbers)', v)
+
+    d = sec("digits")
+    c.num("digits.count", d.get("count"), lo=1, integer=True)
+    c.num("digits.per_digit_inset", d.get("per_digit_inset"), lo=0, hi=0.5, hi_open=True)
+    up, dn = d.get("rolling_threshold_up"), d.get("rolling_threshold_down")
+    c.num("digits.rolling_threshold_up", up, lo=0, hi=1, lo_open=True, hi_open=True)
+    c.num("digits.rolling_threshold_down", dn, lo=0, hi=1, lo_open=True, hi_open=True)
+    up_v = 0.92 if up is None else up
+    dn_v = 0.08 if dn is None else dn
+    if (all(isinstance(x, (int, float)) and not isinstance(x, bool) for x in (up_v, dn_v))
+            and dn_v >= up_v):
+        c.add("digits.rolling_threshold_down", "must be below rolling_threshold_up",
+              [dn_v, up_v])
+
+    rois = sec("rois")
+    if rois.get("digits") is not None:
+        c.roi("rois.digits", rois.get("digits"))
+    dials = rois.get("dials")
+    if dials is not None:
+        if not isinstance(dials, list):
+            c.add("rois.dials", "must be a list of dials", dials)
+        else:
+            for i, dl in enumerate(dials):
+                path = f"rois.dials[{i}]"
+                if not isinstance(dl, dict):
+                    c.add(path, "must be a mapping", dl)
+                    continue
+                for k in dl:
+                    if k not in _DIAL_KEYS:
+                        c.add(f"{path}.{k}", f"unknown key (dial keys: {', '.join(_DIAL_KEYS)})",
+                              show=False)
+                for k in ("name", "roi", "factor"):
+                    if dl.get(k) is None:
+                        c.add(f"{path}.{k}", "is required", show=False)
+                c.string(f"{path}.name", dl.get("name"))
+                if dl.get("roi") is not None:
+                    c.roi(f"{path}.roi", dl.get("roi"))
+                c.num(f"{path}.factor", dl.get("factor"), lo=0, lo_open=True)
+                c.enum(f"{path}.rotation", dl.get("rotation"), ("cw", "ccw"))
+                c.num(f"{path}.zero_angle_deg", dl.get("zero_angle_deg"), lo=-360, hi=360)
+    dr = sec("rois", "digital")
+    for k in ("total", "total_int", "total_frac", "flow"):
+        v = dr.get(k)
+        if v not in (None, []):
+            c.roi(f"rois.digital.{k}", v)
+    for k in ("total_int_digits", "total_frac_digits", "flow_digits"):
+        c.roi_list(f"rois.digital.{k}", dr.get(k))
+
+    pp = sec("postproc")
+    for k in ("monotonic_epsilon", "big_jump_guard", "big_jump_rate_per_day",
+              "big_jump_elapsed_cap_days"):
+        c.num(f"postproc.{k}", pp.get(k), lo=0)
+    for k in ("max_flow_lpm", "confirm_above_lpm", "immediate_dt_cap_sec",
+              "candidate_ttl_sec"):
+        c.num(f"postproc.{k}", pp.get(k), lo=0, lo_open=True)
+    for k in ("confirm_min_gap_sec", "rebaseline_min_span_sec"):
+        c.num(f"postproc.{k}", pp.get(k), lo=0)
+    c.num("postproc.flow_slack_l", pp.get("flow_slack_l"), lo=0, integer=True)
+    c.num("postproc.rebaseline_count", pp.get("rebaseline_count"), lo=1, integer=True)
+    mx = pp.get("max_flow_lpm", 40.0)
+    ca = pp.get("confirm_above_lpm", 25.0)
+    if (all(isinstance(x, (int, float)) and not isinstance(x, bool) for x in (mx, ca))
+            and ca > mx):
+        c.add("postproc.confirm_above_lpm", "must not exceed max_flow_lpm", [ca, mx])
+
+    m = sec("mqtt")
+    host = m.get("host")
+    if host is not None and not (isinstance(host, str) and host.strip()):
+        c.add("mqtt.host", "must be a non-empty string", host)
+    c.num("mqtt.port", m.get("port"), lo=1, hi=65535, integer=True)
+    for k in ("username", "password"):
+        if m.get(k) is not None and not isinstance(m.get(k), str):
+            c.add(f"mqtt.{k}", "must be a string or null", show=False)  # never echo secrets
+    for k in ("topic", "client_id", "ha_discovery_prefix", "availability_topic"):
+        c.string(f"mqtt.{k}", m.get(k), allow_none=(k == "availability_topic"))
+    c.num("mqtt.stale_after_sec", m.get("stale_after_sec"), lo=0)
+
+    pa = sec("paths")
+    for k in ("state_path", "ocr_bin", "log_path"):
+        c.string(f"paths.{k}", pa.get(k))
+    c.num("paths.log_max_bytes", pa.get("log_max_bytes"), lo=1, integer=True)
+    c.num("paths.log_backup_count", pa.get("log_backup_count"), lo=0, integer=True)
+
+    al = sec("alignment")
+    for k in ("enabled", "use_mask", "write_debug_aligned"):
+        c.boolean(f"alignment.{k}", al.get(k))
+    c.string("alignment.reference_path", al.get("reference_path"))
+    anchors = al.get("anchor_rois")
+    if anchors is not None:
+        c.roi_list("alignment.anchor_rois", anchors)
+    for k in ("nfeatures", "min_matches"):
+        c.num(f"alignment.{k}", al.get(k), lo=1, integer=True)
+    c.num("alignment.min_inliers", al.get("min_inliers"), lo=0, integer=True)
+    for k in ("ratio_test", "min_inlier_ratio", "max_translation_frac"):
+        c.num(f"alignment.{k}", al.get(k), lo=0, hi=1, lo_open=(k != "min_inlier_ratio"))
+    c.num("alignment.ransac_thresh_px", al.get("ransac_thresh_px"), lo=0, lo_open=True)
+    c.num("alignment.max_scale_change", al.get("max_scale_change"), lo=0)
+    c.num("alignment.max_rotation_deg", al.get("max_rotation_deg"), lo=0, hi=180)
+    c.enum("alignment.warp_mode", al.get("warp_mode"), ("similarity", "affine"))
+
+    ov = sec("overlay")
+    c.num("overlay.font_scale", ov.get("font_scale"), lo=0, lo_open=True)
+    for k in ("font_thickness", "outline_thickness", "line_thickness"):
+        c.num(f"overlay.{k}", ov.get(k), lo=0, integer=True)
+    c.boolean("overlay.publish_mqtt", ov.get("publish_mqtt"))
+    for k in ("camera_topic", "camera_name", "camera_unique_id"):
+        c.string(f"overlay.{k}", ov.get(k))
+    c.num("overlay.jpeg_quality", ov.get("jpeg_quality"), lo=1, hi=100, integer=True)
+
+    ac = sec("auto_centering")
+    c.boolean("auto_centering.enabled", ac.get("enabled"))
+    c.num("auto_centering.smoothing_alpha", ac.get("smoothing_alpha"), lo=0, hi=1)
+    c.num("auto_centering.min_confidence_threshold", ac.get("min_confidence_threshold"),
+          lo=0, hi=1)
+
+    dg = sec("digital")
+    c.regex("digital.total_regex", dg.get("total_regex"))
+    c.regex("digital.flow_regex", dg.get("flow_regex"))
+    c.num("digital.max_retries", dg.get("max_retries"), lo=0, integer=True)
+    c.num("digital.retry_delay_sec", dg.get("retry_delay_sec"), lo=0)
+    c.num("digital.min_digits", dg.get("min_digits"), lo=0, integer=True)
+    c.enum("digital.ocr_preprocess", dg.get("ocr_preprocess"), ("none", "clahe"))
+    for k in ("total_int_digit_count", "total_frac_digit_count", "flow_digit_count"):
+        c.num(f"digital.{k}", dg.get(k), lo=0, hi=_MAX_DIGIT_CELLS, integer=True)
+    c.num("digital.per_digit_inset", dg.get("per_digit_inset"), lo=0, hi=0.5, hi_open=True)
+    for k in ("per_digit_auto_detect", "save_ocr_crops"):
+        c.boolean(f"digital.{k}", dg.get(k))
+    c.num("digital.ocr_upscale_factor", dg.get("ocr_upscale_factor"), lo=1, integer=True)
+    c.num("digital.cycle_budget_sec", dg.get("cycle_budget_sec"), lo=0)
+    vs = sec("digital", "view_sync")
+    c.boolean("digital.view_sync.enabled", vs.get("enabled"))
+    for k in ("period_sec", "numeric_dwell_sec"):
+        c.num(f"digital.view_sync.{k}", vs.get(k), lo=0, lo_open=True)
+    for k in ("margin_sec", "capture_lead_sec", "observation_slack_sec"):
+        c.num(f"digital.view_sync.{k}", vs.get(k), lo=0)
+    c.num("digital.view_sync.drift_per_sec", vs.get("drift_per_sec"), lo=0, hi=0.01)
+    c.num("digital.view_sync.drift_decay_observations", vs.get("drift_decay_observations"),
+          lo=1, integer=True)
+    dw = vs.get("view_dwells_sec")
+    if dw is not None and not (isinstance(dw, list) and dw and all(
+            isinstance(x, (int, float)) and not isinstance(x, bool) for x in dw)):
+        c.add("digital.view_sync.view_dwells_sec", "must be a list of numbers", dw)
+    return c.problems
+
+
+def valid_total_digit_counts(total_regex, max_cells=_MAX_DIGIT_CELLS):
+    """(integer, fractional) cell counts whose split-mode reading the parser accepts.
+
+    Split mode always hands the parser f"{int_digits}.{frac_digits}", so a
+    count is valid exactly when that string of zeros parses.
+    """
+    if isinstance(total_regex, str):
+        total_regex = re.compile(total_regex)
+    return [(i, f) for i in range(1, max_cells + 1) for f in range(1, max_cells + 1)
+            if parse_digital_total("0" * i + "." + "0" * f, total_regex) is not None]
+
+
+def valid_flow_digit_counts(flow_regex, max_cells=_MAX_DIGIT_CELLS):
+    """Per-digit flow cells are joined without a dot; counts the parser accepts."""
+    if isinstance(flow_regex, str):
+        flow_regex = re.compile(flow_regex)
+    return [n for n in range(1, max_cells + 1)
+            if parse_digital_flow("0" * n, flow_regex) is not None]
+
+
+def _fmt_pairs(pairs):
+    return ", ".join(f"{i}+{f}" for i, f in pairs) or "none"
+
+
+def digit_count_problem(n_int, n_frac, total_regex):
+    """None when n_int integer + n_frac fractional cells parse, else a message."""
+    valid = valid_total_digit_counts(total_regex)
+    if (n_int, n_frac) in valid:
+        return None
+    pattern = getattr(total_regex, "pattern", total_regex)
+    if len(valid) == 1:
+        i, f = valid[0]
+        return (f"needs {i} integer + {f} fractional cells for total_regex {pattern!r}, "
+                f"got {n_int} + {n_frac}")
+    return (f"{n_int} integer + {n_frac} fractional cells don't parse with total_regex "
+            f"{pattern!r} (valid: {_fmt_pairs(valid)})")
+
+
+def flow_count_problem(n, flow_regex):
+    valid = valid_flow_digit_counts(flow_regex)
+    if n in valid:
+        return None
+    pattern = getattr(flow_regex, "pattern", flow_regex)
+    return (f"{n} flow cells don't parse with flow_regex {pattern!r} "
+            f"(valid counts: {', '.join(map(str, valid)) or 'none'})")
+
+
+def _validate_built(cfg):
+    """Pass 2: rules that need the resolved Config."""
+    c = _Checker()
+    if cfg.dials and not math.isclose(cfg.dials[0].factor, 0.1, rel_tol=1e-6):
+        c.add("rois.dials[0].factor",
+              "must be 0.1: dials[0] is the tenths wheel that drives the rolling digits",
+              cfg.dials[0].factor)
+    if cfg.meter_type == "digital":
+        int_side = bool(cfg.digital_total_int_digits) or bool(cfg.digital_total_int_roi)
+        frac_side = bool(cfg.digital_total_frac_digits) or bool(cfg.digital_total_frac_roi)
+        if int_side != frac_side:
+            have, miss = (("total_int", "total_frac") if int_side
+                          else ("total_frac", "total_int"))
+            c.add("rois.digital", f"{have} is set but {miss} is not; set both "
+                  f"(total_int_digits/total_int + total_frac_digits/total_frac) or neither",
+                  show=False)
+        elif not int_side and not cfg.digital_total_roi:
+            c.add("rois.digital", "a digital meter needs rois.digital.total, or an "
+                  "integer + fractional pair (total_int_digits + total_frac_digits, "
+                  "or total_int + total_frac)", show=False)
+        if int_side and frac_side:
+            n_int = (len(cfg.digital_total_int_digits) if cfg.digital_total_int_digits
+                     else cfg.digital_total_int_digit_count or None)
+            n_frac = (len(cfg.digital_total_frac_digits) if cfg.digital_total_frac_digits
+                      else cfg.digital_total_frac_digit_count or None)
+            if n_int is not None and n_frac is not None:
+                msg = digit_count_problem(n_int, n_frac, cfg.digital_total_regex)
+                if msg:
+                    c.add("rois.digital", msg, show=False)
+        n_flow = (len(cfg.digital_flow_digits) if cfg.digital_flow_digits
+                  else (cfg.digital_flow_digit_count if cfg.digital_flow_roi else 0))
+        if n_flow:
+            msg = flow_count_problem(n_flow, cfg.digital_flow_regex)
+            if msg:
+                c.add("rois.digital.flow_digits", msg, show=False)
+        if cfg.view_sync_enabled:
+            try:
+                ViewPhase(cfg.view_period_sec, cfg.view_numeric_dwell_sec,
+                          margin_sec=cfg.view_margin_sec,
+                          capture_lead_sec=cfg.view_capture_lead_sec,
+                          view_dwells_sec=cfg.view_dwells_sec,
+                          drift_per_sec=cfg.view_drift_per_sec,
+                          drift_decay_observations=cfg.view_drift_decay_observations,
+                          observation_slack_sec=cfg.view_observation_slack_sec)
+            except (ValueError, TypeError) as e:
+                c.add("digital.view_sync", str(e), show=False)
+            if cfg.view_numeric_dwell_sec >= cfg.view_period_sec:
+                c.add("digital.view_sync.numeric_dwell_sec", "must be shorter than period_sec",
+                      cfg.view_numeric_dwell_sec)
+    return c.problems
+
+
+def runtime_config_problems(cfg):
+    """Requirements of the service loop on top of load_config's checks.
+
+    Kept separate so tools (calibrate, tests) can load a mechanical config
+    that has no dials yet; the service itself can't run one.
+    """
+    problems = []
+    if cfg.meter_type == "mechanical" and len(cfg.dials) < 2:
+        problems.append("rois.dials: a mechanical meter needs at least 2 dials "
+                        f"(dials[0] = tenths, dials[1] = hundredths), got {len(cfg.dials)}")
+    return problems
+
 
 class VisionOCR:
     def __init__(self,bin_path): self.bin=bin_path
@@ -3028,7 +3527,10 @@ def handle_digital_result(cfg, mqttc, gate, stale, result, log, now=None):
     return dec
 
 
-def main():
+EX_CONFIG = 78  # sysexits.h: configuration error
+
+
+def main(argv=None):
     parser = argparse.ArgumentParser()
     parser.add_argument("--config", required=True)
     parser.add_argument("--log")
@@ -3038,7 +3540,28 @@ def main():
         help="Reset state.json total to VALUE (default 0.0) and exit. "
              "Use after physical meter replacement; pair with a restart of the LaunchAgent.",
     )
-    a = parser.parse_args(); cfg = load_config(a.config)
+    parser.add_argument(
+        "--check-config", action="store_true",
+        help="Validate the config and exit (0 = OK, 78 = invalid). Touches nothing else.",
+    )
+    a = parser.parse_args(argv)
+    # Validate before logging, MQTT or the network: a bad config is reported
+    # with every problem at once and never half-starts the service.
+    try:
+        cfg = load_config(a.config)
+        # --reset-total only edits state.json; the loop requirements don't apply.
+        problems = runtime_config_problems(cfg) if a.reset_total is None else []
+        if problems:
+            raise ConfigError(a.config, problems)
+    except ConfigError as e:
+        print(f"error: {e}", file=sys.stderr)
+        sys.exit(EX_CONFIG)
+    except OSError as e:
+        print(f"error: cannot read config {a.config}: {e}", file=sys.stderr)
+        sys.exit(EX_CONFIG)
+    if a.check_config:
+        print(f"config OK: {a.config} ({cfg.meter_type})")
+        sys.exit(0)
     ensure_dir(os.path.dirname(cfg.log_path))
     setup_logging(a.log or cfg.log_path, cfg.log_max_bytes, cfg.log_backup_count)
     log = logging.getLogger("watermeter")
