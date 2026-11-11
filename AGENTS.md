@@ -33,8 +33,8 @@ Entry point: `main()` at [watermeter.py](watermeter.py). The mechanical pipeline
 ```
 ~/watermeter/
   config.yaml                 # user-edited config
-  watermeter.py               # deployed copy
   bin/watermeter              # signed PyInstaller binary the service runs (built by install.sh)
+  bin/watermeter.prev, bin/ocr.prev   # previous release, kept by release.sh for rollback
   reference.jpg               # alignment reference frame
   state.json                  # persisted total + per-dial history
   watermeter.log              # logs
