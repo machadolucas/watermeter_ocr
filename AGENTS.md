@@ -18,9 +18,10 @@ Entry point: `main()` at [watermeter.py](watermeter.py). The mechanical pipeline
 | [watermeter.py](watermeter.py) | Everything — config, OCR wrapper, dial/digit logic, alignment, MQTT, main loop (1190 lines, flat module) |
 | [ocr.swift](ocr.swift) | Apple Vision CLI helper; reads one digit slice from a given ROI |
 | [config.yaml](config.yaml) | Default config; deploy copy lives at `~/watermeter/config.yaml` |
-| [install.sh](install.sh) | Bash installer: venv, Swift build, LaunchAgent, starter config |
-| [save_reference.py](save_reference.py) | One-shot: capture a clean ESP32 frame and save as the alignment reference |
-| [calibrate.py](calibrate.py) | Browser-based ROI calibration tool. Run `python3 calibrate.py`; see [docs/CONFIGURATION.md](docs/CONFIGURATION.md). |
+| [install.sh](install.sh) | Bash installer: venv, Swift build, LaunchAgent, starter config; hands the release to `release.sh` |
+| [release.sh](release.sh) | Release transaction sourced by install.sh: stage → `--check-config` gate → swap keeping `*.prev` → restart → stable-pid gate → auto-rollback. `./release.sh rollback` / `status` by hand |
+| [save_reference.py](save_reference.py) | One-shot: capture a clean ESP32 frame (via `_fetch_jpeg`, so ESPHome mode works) and atomically save it as the alignment reference |
+| [calibrate.py](calibrate.py) | Browser-based ROI calibration tool. Run `python3 calibrate.py` and open the printed `?token=` URL; see [docs/CONFIGURATION.md](docs/CONFIGURATION.md). |
 | [tests/](tests) | pytest suite (fixtures, unit + synthetic-image tests) |
 | [overlay_example.jpg](overlay_example.jpg) | Sample debug overlay for tuning ROIs visually |
 | [docs/CONFIGURATION.md](docs/CONFIGURATION.md) | Full config reference, meter-swap procedure, troubleshooting |
@@ -58,13 +59,20 @@ swiftc -O ocr.swift -o ~/watermeter/bin/ocr
 # Foreground run against the deployed config
 ~/watermeter/venv/bin/python3 watermeter.py --config ~/watermeter/config.yaml
 
+# Validate a config without starting anything (exit 0 OK, 78 invalid)
+~/watermeter/venv/bin/python3 watermeter.py --check-config --config ~/watermeter/config.yaml
+
+# Roll the service back to the previous release / check its health
+./release.sh rollback
+./release.sh status
+
 # Tests (from repo root)
 pip install -r requirements-dev.txt
 pytest -q
 pytest -q tests/test_digit_logic.py -k rollover   # selective run
 
 # Interactive ROI calibration (after a meter swap, or first-time setup)
-python3 calibrate.py                               # browser opens at 127.0.0.1:8765
+python3 calibrate.py                               # browser opens at 127.0.0.1:8765/?token=...
 
 # Reset the running total (e.g. new physical meter starts at 0)
 python3 watermeter.py --config ~/watermeter/config.yaml --reset-total 0
@@ -205,7 +213,8 @@ Break these and things go silently wrong.
 
 ## Config pitfalls
 
-- `load_config` uses deeply chained `.get()` with fallback defaults — a typo'd key turns into a silent default. No validation errors. If behavior changes unexpectedly, diff against `config.yaml` keys precisely.
+- **`load_config` validates** (since 2026-11-11) and raises `ConfigError` with every problem as `dotted.key: message`. Pass 1 (`_validate_raw`) checks the YAML: unknown keys against `_CONFIG_SCHEMA` (with a did-you-mean), types, enums, ranges, ROI shapes, regexes, quoted `HH:MM`. Pass 2 (`_validate_built`) checks the built Config: digital total source, int/frac sides together, cell counts vs the parser (`digit_count_problem` / `flow_count_problem`), `ViewPhase` dwell rules, `dials[0].factor == 0.1`. **A new config key must be added to `_CONFIG_SCHEMA`**, or every config using it fails to load. `runtime_config_problems` (mechanical needs ≥ 2 dials) is checked only by `main()`, so tools and tests can load a dial-less config. `main()` exits 78 before logging/MQTT/network; `--check-config` validates and exits, and release.sh's gate 1 depends on it.
+- **Digit-cell counts come from the parser.** Split mode hands `parse_digital_total` the string `f"{int}.{frac}"`, so a count is valid exactly when that many zeros parse (`valid_total_digit_counts`; 6 + 3 for the default regex). Per-digit flow cells are joined without a dot (`valid_flow_digit_counts`; 5–8). calibrate.py uses the same helpers for its slot counts and payload checks.
 - `rois.digits` is a **single window** split `digits.count` ways by `build_digit_rois` at [watermeter.py:944](watermeter.py:944). `digits.count` must match the physical meter; the current meter has 5.
 - `per_digit_inset` shrinks each derived digit cell inward. Too high and Vision sees nothing; too low and it includes the plastic frame.
 - `dials[].rotation` is `cw` or `ccw`; `zero_angle_deg` is where "0" points relative to screen coordinates (-90 = top). Nudge by ±5–10° if readings are consistently offset.
@@ -223,7 +232,7 @@ Break these and things go silently wrong.
 - **Additional sanity check on total**: either extend `estimate_total_from_dials` or add inline logic around [watermeter.py:1111](watermeter.py:1111) where `big_jump_guard` is consulted.
 - **New Home Assistant sensor**: add a discovery payload in `MqttClient.discovery` at [watermeter.py:709](watermeter.py:709) and publish its value in the main loop.
 - **New guard/clamp**: the publish branch at [watermeter.py:1122-1131](watermeter.py:1122) is where `publish_total` is decided separately from the raw `total` — add behavior there if you want the raw reading logged but not published.
-- **Changing ROIs**: prefer `python3 calibrate.py` over hand-editing `config.yaml`. The tool validates (ROI bounds, dial ordering, round-trip through `load_config`) before writing and creates a timestamped backup. Hand-editing is the fallback for headless boxes — see [docs/CONFIGURATION.md](docs/CONFIGURATION.md) § "Manual ROI tuning".
+- **Changing ROIs**: prefer `python3 calibrate.py` over hand-editing `config.yaml`. The tool validates (ROI bounds, positional per-digit cells with no gaps, counts vs the parser, dial ordering, round-trip through `load_config`) before writing, serializes saves (`_SAVE_LOCK`, unique temp file) and creates a unique 0600 backup. Every route needs the per-run session token (`X-Calibrate-Token` header or `?token=`); bodies are capped at 64 KiB and the socket timeout is 15 s. The digital **Test** button runs `run_digital_cycle` on the cached frame through `_FrameSession` with a temp `image_path`, no retries, no aligner unless `reference.jpg` exists, and no debug writes. It must never publish or touch the live service's files. Hand-editing is the fallback for headless boxes — see [docs/CONFIGURATION.md](docs/CONFIGURATION.md) § "Manual ROI tuning".
 - **Physical meter replacement**: the full procedure lives in [docs/CONFIGURATION.md](docs/CONFIGURATION.md) § "Meter-swap procedure". Short version: stop LaunchAgent → delete `reference.jpg` → run `calibrate.py` → `watermeter.py --reset-total 0` → restart LaunchAgent.
 - **Swap to a digital LCD meter**: set `meter.type: digital` in config, bump `processing.interval_sec` to 15, calibrate the two line ROIs, then the standard meter-swap procedure. State's `meter_type` field auto-discards `prev_total` on mismatch. See [docs/CONFIGURATION.md](docs/CONFIGURATION.md) § "Digital meter".
 - **Adapt the digital pipeline to a different LCD layout**: change `digital.total_regex` and `digital.flow_regex` in config to match your meter's display format (e.g. 8 integer digits with no decimal: `^\d{8}$`). If the layout has no decimal at all, adjust `parse_digital_total` so it doesn't inject one. ROI count stays at two — total and flow.
@@ -242,7 +251,10 @@ pytest -q --tb=long                                # longer tracebacks for debug
 
 Coverage is organized by concern:
 - `test_utils.py` — small helpers (`clip01`, `norm_to_abs`, time windows, ROI math)
-- `test_config.py` — `load_config` on minimal/full YAML, including digital keys
+- `test_config.py` — `load_config` on minimal/full YAML, including digital keys; validation (`ConfigError`) and `--check-config` exit codes
+- `test_calibrate.py` / `test_calibrate_hardening.py` — payload validation, merge, backups; the real digital Test on the LCD fixture; token / 411 / 413 / socket timeout / concurrent saves over a live loopback server
+- `test_save_reference.py` — capture via `_fetch_jpeg` (ESPHome order, flash-off on failure), decode/write checks, atomic replace
+- `test_release.py` — `release.sh` with a stub `launchctl`: gate 1 failure, keep-previous, crash-loop rollback, manual rollback
 - `test_digit_logic.py` — `decide_digit` branches, `compose_integer` rollover scenarios (highest-value mechanical module)
 - `test_postproc.py` — `estimate_total_from_dials`, temporal validation & prediction
 - `test_dial_detection.py` — synthetic-dial tests for `detect_dial_center`, `read_dial`, needle methods (mechanical only)

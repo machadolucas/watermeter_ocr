@@ -96,10 +96,13 @@ When new code lands in this repo and you've already installed the service on the
    ```
 
    This:
-   - rebuilds the Swift OCR helper at `~/watermeter/bin/ocr`,
-   - rebuilds the signed PyInstaller binary `~/watermeter/bin/watermeter` that the service runs,
-   - refreshes the LaunchAgent plist and reloads it (unload + load + start),
+   - rebuilds the Swift OCR helper and the signed PyInstaller binary in `build-tmp/`,
+   - stages them in `~/watermeter/bin/.staged/` and runs the new binary's `--check-config` against your live config (health gate 1; on failure the running service is untouched),
+   - keeps the running binaries as `bin/watermeter.prev` / `bin/ocr.prev`, swaps the new ones in, refreshes the LaunchAgent plist and restarts it,
+   - waits for the service to stay up on one pid for 20 s (health gate 2) and rolls back to `*.prev` automatically if it doesn't,
    - preserves your `~/watermeter/config.yaml`, `state.json`, `reference.jpg`, and everything under `~/watermeter/debug/`.
+
+   To go back to the previous release by hand: `./release.sh rollback`. `./release.sh status` runs the health check.
 
 3. Confirm the service came back up:
 
@@ -108,7 +111,7 @@ When new code lands in this repo and you've already installed the service on the
    tail -f ~/watermeter/watermeter.log
    ```
 
-> The installer only copies `config.yaml` from the repo if `~/watermeter/config.yaml` is missing — your tuned settings survive. When a release adds new config keys, the service picks them up via `load_config`'s built-in fallbacks; release notes will call out any default changes that matter.
+> The installer only copies `config.yaml` from the repo if `~/watermeter/config.yaml` is missing — your tuned settings survive. When a release adds new config keys, the service picks them up via `load_config`'s built-in fallbacks; release notes will call out any default changes that matter. A key the release doesn't know (a typo, or one that was removed) makes `--check-config` fail, so the installer stops before it replaces anything; see [docs/CONFIGURATION.md § Validation](./docs/CONFIGURATION.md#validation).
 
 > If the update introduces a schema change your old file doesn't have (e.g. switching from `mechanical` to `digital`), edit `~/watermeter/config.yaml` before step 2, or use `~/watermeter/venv/bin/python3 calibrate.py` for ROI work. When switching meter types, run `~/watermeter/venv/bin/python3 watermeter.py --config ~/watermeter/config.yaml --reset-total 0` once so the guards accept the new baseline.
 

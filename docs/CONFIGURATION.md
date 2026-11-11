@@ -45,7 +45,18 @@ Two copies of `config.yaml`:
 | [`config.yaml`](../config.yaml) (in the repo) | Template shipped with the code. Reflects the author's current meter; use as a starting point when copying to a new machine. |
 | `~/watermeter/config.yaml` | **The file the service actually reads.** Created by [`install.sh`](../install.sh) the first time you run it (copied from the repo). All subsequent edits happen here. |
 
-Running [`calibrate.py`](../calibrate.py) edits `~/watermeter/config.yaml` directly and leaves a timestamped backup next to it: `~/watermeter/config.yaml.bak.<YYYYMMDDTHHMMSS>`. If you want to revert, replace the live file with the backup.
+Running [`calibrate.py`](../calibrate.py) edits `~/watermeter/config.yaml` directly and leaves a timestamped backup next to it: `~/watermeter/config.yaml.bak.<YYYYMMDDTHHMMSSffffff>` (mode 0600, since the file holds the MQTT password). If you want to revert, replace the live file with the backup.
+
+### Validation
+
+`load_config` validates the whole file and refuses to start on any problem, listing all of them at once as `dotted.key: message (got X)`. It catches unknown keys (with a "did you mean"), bad enums (`meter.type`, `esp32.capture_mode`, `digital.ocr_preprocess`, `alignment.warp_mode`, dial `rotation`), out-of-range numbers, ROIs outside the frame, regexes that don't compile, and unquoted `HH:MM` quiet-hour times (YAML reads `17:30` as a number). It also enforces the digital-mode rules: a total source is required, the integer and fractional sides go together, and the per-digit cell counts must make a reading `digital.total_regex` parses (6 + 3 with the default regex). Check a config without starting anything:
+
+```bash
+~/watermeter/venv/bin/python3 watermeter.py --check-config --config ~/watermeter/config.yaml
+# config OK: /Users/.../config.yaml (digital)      exit 0;  invalid -> errors on stderr, exit 78
+```
+
+The service exits 78 (EX_CONFIG) before logging, MQTT or any network access when the config is invalid. `install.sh` runs this check on the new binary before it replaces the running one.
 
 ## Quick reference
 
@@ -353,10 +364,10 @@ From the repo directory (or anywhere, really — `calibrate.py` uses the deploye
 source ~/watermeter/venv/bin/activate && python3 calibrate.py
 ```
 
-A browser tab opens at `http://127.0.0.1:8765` showing the current meter image. The sidebar reflects the `meter.type` you have in config:
+A browser tab opens at `http://127.0.0.1:8765/?token=…` showing the current meter image. Every request needs that per-run token, so open the exact URL printed in the terminal; a URL without it gets 403. This stops other LAN hosts and cross-site pages from rewriting the config. With `--host 0.0.0.0` (to use a phone at the meter), open the printed URL with the Mac's LAN address, and stop the tool when you're done. The sidebar reflects the `meter.type` you have in config:
 
 - **Mechanical** → 1 digits window + 4 dial ROIs + 3 alignment anchors.
-- **Digital** → 2 line ROIs (total, flow) + 3 alignment anchors.
+- **Digital** → per-digit cells (as many as `digital.total_regex` / `flow_regex` accept: 6 integer + 3 fractional by default), the legacy line ROIs (total, flow) and 3 alignment anchors. Cells are positional: an empty cell before a drawn one is rejected (it would shift every later digit), and the cell counts must match the parser.
 
 For each ROI in the sidebar:
 
@@ -364,7 +375,7 @@ For each ROI in the sidebar:
 2. Drag a rectangle on the image to place it.
 3. (Mechanical dials only) set `rotation` and `zero_angle_deg` in the sidebar.
 
-Iterate. Click **Test current config** whenever you want to verify a dial's reading (mechanical only — digital mode's live OCR runs on the service itself, not in the calibrator). When everything looks right:
+Iterate. Click **Test current config** whenever you want to check the result. Mechanical: each dial's reading and confidence. Digital: the service's real pipeline (decode, alignment, per-digit / line OCR, parsing, validation) runs on the last fetched frame and shows the reading, or why it failed (for example a diagnostic view), with each cell's digit in the sidebar. Nothing is published, and the live service's files are untouched. When everything looks right:
 
 4. Click **Save to config.yaml**. A toast confirms the backup filename.
 
@@ -426,7 +437,7 @@ tail -f ~/watermeter/watermeter.log
 
 If you're on a headless box or just prefer editing YAML:
 
-1. Grab a current frame: `python3 save_reference.py` — writes to `~/watermeter/reference.jpg`.
+1. Grab a current frame: `~/watermeter/venv/bin/python3 save_reference.py` — writes to `~/watermeter/reference.jpg`. It captures exactly like the service (`esp32.capture_mode`, including the ESPHome flash), checks the decode and the write, keeps the old reference as `reference.jpg.bak.<timestamp>`, and exits non-zero with the old file intact on any failure. Stop the LaunchAgent first.
 2. Open the image in any image viewer that shows pixel coordinates. (macOS Preview: tap `⌘-Shift-i` for inspector.)
 3. For each ROI you want to define:
    - Measure top-left (x_px, y_px) and size (w_px, h_px) in pixels.
