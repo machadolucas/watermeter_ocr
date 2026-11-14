@@ -13,6 +13,7 @@ import numpy as np
 import pytest
 
 import cv2
+import watermeter as watermeter_module
 
 from watermeter import (
     detect_dial_center,
@@ -181,6 +182,39 @@ class TestDetectNeedleByLines:
         result = detect_needle_by_lines(img, cx=100, cy=100)
         # Might still find noise-edge lines; just assert it doesn't crash.
         assert result is None or isinstance(result, tuple)
+
+    @pytest.mark.parametrize("opencv5_shape", [False, True], ids=["legacy-n-1-4", "opencv5-n-4"])
+    def test_accepts_legacy_and_opencv5_hough_line_shapes(self, monkeypatch, opencv5_shape):
+        img = np.zeros((100, 100, 3), dtype=np.uint8)
+        line = [10, 50, 90, 50]
+        shape = (1, 4) if opencv5_shape else (1, 1, 4)
+        lines = np.asarray(line, dtype=np.int32).reshape(shape)
+        monkeypatch.setattr(cv2, "cvtColor", lambda *_args, **_kwargs: np.zeros((100, 100), np.uint8))
+        monkeypatch.setattr(cv2, "Canny", lambda *_args, **_kwargs: np.zeros((100, 100), np.uint8))
+        monkeypatch.setattr(cv2, "HoughLinesP", lambda *_args, **_kwargs: lines)
+
+        result = detect_needle_by_lines(img, cx=50, cy=50)
+
+        assert result == pytest.approx((0.0, 1.0))
+
+
+@pytest.mark.parametrize("opencv5_shape", [False, True], ids=["legacy-1-n-3", "opencv5-n-3"])
+def test_detect_dial_center_accepts_legacy_and_opencv5_hough_circle_shapes(
+    monkeypatch, opencv5_shape
+):
+    img = np.zeros((100, 100, 3), dtype=np.uint8)
+    circles = np.asarray([[50.0, 51.0, 30.0], [52.0, 50.0, 29.0]], dtype=np.float32)
+    if not opencv5_shape:
+        circles = circles.reshape(1, 2, 3)
+    monkeypatch.setattr(watermeter_module, "detect_needle_center", lambda _img: None)
+    monkeypatch.setattr(cv2, "cvtColor", lambda *_args, **_kwargs: np.zeros((100, 100), np.uint8))
+    monkeypatch.setattr(cv2, "GaussianBlur", lambda image, *_args, **_kwargs: image)
+    monkeypatch.setattr(cv2, "HoughCircles", lambda *_args, **_kwargs: circles)
+    monkeypatch.setattr(watermeter_module, "detect_dial_markings", lambda *_args: (0.0, 0.5))
+
+    result = detect_dial_center(img)
+
+    assert result == pytest.approx((50.0, 51.0, 30.0, 0.7))
 
 
 # ---- History-aware paths in read_dial -------------------------------------

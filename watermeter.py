@@ -1046,9 +1046,15 @@ def detect_dial_center(roi_img):
         maxRadius=int(min(roi_img.shape[:2]) * 0.6)
     )
     
-    if circles is not None and len(circles[0]) > 0:
+    if circles is not None:
+        # OpenCV 5 returns (N, 3), while older releases returned (1, N, 3).
+        circle_candidates = np.asarray(circles).reshape(-1, 3)
+    else:
+        circle_candidates = np.empty((0, 3))
+
+    if len(circle_candidates) > 0:
         # Take the most prominent circle
-        circle = circles[0][0]
+        circle = circle_candidates[0]
         cx, cy, radius = circle[0], circle[1], circle[2]
         
         # Try to validate/refine using dial markings
@@ -1114,13 +1120,16 @@ def detect_needle_by_lines(roi_img, cx, cy):
     
     if lines is None or len(lines) == 0:
         return None
+
+    # OpenCV 5 returns (N, 4), while older releases returned (N, 1, 4).
+    line_candidates = np.asarray(lines).reshape(-1, 4)
     
     # Find line closest to passing through center
     best_angle = None
     best_score = float('inf')
     
-    for line in lines:
-        x1, y1, x2, y2 = line[0]
+    for line in line_candidates:
+        x1, y1, x2, y2 = line
         # Calculate distance from line to center
         line_vec = np.array([x2 - x1, y2 - y1])
         line_len = np.linalg.norm(line_vec)

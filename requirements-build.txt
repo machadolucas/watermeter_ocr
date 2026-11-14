@@ -1,0 +1,6 @@
+# Build tools for the signed standalone binary and local development venv.
+pip==26.3
+wheel==0.48.0
+setuptools==84.2.1
+Cython==3.3.1
+pyinstaller==6.22.3

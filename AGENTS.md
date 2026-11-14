@@ -41,7 +41,7 @@ Entry point: `main()` at [watermeter.py](watermeter.py). The mechanical pipeline
   aligned_last.jpg            # last aligned frame (optional debug output; not the OCR input)
   debug/overlay_latest.jpg    # overlay image (also published to MQTT)
   bin/ocr                     # compiled Swift helper
-  venv/                       # Python venv
+  venv/                       # CPython 3.15.2 build/dev venv; service runs bundled binary
   launch_stdout.log, launch_stderr.log
 ```
 
@@ -66,8 +66,9 @@ swiftc -O ocr.swift -o ~/watermeter/bin/ocr
 ./release.sh rollback
 ./release.sh status
 
-# Tests (from repo root)
-pip install -r requirements-dev.txt
+# Tests (from repo root; create a CPython 3.15.2 arm64 venv first)
+python -m pip install --require-hashes --only-binary=:all: -r requirements-build.lock
+python -m pip install --require-hashes --no-cache-dir --no-build-isolation -r requirements.lock
 pytest -q
 pytest -q tests/test_digit_logic.py -k rollover   # selective run
 
@@ -239,10 +240,11 @@ Break these and things go silently wrong.
 
 ## Testing strategy
 
-pytest suite at `tests/`. Runs with zero external dependencies — no MQTT broker, no ESP32, no Swift binary required. See [tests/conftest.py](tests/conftest.py) for fixtures.
+pytest suite at `tests/`. Runs with zero external services — no MQTT broker, no ESP32, no Swift binary required. Use the CPython 3.15.2 arm64 build/dev venv and install the generated hash locks. See [tests/conftest.py](tests/conftest.py) for fixtures.
 
 ```bash
-pip install -r requirements-dev.txt
+python -m pip install --require-hashes --only-binary=:all: -r requirements-build.lock
+python -m pip install --require-hashes --no-cache-dir --no-build-isolation -r requirements.lock
 pytest -q                                          # full suite
 pytest -q tests/test_digit_logic.py                # one module
 pytest -q -k "rollover or wraparound"              # keyword filter

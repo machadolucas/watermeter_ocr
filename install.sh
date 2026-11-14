@@ -25,6 +25,20 @@ SIGNING_IDENTITY="Macserver Code Signing"
 BUNDLE_IDENTIFIER="me.machadolucas.watermeter"
 REPO_DIR="$(cd "$(dirname "$0")" && pwd)"
 BUILD_TMP="$REPO_DIR/build-tmp"
+DEFAULT_WTM_PYTHON="$HOME/.local/share/uv/python/cpython-3.15.2-macos-aarch64-none/bin/python3.15"
+WTM_PYTHON="${WTM_PYTHON:-$DEFAULT_WTM_PYTHON}"
+
+# Validate the selected interpreter before removing build artifacts or the
+# existing build venv. An explicit override is allowed, but must still match
+# the Python and architecture used to validate this release.
+if [ ! -x "$WTM_PYTHON" ]; then
+  echo "[watermeter] ERROR: Python interpreter is not executable: $WTM_PYTHON" >&2
+  exit 1
+fi
+if ! "$WTM_PYTHON" -c 'import platform, sys; sys.exit(0 if sys.implementation.name == "cpython" and sys.version_info[:3] == (3, 15, 2) and platform.machine() == "arm64" else 1)'; then
+  echo "[watermeter] ERROR: WTM_PYTHON must be CPython 3.15.2 on arm64." >&2
+  exit 1
+fi
 
 # Release transaction (stage -> health gates -> swap, keeping *.prev ->
 # rollback on failure). A failed build or health gate leaves the running
@@ -57,31 +71,24 @@ fi
 echo "[watermeter] Building Swift OCR helper"
 swiftc -O "$REPO_DIR/ocr.swift" -o "$BUILD_TMP/ocr"
 
-# 2. Python environment. The same venv serves both build and dev: it holds
-#    the runtime deps (pinned in requirements.txt) plus pyinstaller for the
-#    bundling step. Recreated on every install to stay in sync with the
-#    pinned requirements.
-if ! command -v python3 >/dev/null; then
-  echo "python3 is required"; exit 1
-fi
+# 2. Python environment. The same venv serves build and dev. Both locks are
+#    hash-checked: first install binary-only build tools, then install the
+#    complete target lock using those pinned tools for any source builds.
 echo "[watermeter] Preparing Python venv at $VENV_DIR"
 rm -rf "$VENV_DIR"
-python3 -m venv "$VENV_DIR"
-# shellcheck disable=SC1091
-source "$VENV_DIR/bin/activate"
-pip install -q -U pip wheel
-pip install -q -r "$REPO_DIR/requirements.txt"
-pip install -q pyinstaller
-# Dev/test tooling, so the documented test commands keep working after a
-# reinstall (the service itself runs the bundled binary, not this venv).
-pip install -q -r "$REPO_DIR/requirements-dev.txt"
+"$WTM_PYTHON" -m venv "$VENV_DIR"
+VENV_PYTHON="$VENV_DIR/bin/python3"
+"$VENV_PYTHON" -m pip install -q --require-hashes --only-binary=:all: \
+  -r "$REPO_DIR/requirements-build.lock"
+"$VENV_PYTHON" -m pip install -q --require-hashes --no-cache-dir --no-build-isolation \
+  -r "$REPO_DIR/requirements.lock"
 
 # 3. Build the bundled binary. --onefile produces a single self-extracting
 #    Mach-O; --collect-all keeps PyInstaller's hook detection from missing
 #    runtime data files in cv2/numpy. distpath/workpath/specpath isolate the
 #    build artifacts under build-tmp/ so the repo stays clean.
 echo "[watermeter] Bundling watermeter.py with PyInstaller (this takes ~60s)"
-pyinstaller --clean --noconfirm \
+"$VENV_DIR/bin/pyinstaller" --clean --noconfirm \
   --onefile \
   --name watermeter \
   --collect-all cv2 \
@@ -90,7 +97,6 @@ pyinstaller --clean --noconfirm \
   --workpath "$BUILD_TMP/build" \
   --specpath "$BUILD_TMP" \
   "$REPO_DIR/watermeter.py" >/dev/null
-deactivate
 
 # 4. Sign with our stable identity. We deliberately do NOT use --options
 #    runtime: hardened runtime enforces library validation, which rejects

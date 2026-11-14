@@ -53,15 +53,41 @@ Publishes **total (m³)**, **flow rate (m³/min)**, **liters/min**, and an **ove
 ## Requirements
 
 * macOS (Apple Silicon tested)
-* Python **3.10+**
+* Building/installing requires CPython **3.15.2** on Apple Silicon (uv-managed by default); the deployed PyInstaller binary includes its Python runtime.
 * ESP32 AI-on-the-Edge Cam reachable on LAN
 * MQTT broker (e.g., Mosquitto) + Home Assistant (MQTT integration)
 
 ---
 
+## Locked build dependencies
+
+The installer defaults to uv-managed CPython 3.15.2 on arm64. Set `WTM_PYTHON`
+to an alternative interpreter only if it has that exact version and architecture.
+Runtime, test and build inputs are in `requirements.txt`, `requirements-dev.txt`
+and `requirements-build.txt`. The two generated locks include exact versions
+and hashes. Build tools install first; PyYAML's source build then uses those
+pinned tools without build isolation or a previously cached local wheel.
+
+To refresh the locks on the target platform, run these commands through the
+host's heavy-job guard, once for the command chain:
+
+```sh
+WTM_PYTHON="$HOME/.local/share/uv/python/cpython-3.15.2-macos-aarch64-none/bin/python3.15"
+uv pip compile --upgrade --generate-hashes --python "$WTM_PYTHON" \
+  --python-platform aarch64-apple-darwin -o requirements-build.lock requirements-build.txt
+uv pip compile --upgrade --generate-hashes --python "$WTM_PYTHON" \
+  --python-platform aarch64-apple-darwin -o requirements.lock \
+  requirements.txt requirements-dev.txt requirements-build.txt
+```
+
+On the production Mac, every install, full test, build and deploy must use
+`HEAVY_MIN_DISK_GB=40 HEAVY_ABORT_DISK_GB=40 ~/claude/scripts/heavy-job.sh`.
+Exit 75 stops work. Validate in a separate checkout before using the existing
+release transaction; `WTM_ROOT` alone does not isolate the installer's LaunchAgent.
+
 ## Install
 
-The installer sets up a Python venv at `~/watermeter/venv/`, dependencies, directories, builds the OCR helper from `ocr.swift`, bundles and signs the service as the PyInstaller binary `~/watermeter/bin/watermeter` (the LaunchAgent runs that binary, not `python3 watermeter.py`), and places starter config & state paths.
+The installer uses the managed CPython 3.15.2 interpreter and hash-locked dependencies to set up `~/watermeter/venv/`, builds the OCR helper from `ocr.swift`, bundles and signs the service as the PyInstaller binary `~/watermeter/bin/watermeter` (the LaunchAgent runs that binary, not `python3 watermeter.py`), and places starter config & state paths.
 
 ```bash
 ./install.sh
